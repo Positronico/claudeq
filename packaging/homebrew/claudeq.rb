@@ -52,9 +52,13 @@ class Claudeq < Formula
   end
 
   test do
-    # `flash` with a dummy port must be recognized and fail gracefully (no toolchain in the sandbox),
-    # proving the wrapper resolves the bundled firmware + flash.sh.
-    output = shell_output("#{bin}/claudeq flash /dev/null 2>&1", 1)
-    assert_match(/flasher|esptool|firmware/i, output)
+    # The merged firmware must be bundled for `claudeq flash` to work.
+    assert_predicate libexec/"firmware/dist/claudeq-firmware.bin", :exist?
+
+    # Hermetic check of the wrapper -> flash.sh delegation: a bogus CLAUDEQ_FIRMWARE makes flash.sh
+    # exit immediately, before any serial-port autodetect or esptool/espflash spawn (which could hang
+    # if a flasher happens to be on PATH). Proves claudeq execs the bundled flash.sh and reads its env.
+    output = shell_output("CLAUDEQ_FIRMWARE=/nonexistent.bin #{bin}/claudeq flash 2>&1", 1)
+    assert_match(/firmware image not found/i, output)
   end
 end

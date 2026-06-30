@@ -63,6 +63,7 @@ function newSession(sid) {
     sid, seq: ++sessionSeq, tmux: DEFAULT_TMUX, title: 'session', cwd: null,
     state: 'idle', text: 'idle', tool: null, attn: false,
     hud: { model: null, elapsedMs: 0, lastTool: null, todos: [], cwd: null },
+    feed: [],                              // recent activity lines (for the "follow along" screen)
     promptStartedAt: 0, pendingAsk: null, lastSeen: Date.now(),
   };
 }
@@ -110,6 +111,35 @@ function statusMsg(s) { return { type: 'status', sid: s.sid, state: s.state, tex
 function hudMsg(s) { return { type: 'hud', sid: s.sid, ...s.hud }; }
 function askMsg(s) { return { type: 'ask', id: s.pendingAsk.id, sid: s.sid, questions: s.pendingAsk.questions }; }
 
+// ---------- activity feed (live "what's Claude doing") ----------
+const FEED_MAX = 40;
+function shortFile(p) { return p ? String(p).split('/').pop() : ''; }
+function clip(v, n = 52) { const s = String(v || '').replace(/\s+/g, ' ').trim(); return s.length > n ? s.slice(0, n - 1) + '…' : s; }
+// Turn a tool call into a short "target" detail, by tool.
+function describeTool(name, ti = {}) {
+  if (!ti) ti = {};                    // tool_input may arrive as null, not just absent
+  switch (name) {
+    case 'Read': case 'Edit': case 'Write': case 'NotebookEdit':
+      return shortFile(ti.file_path || ti.notebook_path);
+    case 'Bash': return clip(ti.command);
+    case 'Grep': case 'Glob': return clip(ti.pattern);
+    case 'Task': case 'Agent': return clip(ti.description || ti.subagent_type);
+    case 'WebFetch': try { return new URL(ti.url).hostname; } catch { return clip(ti.url); }
+    case 'WebSearch': return clip(ti.query);
+    case 'Skill': return clip(ti.command || ti.skill || ti.name);
+    case 'TodoWrite': return ti.todos?.length ? ti.todos.length + ' items' : '';
+    default: return '';
+  }
+}
+// Append a line to a session's feed; stream it to the deck if that session is focused.
+function pushFeed(s, kind, label, detail = '') {
+  const line = { ts: Date.now(), kind, label, detail };
+  s.feed.push(line);
+  if (s.feed.length > FEED_MAX) s.feed.shift();
+  if (s.sid === focusedSid) broadcast({ type: 'activity', sid: s.sid, line });
+}
+function feedMsg(s) { return { type: 'activity', sid: s.sid, feed: s.feed }; }
+
 // Push the focused session's full state to the deck (status + hud + ask/clear).
 function pushFocused() {
   const s = sessions.get(focusedSid);
@@ -118,6 +148,9 @@ function pushFocused() {
   broadcast(hudMsg(s));
   if (s.pendingAsk) broadcast(askMsg(s));
   else broadcast({ type: 'ask_cancel', sid: s.sid, reason: 'focus' });
+  broadcast(feedMsg(s));               // AFTER the ask: a question auto-focuses its session, so the deck
+                                       // only adopts this focus when it sees the ask — send the feed last
+                                       // or it's dropped by the deck's focus gate.
 }
 function setFocus(sid, push = true) {
   if (!sessions.has(sid)) return;
@@ -266,12 +299,17 @@ function handleEvent(kind, ev, meta) {
   switch (kind) {
     case 'SessionStart':
       if (ev.model) s.hud.model = ev.model;
-      s.attn = false; setSessionStatus(s, 'idle', 'ready'); break;
+      s.attn = false; setSessionStatus(s, 'idle', 'ready');
+      pushFeed(s, 'start', 'session', shortFile(s.cwd)); break;
     case 'UserPromptSubmit':
       s.promptStartedAt = Date.now(); s.hud.elapsedMs = 0; s.attn = false;
-      setSessionStatus(s, 'thinking', 'thinking'); broadcastSessions(); break;
+      setSessionStatus(s, 'thinking', 'thinking');
+      pushFeed(s, 'prompt', 'you', clip(ev.prompt)); broadcastSessions(); break;
     case 'PreToolUse':
-      if (ev.tool_name) { s.hud.lastTool = ev.tool_name; setSessionStatus(s, 'working', 'working: ' + ev.tool_name, ev.tool_name); }
+      if (ev.tool_name) {
+        s.hud.lastTool = ev.tool_name; setSessionStatus(s, 'working', 'working: ' + ev.tool_name, ev.tool_name);
+        pushFeed(s, 'tool', ev.tool_name, describeTool(ev.tool_name, ev.tool_input));
+      }
       break;
     case 'PostToolUse':
       if (ev.tool_name === 'TodoWrite' && ev.tool_input?.todos) {
@@ -280,11 +318,13 @@ function handleEvent(kind, ev, meta) {
       break;
     case 'Notification':
       s.attn = true; setSessionStatus(s, 'waiting', 'needs you');
+      pushFeed(s, 'notify', 'needs you', clip(ev.message));
       broadcast({ type: 'alert', sid: s.sid, level: 'attn', text: ev.message || 'Claude needs you', sound: 'chirp' });
       sendSound('alert'); broadcastSessions(); break;
     case 'Stop':
       if (s.promptStartedAt) s.hud.elapsedMs = Date.now() - s.promptStartedAt;
       s.attn = false; setSessionStatus(s, 'done', 'done');
+      pushFeed(s, 'done', 'done', s.hud.elapsedMs ? Math.round(s.hud.elapsedMs / 1000) + 's' : '');
       broadcast({ type: 'alert', sid: s.sid, level: 'info', text: 'done', sound: 'soft' });
       sendSound('done'); broadcastSessions(); break;
   }
@@ -326,6 +366,7 @@ function sendSnapshot(ws) {
     ws.send(JSON.stringify(statusMsg(s)));
     ws.send(JSON.stringify(hudMsg(s)));
     if (s.pendingAsk) ws.send(JSON.stringify(askMsg(s)));
+    ws.send(JSON.stringify(feedMsg(s)));   // after the ask (see pushFocused)
   } else {
     ws.send(JSON.stringify({ type: 'status', sid: null, state: 'idle', text: 'idle', tool: null }));
   }

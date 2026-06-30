@@ -47,6 +47,17 @@
   .confirm{ width:100%; background:var(--accent); color:#1a1206; font-weight:700; border:0;
             border-radius:9px; padding:9px; margin-top:2px; cursor:pointer; }
   .placeholder{ color:var(--dim); text-align:center; margin-top:40px; font-size:12px; }
+  /* live activity feed (Decide screen when no question) */
+  .feed{ display:flex; flex-direction:column; gap:1px; }
+  .feedline{ display:flex; align-items:baseline; gap:6px; padding:3px 3px; border-bottom:1px solid rgba(34,38,51,.5);
+             font:11.5px/1.4 ui-monospace,Menlo,monospace; }
+  .feedline .fk{ flex:0 0 auto; width:10px; color:var(--dim); text-align:center; }
+  .feedline .fl{ flex:0 0 auto; min-width:58px; color:var(--accent2); font-weight:600; }
+  .feedline .fd{ flex:1 1 auto; color:var(--ink); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .feedline.k-done .fl{ color:var(--ok); } .feedline.k-notify .fl{ color:var(--warn); }
+  .feedline.k-prompt .fl{ color:var(--accent); } .feedline.k-start{ color:var(--dim); }
+  .feedline.now{ background:rgba(122,162,255,.12); border-radius:4px; }
+  .feedhint{ color:var(--dim); text-align:center; margin-top:30px; font-size:12px; }
   .macros{ display:flex; flex-direction:column; gap:7px; }
   .macro{ background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:13px 10px;
           text-align:center; cursor:pointer; }
@@ -106,6 +117,7 @@ const PORTS = (new URLSearchParams(location.search).get('b') || '8787').split(',
 document.getElementById('wsurl').textContent = PORTS.map(p=>`ws://${HOST}:${p}`).join('  ,  ');
 let mode='decide', ask=null, sel={}, hud={}, macros=[], state={state:'idle',text:'idle'};
 let sessions=[], focus=null, qIdx=0, answersAcc={}, hosts={};   // focus = {sid, bridge} | null; hosts[bridge]=machine
+let feed=[];                                                     // activity lines for the focused session
 let conns=[];   // per-bridge connection: {idx, ws, up}
 
 function log(msg, cls='log-sys'){ const el=document.getElementById('log');
@@ -133,21 +145,25 @@ function handle(m, bridge){
   switch(m.type){
     case 'sessions': if(m.host) hosts[bridge]=m.host; mergeSessions(m.list||[], bridge); renderSessions(); renderStatus(); if(mode==='decide') render(); break;
     case 'status': if(concernsFocus(m,bridge)){ state=m; renderStatus(); } break;
-    case 'ask': if(m.sid){ focus={sid:m.sid, bridge}; } ask=m; qIdx=0; answersAcc={}; sel={}; mode='decide'; setTab(); renderSessions(); renderStatus(); render(); flash(); break;
+    case 'ask': if(m.sid){ if(!focus || focus.bridge!==bridge || focus.sid!==m.sid) feed=[]; focus={sid:m.sid, bridge}; } ask=m; qIdx=0; answersAcc={}; sel={}; mode='decide'; setTab(); renderSessions(); renderStatus(); render(); flash(); break;
     case 'ask_cancel': if(concernsFocus(m,bridge)){ ask=null; render(); } break;
     case 'hud': if(concernsFocus(m,bridge)){ hud=m; if(mode==='hud') render(); } break;
+    case 'activity': if(concernsFocus(m,bridge)){
+        if(m.feed){ feed=m.feed.slice(); } else if(m.line){ feed.push(m.line); if(feed.length>40) feed.shift(); }
+        if(mode==='decide' && !ask) render();
+      } break;
     case 'macros': macros=m.items||[]; if(mode==='macros') render(); break;
     case 'alert': flash(); log('ALERT: '+m.text,'log-sys'); break;
   }
 }
 function mergeSessions(list, bridge){
   sessions = sessions.filter(s=>s.bridge!==bridge).concat(list.map(s=>({...s, bridge})));
-  if(focus && !sessions.find(s=>s.bridge===focus.bridge && s.sid===focus.sid)){ focus=null; ask=null; }
-  if(!focus && sessions.length){ focus={sid:sessions[0].sid, bridge:sessions[0].bridge}; }
+  if(focus && !sessions.find(s=>s.bridge===focus.bridge && s.sid===focus.sid)){ focus=null; ask=null; feed=[]; }
+  if(!focus && sessions.length){ focus={sid:sessions[0].sid, bridge:sessions[0].bridge}; feed=[]; }
 }
 function bridgeGone(bridge){
   sessions = sessions.filter(s=>s.bridge!==bridge);
-  if(focus && focus.bridge===bridge){ focus=null; ask=null; }
+  if(focus && focus.bridge===bridge){ focus=null; ask=null; feed=[]; }
   renderSessions(); renderStatus(); render();
 }
 function focusedTitle(){ const s=focus && sessions.find(x=>x.bridge===focus.bridge && x.sid===focus.sid); return s?s.title:'—'; }
@@ -159,7 +175,7 @@ function renderSessions(){ const sb=document.getElementById('sessbar'); sb.inner
     const clash = sessions.some(o=>o!==s && o.bridge!==s.bridge && o.title===s.title);
     c.innerHTML = s.title + (clash && hosts[s.bridge] ? `<span class="host">@${hosts[s.bridge]}</span>` : '');
     c.title=`${s.sid} @ bridge ${s.bridge}`;
-    c.onclick=()=>{ focus={sid:s.sid, bridge:s.bridge}; sendTo(s.bridge,{type:'focus', sid:s.sid}); renderSessions(); renderStatus(); };
+    c.onclick=()=>{ focus={sid:s.sid, bridge:s.bridge}; feed=[]; sendTo(s.bridge,{type:'focus', sid:s.sid}); renderSessions(); renderStatus(); if(mode==='decide') render(); };
     sb.appendChild(c); }); }
 function renderStatus(){ document.getElementById('dot').className='dot '+(state.state||'idle');
   document.getElementById('titletxt').textContent=focusedTitle();
@@ -169,7 +185,7 @@ function flash(){ const f=document.getElementById('flash'); f.classList.remove('
 function render(){
   const b=document.getElementById('body'); b.innerHTML='';
   if(mode==='decide'){
-    if(!ask){ b.innerHTML='<div class="placeholder">No question.<br>Waiting for Claude…</div>'; return; }
+    if(!ask){ renderFeed(b); return; }
     const q=ask.questions[qIdx];
     const prog = ask.questions.length>1 ? ` (${qIdx+1}/${ask.questions.length})` : '';
     b.innerHTML += `<span class="hdr">${(q.header||'Question')+prog}</span><div class="q">${q.question}</div>`;
@@ -201,6 +217,18 @@ function render(){
     rows.forEach(([k,v])=>{ w.innerHTML+=`<div class="row"><span class="k">${k}</span><span class="v">${v}</span></div>`; });
     b.appendChild(w);
   }
+}
+const FEED_SYM={tool:'›', prompt:'»', notify:'!', done:'✓', start:'·', thinking:'…'};
+function renderFeed(b){
+  if(!feed.length){ b.innerHTML='<div class="feedhint">'+(focus?'Claude is idle.<br>Following along…':'Waiting for a session…')+'</div>'; return; }
+  const active = state.state==='working' || state.state==='thinking';
+  const w=document.createElement('div'); w.className='feed';
+  feed.forEach((ln,i)=>{ const d=document.createElement('div');
+    d.className='feedline k-'+(ln.kind||'tool')+(active && i===feed.length-1?' now':'');
+    d.innerHTML=`<span class="fk">${FEED_SYM[ln.kind]||'›'}</span><span class="fl">${ln.label||''}</span><span class="fd">${ln.detail||''}</span>`;
+    w.appendChild(d); });
+  b.appendChild(w);
+  b.scrollTop=b.scrollHeight;   // auto-scroll to newest
 }
 function advanceAsk(){ qIdx++;
   if(qIdx < ask.questions.length){ sel={}; render(); }      // more questions in this ask

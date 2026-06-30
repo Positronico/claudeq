@@ -9,8 +9,8 @@
 class Claudeq < Formula
   desc "Physical touchscreen control surface for Claude Code (ESP32-S3 deck)"
   homepage "https://github.com/Positronico/claudeq"
-  url "https://github.com/Positronico/claudeq/archive/refs/tags/v0.1.0.tar.gz"
-  sha256 "5dbb51760179fcdc6514af9b5c7221014fb3744c8a04f3f4a1bc1fdd5708fb14"
+  url "https://github.com/Positronico/claudeq/archive/refs/tags/v0.1.1.tar.gz"
+  sha256 "REPLACE_WITH_TARBALL_SHA256"
   license "MIT"
 
   depends_on "node"   # runtime for the bridge

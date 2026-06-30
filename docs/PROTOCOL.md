@@ -26,6 +26,7 @@ focused session's tmux target on its bridge. A question auto-focuses the session
 | `ask` | `id`, `sid`, `questions[]` = `{question, header, multiSelect, options[]:{label,description}}` | A question to render; user taps to choose. Sent **after** the `sessions` message that focuses `sid` |
 | `ask_cancel` | `sid`, `id?`, `reason` | Question resolved/cancelled (or focus moved to a session with no pending question) — clear it |
 | `hud` | `sid`, `model`, `elapsedMs`, `tokens`, `costUSD`, `lastTool`, `todos[]`, `cwd` | Telemetry of the focused session for the HUD screen |
+| `activity` | `sid`, and **either** `line` = `{ts, kind, label, detail}` (append one) **or** `feed[]` (full snapshot, replace) | Live "what's Claude doing" feed for the Decide screen. `kind` ∈ `tool`/`prompt`/`notify`/`done`/`start`; `label` is the tool name (or `you`/`done`), `detail` the target (file, command, pattern…). A snapshot is sent on focus/connect (**after** any `ask`, so the deck has adopted the new focus before it lands); single lines stream as events arrive. Only for the focused session. The deck clears its feed on every focus change so one session's activity never appends onto another's. |
 | `macros` | `items[]` = `{id,label,icon,prompt}` | The macro deck contents (global) |
 | `alert` | `sid`, `level` (`info`/`attn`/`error`), `text`, `sound` | Pull-attention: chirp + flash |
 

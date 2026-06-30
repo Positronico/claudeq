@@ -46,6 +46,9 @@ static const char *NAV_TEXT[4] = { "Decide", "Macros", "Voice", "HUD" };
 static void set_page(int idx);
 // decide (supports multi-question asks)
 static lv_obj_t *s_header, *s_question, *s_opts, *s_placeholder;
+static lv_obj_t *s_feed;              // live activity feed on the Decide page (when no question)
+static int s_feed_n = 0;
+#define FEED_MAX_ROWS 30
 static char cur_id[80];
 static cJSON *s_ask = NULL;       // cloned questions payload, kept alive across taps
 static cJSON *s_answers = NULL;   // accumulated {question: label} across the ask's questions
@@ -77,6 +80,97 @@ static void style_card(lv_obj_t *o) {
 // ---------- decide (supports multi-question asks) ----------
 static void opt_clicked(lv_event_t *e);
 
+// ---------- activity feed (live "what's Claude doing" on the Decide page) ----------
+static const char *feed_sym(const char *kind) {
+    if (!kind) return LV_SYMBOL_RIGHT;
+    if (!strcmp(kind, "done"))   return LV_SYMBOL_OK;
+    if (!strcmp(kind, "notify")) return LV_SYMBOL_BELL;
+    if (!strcmp(kind, "prompt")) return LV_SYMBOL_RIGHT;
+    if (!strcmp(kind, "start"))  return LV_SYMBOL_PLAY;
+    return LV_SYMBOL_RIGHT;            // tool
+}
+static uint32_t feed_col(const char *kind) {
+    if (kind && !strcmp(kind, "done"))   return COL_OK;
+    if (kind && !strcmp(kind, "notify")) return COL_WARN;
+    if (kind && !strcmp(kind, "prompt")) return COL_ACCENT;
+    if (kind && !strcmp(kind, "start"))  return COL_DIM;
+    return COL_BLUE;                  // tool
+}
+// Show the feed if it has rows, else the idle placeholder (called when no question is pending).
+static void show_idle_view(void) {
+    if (s_feed_n > 0) {
+        if (s_feed) lv_obj_clear_flag(s_feed, LV_OBJ_FLAG_HIDDEN);
+        if (s_placeholder) lv_obj_add_flag(s_placeholder, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        if (s_feed) lv_obj_add_flag(s_feed, LV_OBJ_FLAG_HIDDEN);
+        if (s_placeholder) lv_obj_clear_flag(s_placeholder, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+static void feed_clear(void) { if (s_feed) { lv_obj_clean(s_feed); s_feed_n = 0; } }
+
+static void feed_add_row(const char *kind, const char *label, const char *detail, bool current) {
+    if (!s_feed) return;
+    // cap: drop oldest rows beyond the limit
+    while (s_feed_n >= FEED_MAX_ROWS) {
+        lv_obj_t *first = lv_obj_get_child(s_feed, 0);
+        if (!first) break;
+        lv_obj_del(first); s_feed_n--;
+    }
+    // un-highlight the previous "current" row so only the newest is marked
+    uint32_t cnt = lv_obj_get_child_cnt(s_feed);
+    if (current && cnt > 0) {
+        lv_obj_t *last = lv_obj_get_child(s_feed, cnt - 1);
+        if (last) lv_obj_set_style_bg_opa(last, LV_OPA_0, 0);
+    }
+    lv_obj_t *row = lv_obj_create(s_feed);
+    lv_obj_set_size(row, LV_PCT(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_color(row, lv_color_hex(COL_BLUE), 0);
+    lv_obj_set_style_bg_opa(row, current ? LV_OPA_20 : LV_OPA_0, 0);
+    lv_obj_set_style_border_width(row, 0, 0);
+    lv_obj_set_style_radius(row, 4, 0);
+    lv_obj_set_style_pad_hor(row, 2, 0);
+    lv_obj_set_style_pad_ver(row, 2, 0);
+    lv_obj_set_style_pad_column(row, 4, 0);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+    uint32_t col = feed_col(kind);
+    lv_obj_t *pf = mklabel(row, feed_sym(kind), &lv_font_montserrat_12, col);
+    lv_obj_set_width(pf, 12);
+    lv_obj_t *lb = mklabel(row, label && label[0] ? label : "", &lv_font_montserrat_12, col);
+    lv_obj_set_width(lb, 44);
+    lv_obj_t *dt = mklabel(row, detail ? detail : "", &lv_font_montserrat_12, COL_INK);
+    lv_label_set_long_mode(dt, LV_LABEL_LONG_DOT);
+    lv_obj_set_width(dt, 90);
+    s_feed_n++;
+    lv_obj_scroll_to_view(row, LV_ANIM_OFF);   // keep newest visible
+}
+static void feed_replace(cJSON *arr) {
+    feed_clear();
+    int n = cJSON_IsArray(arr) ? cJSON_GetArraySize(arr) : 0;
+    int start = n > FEED_MAX_ROWS ? n - FEED_MAX_ROWS : 0;
+    for (int i = start; i < n; i++) {
+        cJSON *ln = cJSON_GetArrayItem(arr, i);
+        cJSON *k = cJSON_GetObjectItem(ln, "kind");
+        cJSON *l = cJSON_GetObjectItem(ln, "label");
+        cJSON *d = cJSON_GetObjectItem(ln, "detail");
+        feed_add_row(cJSON_IsString(k) ? k->valuestring : NULL,
+                     cJSON_IsString(l) ? l->valuestring : "",
+                     cJSON_IsString(d) ? d->valuestring : "", i == n - 1);
+    }
+}
+
+// Single entry point for changing which (sid,bridge) the deck follows. Wipes the activity feed
+// whenever the target actually changes, so a new session never inherits/appends onto the previous
+// one's rows. Pass sid=NULL to clear focus. The newly-focused bridge re-sends its feed snapshot.
+static void set_local_focus(const char *sid, int bridge) {
+    bool changed = sid ? (bridge != focus_bridge || strcmp(focus_sid, sid) != 0)
+                       : (focus_sid[0] != 0);
+    if (sid) { snprintf(focus_sid, sizeof(focus_sid), "%s", sid); focus_bridge = bridge; net_set_focus_bridge(bridge); }
+    else { focus_sid[0] = 0; focus_bridge = -1; }
+    if (changed) feed_clear();
+}
+
 static void clear_ask(void) {
     if (s_ask) { cJSON_Delete(s_ask); s_ask = NULL; }
     if (s_answers) { cJSON_Delete(s_answers); s_answers = NULL; }
@@ -84,7 +178,7 @@ static void clear_ask(void) {
     if (s_opts) lv_obj_clean(s_opts);
     if (s_header) lv_obj_add_flag(s_header, LV_OBJ_FLAG_HIDDEN);
     if (s_question) lv_obj_add_flag(s_question, LV_OBJ_FLAG_HIDDEN);
-    if (s_placeholder) lv_obj_clear_flag(s_placeholder, LV_OBJ_FLAG_HIDDEN);
+    show_idle_view();                 // back to the activity feed (or placeholder if empty)
 }
 
 // Render the question at cur_q_idx of the kept-alive s_ask payload.
@@ -98,6 +192,7 @@ static void render_question(void) {
     cJSON *opts = cJSON_GetObjectItem(q, "options");
 
     lv_obj_add_flag(s_placeholder, LV_OBJ_FLAG_HIDDEN);
+    if (s_feed) lv_obj_add_flag(s_feed, LV_OBJ_FLAG_HIDDEN);   // question takes over the screen
     const char *htext = cJSON_IsString(header) ? header->valuestring : "QUESTION";
     char hbuf[56];
     if (cur_q_total > 1) snprintf(hbuf, sizeof(hbuf), "%s  (%d/%d)", htext, cur_q_idx + 1, cur_q_total);
@@ -252,15 +347,14 @@ static void render_chips(void);
 static void chip_clicked(lv_event_t *e) {
     int idx = (int)(intptr_t)lv_event_get_user_data(e);
     if (idx < 0 || idx >= sess_n || !sess_sid[idx][0]) return;
-    snprintf(focus_sid, sizeof(focus_sid), "%s", sess_sid[idx]);
-    focus_bridge = sess_bridge[idx];
-    net_set_focus_bridge(focus_bridge);              // route macros/voice to this session's bridge
+    set_local_focus(sess_sid[idx], sess_bridge[idx]);   // clears the feed on switch; routes macros/voice
     cJSON *m = cJSON_CreateObject();
     cJSON_AddStringToObject(m, "type", "focus");
     cJSON_AddStringToObject(m, "sid", sess_sid[idx]);
     char *s = cJSON_PrintUnformatted(m);
     if (s) { net_send_to(focus_bridge, s); ESP_LOGI(TAG, "focus -> b%d %s", focus_bridge, sess_sid[idx]); cJSON_free(s); }
     cJSON_Delete(m);
+    if (!s_ask) show_idle_view();   // feed was cleared by set_local_focus; its bridge will resend it
     render_chips();
 }
 
@@ -344,19 +438,18 @@ static void show_sessions(cJSON *root, int bridge) {
     // Only the focus's own bridge may invalidate its focus, and never wipe a live ask here
     // (that's the job of ask_cancel / ui_bridge_gone). An unrelated bridge's refresh must not touch focus.
     if (!found && focus_sid[0] && bridge == focus_bridge && !s_ask) {
-        if (sess_n > 0) { snprintf(focus_sid, sizeof(focus_sid), "%s", sess_sid[0]); focus_bridge = sess_bridge[0]; net_set_focus_bridge(focus_bridge); }
-        else { focus_sid[0] = 0; focus_bridge = -1; }
+        if (sess_n > 0) set_local_focus(sess_sid[0], sess_bridge[0]);
+        else set_local_focus(NULL, -1);
     }
-    if (!focus_sid[0] && sess_n > 0) {   // no focus yet -> adopt the first session
-        snprintf(focus_sid, sizeof(focus_sid), "%s", sess_sid[0]); focus_bridge = sess_bridge[0]; net_set_focus_bridge(focus_bridge);
-    }
+    if (!focus_sid[0] && sess_n > 0)     // no focus yet -> adopt the first session
+        set_local_focus(sess_sid[0], sess_bridge[0]);
     render_chips();
 }
 
 void ui_bridge_gone(int bridge) {
     if (!ui_lock(1000)) return;
     drop_bridge_sessions(bridge);
-    if (focus_bridge == bridge) { focus_sid[0] = 0; focus_bridge = -1; clear_ask(); }
+    if (focus_bridge == bridge) { set_local_focus(NULL, -1); clear_ask(); }
     render_chips();
     ui_unlock();
 }
@@ -413,15 +506,29 @@ void ui_handle_message(cJSON *root, int bridge) {
         show_sessions(root, bridge);
     } else if (!strcmp(t, "ask")) {
         cJSON *sid = cJSON_GetObjectItem(root, "sid");
-        if (cJSON_IsString(sid)) {           // a question pulls focus to its session, on whichever bridge
-            snprintf(focus_sid, sizeof(focus_sid), "%s", sid->valuestring);
-            focus_bridge = bridge; net_set_focus_bridge(bridge);
-        }
+        if (cJSON_IsString(sid))             // a question pulls focus to its session, on whichever bridge
+            set_local_focus(sid->valuestring, bridge);   // clears stale feed; bridge resends snapshot after the ask
         show_ask(root); set_state("waiting", "tap to choose"); render_chips();
     } else if (!strcmp(t, "ask_cancel")) {
         if (concerns_focus(root, bridge)) clear_ask();
     } else if (!strcmp(t, "hud")) {
         if (concerns_focus(root, bridge)) show_hud(root);
+    } else if (!strcmp(t, "activity")) {
+        if (concerns_focus(root, bridge)) {
+            cJSON *feed = cJSON_GetObjectItem(root, "feed");
+            cJSON *line = cJSON_GetObjectItem(root, "line");
+            if (cJSON_IsArray(feed)) {
+                feed_replace(feed);
+            } else if (line) {
+                cJSON *k = cJSON_GetObjectItem(line, "kind");
+                cJSON *l = cJSON_GetObjectItem(line, "label");
+                cJSON *d = cJSON_GetObjectItem(line, "detail");
+                feed_add_row(cJSON_IsString(k) ? k->valuestring : NULL,
+                             cJSON_IsString(l) ? l->valuestring : "",
+                             cJSON_IsString(d) ? d->valuestring : "", true);
+            }
+            if (!s_ask) show_idle_view();
+        }
     } else if (!strcmp(t, "macros")) {
         show_macros(root);
     } else if (!strcmp(t, "alert")) {
@@ -575,9 +682,19 @@ void ui_init(void) {
     lv_obj_set_style_pad_gap(s_opts, 6, 0);
     lv_obj_set_flex_flow(s_opts, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(s_opts, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
-    s_placeholder = mklabel(t_decide, "Claudeq ready.\nWaiting for a\nquestion...", &lv_font_montserrat_16, COL_DIM);
+    s_placeholder = mklabel(t_decide, "Claudeq ready.\nFollowing\nClaude...", &lv_font_montserrat_16, COL_DIM);
     lv_obj_set_style_text_align(s_placeholder, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_center(s_placeholder);
+    // live activity feed — fills the Decide page; shown when idle (no question) and has rows
+    s_feed = lv_obj_create(t_decide);
+    lv_obj_set_size(s_feed, 160, 422);
+    lv_obj_align(s_feed, LV_ALIGN_TOP_LEFT, 0, 0);
+    lv_obj_set_style_bg_opa(s_feed, LV_OPA_0, 0);
+    lv_obj_set_style_border_width(s_feed, 0, 0);
+    lv_obj_set_style_pad_all(s_feed, 0, 0);
+    lv_obj_set_style_pad_row(s_feed, 1, 0);
+    lv_obj_set_flex_flow(s_feed, LV_FLEX_FLOW_COLUMN);
+    lv_obj_add_flag(s_feed, LV_OBJ_FLAG_HIDDEN);
 
     // --- Macros page ---
     s_macros_cont = lv_obj_create(t_macros);

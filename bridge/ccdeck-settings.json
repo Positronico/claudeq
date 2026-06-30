@@ -1,0 +1,30 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      { "matcher": "AskUserQuestion",
+        "hooks": [ { "type": "command", "command": "node /Users/mmachado/Scratch/Waveshare/bridge/hooks/askquestion.mjs", "timeout": 300 } ] },
+      { "matcher": ".*",
+        "hooks": [ { "type": "command", "command": "bash /Users/mmachado/Scratch/Waveshare/bridge/hooks/event.sh PreToolUse", "timeout": 5 } ] }
+    ],
+    "PostToolUse": [
+      { "matcher": "TodoWrite",
+        "hooks": [ { "type": "command", "command": "bash /Users/mmachado/Scratch/Waveshare/bridge/hooks/event.sh PostToolUse", "timeout": 5 } ] }
+    ],
+    "UserPromptSubmit": [
+      { "matcher": "",
+        "hooks": [ { "type": "command", "command": "bash /Users/mmachado/Scratch/Waveshare/bridge/hooks/event.sh UserPromptSubmit", "timeout": 5 } ] }
+    ],
+    "Notification": [
+      { "matcher": "",
+        "hooks": [ { "type": "command", "command": "bash /Users/mmachado/Scratch/Waveshare/bridge/hooks/event.sh Notification", "timeout": 5 } ] }
+    ],
+    "Stop": [
+      { "matcher": "",
+        "hooks": [ { "type": "command", "command": "bash /Users/mmachado/Scratch/Waveshare/bridge/hooks/event.sh Stop", "timeout": 5 } ] }
+    ],
+    "SessionStart": [
+      { "matcher": "",
+        "hooks": [ { "type": "command", "command": "bash /Users/mmachado/Scratch/Waveshare/bridge/hooks/event.sh SessionStart", "timeout": 5 } ] }
+    ]
+  }
+}

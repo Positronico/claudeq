@@ -1,0 +1,35 @@
+name: Release
+
+# On a version tag (vX.Y.Z): build the firmware fresh and publish the flashable binaries as
+# GitHub Release assets, so people can download them directly (and the web flasher / formula can
+# point at a stable URL).
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build firmware + repackage dist
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: v5.4.1
+          target: esp32s3
+          path: firmware/companion
+          command: idf.py build && ../dist/build-dist.sh
+      - name: Publish release with firmware binaries
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            firmware/dist/claudeq-firmware.bin
+            firmware/dist/bootloader.bin
+            firmware/dist/partition-table.bin
+            firmware/dist/claudeq-app.bin
+            firmware/dist/manifest.json
+          generate_release_notes: true

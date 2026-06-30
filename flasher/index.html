@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Flash Claudeq</title>
+  <meta name="description" content="Install the Claudeq firmware on your Waveshare ESP32-S3-Touch-LCD-3.49 — right from your browser, no tools to install." />
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
+      font: 16px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      color: #e7e9ee; background: radial-gradient(1200px 600px at 50% -10%, #1d2433 0%, #0c0f16 60%);
+      padding: 32px;
+    }
+    .card {
+      width: 100%; max-width: 540px; background: #141925; border: 1px solid #232b3b;
+      border-radius: 18px; padding: 40px 36px; box-shadow: 0 24px 60px rgba(0,0,0,.45);
+    }
+    h1 { margin: 0 0 4px; font-size: 28px; letter-spacing: -.4px; }
+    .sub { margin: 0 0 28px; color: #9aa3b5; }
+    ol { margin: 0 0 26px; padding-left: 20px; color: #c3c9d6; }
+    ol li { margin: 6px 0; }
+    .cta { display: flex; justify-content: center; margin: 8px 0 4px; }
+    esp-web-install-button { --esp-tools-button-color: #0c0f16; --esp-tools-button-text-color: #fff; }
+    esp-web-install-button button, .fallback-btn {
+      font: 600 16px/1 inherit; padding: 14px 26px; border-radius: 12px; border: 0; cursor: pointer;
+      background: linear-gradient(180deg,#5b8cff,#3a6df0); color: #fff;
+    }
+    .unsupported { display: block; margin-top: 14px; color: #ffb4b4; font-size: 14px; text-align: center; }
+    .note { margin-top: 26px; padding-top: 20px; border-top: 1px solid #232b3b; color: #8b93a6; font-size: 14px; }
+    .note code { background: #0c0f16; padding: 2px 6px; border-radius: 6px; color: #c3c9d6; }
+    a { color: #7ea2ff; }
+  </style>
+  <script type="module" src="https://unpkg.com/esp-web-tools@10/dist/web/install-button.js?module"></script>
+</head>
+<body>
+  <main class="card">
+    <h1>Flash Claudeq</h1>
+    <p class="sub">Install the firmware on your Waveshare ESP32-S3-Touch-LCD-3.49 — straight from this page. Nothing to download.</p>
+
+    <ol>
+      <li>Use <b>Chrome</b> or <b>Edge</b> on a desktop (they speak WebSerial).</li>
+      <li>Plug the device into a USB-C port on your computer.</li>
+      <li>Click <b>Install</b>, pick the serial port, and let it flash (~30&nbsp;s).</li>
+    </ol>
+
+    <div class="cta">
+      <esp-web-install-button manifest="./manifest.json">
+        <button slot="activate" class="fallback-btn">Install</button>
+        <span slot="unsupported" class="unsupported">Your browser can't flash over USB — open this page in desktop Chrome or Edge.</span>
+        <span slot="not-allowed" class="unsupported">Serial access was blocked. Reload and allow the port when prompted.</span>
+      </esp-web-install-button>
+    </div>
+
+    <p class="note">
+      After flashing, the device boots into <b>WiFi setup</b>: on your phone join the
+      <code>Claudeq-setup</code> hotspot and enter your home WiFi. Then install the bridge with
+      <code>brew install Positronico/tap/claudeq</code> and run <code>claudeq</code> in any project.
+      See the <a href="https://github.com/Positronico/claudeq#readme">full guide</a>.
+    </p>
+  </main>
+</body>
+</html>

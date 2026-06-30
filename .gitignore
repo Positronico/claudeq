@@ -1,0 +1,81 @@
+# =====================================================================
+# Secrets — NEVER commit
+# =====================================================================
+# Real WiFi credentials. The firmware picks this up via __has_include; the
+# committed template is app_config.h (placeholders only). See PUBLISHING.md.
+wifi_secret.h
+firmware/**/wifi_secret.h
+
+# Generic secret material
+.env
+.env.*
+*.local
+*.pem
+*.key
+*.p12
+*.pfx
+*.keystore
+id_rsa*
+id_ed25519*
+credentials.json
+secrets.json
+*.secret
+
+# =====================================================================
+# macOS / editors
+# =====================================================================
+.DS_Store
+.AppleDouble
+Icon?
+Thumbs.db
+*.swp
+*~
+.idea/
+.vscode/
+
+# =====================================================================
+# Logs / runtime
+# =====================================================================
+*.log
+bridge/bridge.log
+
+# =====================================================================
+# ESP-IDF build output — machine-specific (embeds absolute build paths)
+# =====================================================================
+firmware/*/build/
+firmware/*/sdkconfig.old
+firmware/*/sdkconfig.ci
+firmware/*/sdkconfig.defaults.old
+
+# =====================================================================
+# ESP-IDF managed components — re-downloaded from the registry on build.
+# idf_component.yml + dependencies.lock are committed, so `idf.py build`
+# restores them deterministically. (~200MB of LVGL demo assets otherwise.)
+# =====================================================================
+firmware/*/managed_components/
+
+# =====================================================================
+# Large on-demand downloads
+# =====================================================================
+# whisper voice model — >100MB, exceeds GitHub's per-file limit; fetched by
+# the optional voice-setup step into ~/.claudeq/whisper (outside the repo).
+tools/whisper-models/
+*.wav
+
+# =====================================================================
+# Waveshare reference SDKs — local reference only, not needed to build or
+# run Claudeq. Each is its own nested git clone (would commit as a broken
+# gitlink). Keep them out of the published repo.
+# =====================================================================
+vendor/
+
+# =====================================================================
+# Node
+# =====================================================================
+# bridge/node_modules IS committed on purpose: Homebrew sandboxes network
+# during `install`, so vendoring the two tiny runtime deps (ws,
+# bonjour-service — pure JS, no native/postinstall) makes `brew install`
+# work offline. To switch to install-time `npm ci` instead, un-ignore it.
+# bridge/node_modules/
+npm-debug.log*
+yarn-error.log*

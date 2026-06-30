@@ -1,0 +1,45 @@
+# Publishing & releasing Claudeq
+
+How the no-tools install is wired, and how to ship a new version.
+
+## The three repos
+| Repo | Holds | URL |
+|---|---|---|
+| `Positronico/claudeq` | this project (firmware, bridge, dist, docs, CI) | https://github.com/Positronico/claudeq |
+| `Positronico/positronico.github.io` | the browser flasher, under `/claudeq/` | https://positronico.github.io/claudeq/ |
+| `Positronico/homebrew-tap` | the Homebrew formula (`Formula/claudeq.rb`) | `brew install Positronico/tap/claudeq` |
+
+## What a new owner does
+1. Open **https://positronico.github.io/claudeq/** in Chrome/Edge → **Install** (firmware, ~30 s).
+2. `brew install Positronico/tap/claudeq` (the bridge).
+3. Join the `Claudeq-setup` WiFi on their phone → enter their network.
+4. `cd project && claudeq`.
+
+No compiler, no ESP-IDF, no Python.
+
+## CI/CD (in `Positronico/claudeq`)
+- **`.github/workflows/ci.yml`** — every push/PR: builds the ESP-IDF firmware (re-fetching managed
+  components from `dependencies.lock`), repackages the dist, and sanity-checks the bridge.
+- **`.github/workflows/release.yml`** — on a `vX.Y.Z` tag: builds the firmware and attaches the
+  flashable binaries (`claudeq-firmware.bin`, parts, `manifest.json`) to a GitHub Release.
+
+## Cutting a new firmware version
+1. Build + repackage locally (or let CI do it): `cd firmware/companion && idf.py build && ../dist/build-dist.sh`
+   (bump `firmware/dist/VERSION` first). Commit the updated `firmware/dist/claudeq-firmware.bin`.
+2. Tag and push: `git tag vX.Y.Z && git push --tags` → `release.yml` publishes the binaries.
+3. **Web flasher:** copy `firmware/dist/{claudeq-firmware.bin,manifest.json}` and `flasher/index.html`
+   into the `claudeq/` folder of the `positronico.github.io` repo and push. (It serves the merged
+   image next to the page; the manifest points at it relatively.)
+4. **Homebrew:** in `homebrew-tap`, update `Formula/claudeq.rb` `url` to the new tag and refresh the
+   `sha256`:
+   ```bash
+   curl -L https://github.com/Positronico/claudeq/archive/refs/tags/vX.Y.Z.tar.gz | shasum -a 256
+   ```
+   then `brew install --build-from-source Positronico/tap/claudeq` to smoke-test.
+
+## Secrets / hygiene
+Real WiFi credentials live only in `firmware/companion/main/wifi_secret.h`, which is **gitignored**
+(the committed `app_config.h` has placeholders). The top-level `.gitignore` also keeps the 141 MB
+whisper model, `firmware/*/build`, `firmware/*/managed_components` (~200 MB, re-fetched on build),
+`vendor/` reference SDKs, and logs out of the repo. `bridge/node_modules` **is** committed on purpose
+so `brew install` works offline (Homebrew sandboxes network during install).

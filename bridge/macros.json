@@ -1,0 +1,8 @@
+[
+  { "id": "review",   "icon": "🔍", "label": "Code review", "prompt": "/code-review" },
+  { "id": "tests",    "icon": "✅", "label": "Run tests",   "prompt": "run the tests and fix any failures" },
+  { "id": "commit",   "icon": "💾", "label": "Commit",      "prompt": "/commit" },
+  { "id": "continue", "icon": "▶",  "label": "Continue",    "prompt": "continue" },
+  { "id": "explain",  "icon": "💡", "label": "Explain",     "prompt": "explain what you just did and why" },
+  { "id": "effort",   "icon": "⚙",  "label": "Effort",      "prompt": "/effort" }
+]

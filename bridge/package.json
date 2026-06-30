@@ -1,0 +1,15 @@
+{
+  "name": "claude-deck-bridge",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Bridge between Claude Code (hooks) and the ESP32 Claude Deck device",
+  "main": "bridge.mjs",
+  "scripts": {
+    "start": "node bridge.mjs"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "bonjour-service": "^1.4.2",
+    "ws": "^8.21.0"
+  }
+}

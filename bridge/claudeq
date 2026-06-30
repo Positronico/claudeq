@@ -1,0 +1,67 @@
+#!/bin/bash
+# claudeq — run Claude Code wired to the Claudeq deck, with one command.
+#
+#   cd ~/any-project && claudeq          # then drive this session from the deck
+#
+# What it does:
+#   1. starts the bridge if it isn't already running (survives terminal close),
+#   2. names this session after the project so it shows up as a chip on the deck,
+#   3. exports its identity so the deck hooks can route questions/macros/voice here,
+#   4. launches Claude Code with the deck hooks merged on top of your normal settings.
+#
+# Run it in as many projects/terminals as you like — each becomes its own chip.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SETTINGS="$SCRIPT_DIR/ccdeck-settings.json"
+
+# ---- `claudeq flash` — write the firmware to the device, no toolchain (delegates to flash.sh) ----
+if [ "${1:-}" = "flash" ]; then
+  shift
+  for cand in "$SCRIPT_DIR/../firmware/dist/flash.sh" "$SCRIPT_DIR/firmware/dist/flash.sh"; do
+    [ -x "$cand" ] && exec "$cand" "$@"
+  done
+  echo "claudeq: flash.sh not found next to this install." >&2
+  echo "         Flash from the browser instead: https://positronico.github.io/claudeq/" >&2
+  exit 1
+fi
+
+PORT="${CCDECK_PORT:-8787}"
+export CCDECK_PORT="$PORT"
+
+# ---- 1. make sure the bridge is up ----
+if ! curl -fsS -m 1 "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; then
+  echo "claudeq: starting bridge on :${PORT}..."
+  # Append (not truncate): if two launchers race to start the bridge, the loser exits on
+  # EADDRINUSE (harmless, one wins) and must not clobber the winner's startup log.
+  nohup node "$SCRIPT_DIR/bridge.mjs" >>"$SCRIPT_DIR/bridge.log" 2>&1 &
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    curl -fsS -m 1 "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1 && break
+    sleep 0.3
+  done
+  if ! curl -fsS -m 1 "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; then
+    echo "claudeq: bridge failed to start — see $SCRIPT_DIR/bridge.log" >&2
+  fi
+fi
+
+# ---- 2. project title + tmux target ----
+TITLE="$(basename "$PWD" | tr -cd '[:alnum:]._ -' | cut -c1-24)"
+[ -z "$TITLE" ] && TITLE="session"
+
+if [ -n "${TMUX:-}" ]; then
+  # Already inside tmux: use the current session as the inject target, no nesting.
+  TARGET="$(tmux display-message -p '#S')"
+  export CLAUDEQ_TMUX="$TARGET" CLAUDEQ_TITLE="$TITLE"
+  exec claude --settings "$SETTINGS" "$@"
+fi
+
+# Fresh tmux session named after the project (sanitized; tmux dislikes . and :).
+SLUG="$(echo "$TITLE" | tr '[:upper:] ' '[:lower:]-' | tr -cd 'a-z0-9-' )"
+[ -z "$SLUG" ] && SLUG="session"
+TARGET="claudeq-${SLUG}-$$"
+
+# Carry identity via tmux's per-session env (-e) and pass the command as a real argv vector, so
+# Claude args with spaces/quotes survive intact and hook child processes inherit CLAUDEQ_*.
+exec tmux new-session -s "$TARGET" \
+  -e "CLAUDEQ_TMUX=$TARGET" -e "CLAUDEQ_TITLE=$TITLE" -e "CCDECK_PORT=$PORT" \
+  claude --settings "$SETTINGS" "$@"

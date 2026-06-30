@@ -1,0 +1,217 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Claude Deck — mock device</title>
+<style>
+  :root{ --bg:#0a0b0f; --panel:#12141c; --ink:#e9edf5; --dim:#8a93a6; --line:#222633;
+         --accent:#d6743a; --accent2:#7aa2ff; --ok:#46c46a; --warn:#e8b84b; --err:#ef5a5a; }
+  *{ box-sizing:border-box; }
+  body{ margin:0; background:#05060a; color:var(--ink); font:14px/1.4 -apple-system,Segoe UI,Roboto,sans-serif;
+        display:flex; gap:24px; align-items:flex-start; padding:24px; }
+  /* device = native 172x640 portrait, scaled up x1.5 for viewing */
+  .device{ width:172px; height:640px; transform:scale(1.5); transform-origin:top left;
+           margin-right:120px; background:var(--bg); border-radius:18px; border:2px solid #1b1f2b;
+           box-shadow:0 0 0 6px #0c0e15, 0 18px 50px rgba(0,0,0,.6); overflow:hidden;
+           display:flex; flex-direction:column; position:relative; }
+  .statusbar{ height:34px; flex:0 0 auto; display:flex; align-items:center; gap:6px; padding:0 8px;
+              border-bottom:1px solid var(--line); font-size:11px; color:var(--dim); }
+  .dot{ width:9px; height:9px; border-radius:50%; background:var(--dim); flex:0 0 auto; }
+  .dot.idle{background:#4a5163} .dot.thinking{background:var(--accent2); animation:pulse 1s infinite}
+  .dot.working{background:var(--accent2)} .dot.waiting{background:var(--warn); animation:pulse .8s infinite}
+  .dot.done{background:var(--ok)} .dot.error{background:var(--err)}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+  .title{ font-weight:600; color:var(--ink); font-size:11px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:80px; }
+  .state{ color:var(--dim); font-size:10px; margin-left:auto; white-space:nowrap; }
+  .sessbar{ flex:0 0 auto; display:flex; gap:5px; padding:5px 6px; overflow-x:auto; border-bottom:1px solid var(--line); }
+  .sessbar:empty{ display:none; padding:0; border:0; }
+  .chip{ flex:0 0 auto; font-size:13px; padding:6px 14px; border-radius:16px; border:1px solid var(--line);
+         background:var(--panel); color:var(--dim); cursor:pointer; white-space:nowrap; }
+  .chip.focus{ border:2px solid var(--accent); color:var(--ink); background:rgba(214,116,58,.16); }
+  .chip.needs{ border-color:var(--warn); color:var(--warn); animation:pulse 1s infinite; }
+  .chip.needs.focus{ color:var(--ink); animation:none; }
+  .chip .host{ font-size:10px; color:var(--dim); margin-left:5px; }
+  .body{ flex:1 1 auto; overflow-y:auto; padding:8px; }
+  .hdr{ font-size:10px; letter-spacing:.08em; text-transform:uppercase; color:var(--accent);
+        background:rgba(214,116,58,.12); border:1px solid rgba(214,116,58,.3); border-radius:6px;
+        padding:3px 6px; display:inline-block; margin-bottom:6px; }
+  .q{ font-size:14px; font-weight:600; margin:2px 0 10px; }
+  .opt{ display:block; width:100%; text-align:left; background:var(--panel); color:var(--ink);
+        border:1px solid var(--line); border-radius:9px; padding:8px 9px; margin-bottom:7px; cursor:pointer; }
+  .opt:hover{ border-color:var(--accent2); }
+  .opt:active{ transform:scale(.98); }
+  .opt .l{ font-weight:600; font-size:13px; }
+  .opt .d{ font-size:10.5px; color:var(--dim); margin-top:2px; }
+  .opt.sel{ border-color:var(--accent); background:rgba(214,116,58,.14); }
+  .confirm{ width:100%; background:var(--accent); color:#1a1206; font-weight:700; border:0;
+            border-radius:9px; padding:9px; margin-top:2px; cursor:pointer; }
+  .placeholder{ color:var(--dim); text-align:center; margin-top:40px; font-size:12px; }
+  .macros{ display:flex; flex-direction:column; gap:7px; }
+  .macro{ background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:13px 10px;
+          text-align:center; cursor:pointer; }
+  .macro:hover{ border-color:var(--accent2); }
+  .macro .i{ font-size:18px; } .macro .t{ font-size:12px; margin-top:3px; color:var(--dim); }
+  .voicebtn{ margin:60px auto 0; width:120px; height:120px; border-radius:50%; background:var(--panel);
+             border:2px solid var(--accent); color:var(--accent); font-weight:700; display:flex;
+             align-items:center; justify-content:center; cursor:pointer; user-select:none; }
+  .voicebtn.rec{ background:rgba(239,90,90,.2); border-color:var(--err); color:var(--err); }
+  .hud .row{ display:flex; justify-content:space-between; border-bottom:1px solid var(--line);
+             padding:6px 2px; font-size:12px; }
+  .hud .row .k{ color:var(--dim); } .hud .row .v{ font-weight:600; }
+  .tabs{ flex:0 0 auto; display:grid; grid-template-columns:1fr 1fr; gap:6px; padding:6px;
+         border-top:1px solid var(--line); }
+  .tab{ text-align:center; padding:8px 0; font-size:11px; color:var(--dim); cursor:pointer;
+        background:var(--panel); border:1px solid var(--line); border-radius:10px; }
+  .tab .ic{ font-size:18px; display:block; margin-bottom:2px; }
+  .tab.active{ color:var(--accent); border-color:var(--accent); background:rgba(214,116,58,.12); }
+  .flash{ position:absolute; inset:0; background:var(--warn); opacity:0; pointer-events:none; }
+  .flash.on{ animation:fl .5s ease 3; }
+  @keyframes fl{0%,100%{opacity:0}50%{opacity:.22}}
+  /* side console */
+  .console{ width:520px; }
+  .console h2{ font-size:13px; color:var(--dim); font-weight:600; margin:0 0 8px; }
+  .conn{ font-size:12px; margin-bottom:8px; }
+  .conn b.up{color:var(--ok)} .conn b.down{color:var(--err)}
+  #log{ background:#0b0d13; border:1px solid var(--line); border-radius:8px; height:560px; overflow-y:auto;
+        padding:8px; font:11px/1.5 ui-monospace,Menlo,monospace; color:#aeb6c6; white-space:pre-wrap; }
+  .log-tx{ color:var(--accent2); } .log-rx{ color:var(--accent); } .log-sys{ color:var(--dim); }
+</style>
+</head>
+<body>
+  <div class="device">
+    <div class="statusbar"><span class="dot idle" id="dot"></span><span id="titletxt" class="title">—</span><span id="statetxt" class="state">connecting…</span></div>
+    <div class="sessbar" id="sessbar"></div>
+    <div class="body" id="body"></div>
+    <div class="tabs">
+      <div class="tab active" data-m="decide"><span class="ic">✓</span>Decide</div>
+      <div class="tab" data-m="macros"><span class="ic">⌨</span>Macros</div>
+      <div class="tab" data-m="voice"><span class="ic">🎙</span>Voice</div>
+      <div class="tab" data-m="hud"><span class="ic">☰</span>HUD</div>
+    </div>
+    <div class="flash" id="flash"></div>
+  </div>
+
+  <div class="console">
+    <h2>mock console</h2>
+    <div class="conn">WebSocket: <b id="connstate" class="down">disconnected</b> &nbsp;→ <code id="wsurl"></code></div>
+    <div id="log"></div>
+  </div>
+
+<script>
+// The deck connects to every bridge it discovers via mDNS. The browser can't do mDNS, so list
+// the bridge ports here: open with ?b=8787,8788 to mirror two machines. Default: 8787.
+const HOST = (location.protocol==='file:'? 'localhost' : location.hostname);
+const PORTS = (new URLSearchParams(location.search).get('b') || '8787').split(',').map(s=>s.trim()).filter(Boolean);
+document.getElementById('wsurl').textContent = PORTS.map(p=>`ws://${HOST}:${p}`).join('  ,  ');
+let mode='decide', ask=null, sel={}, hud={}, macros=[], state={state:'idle',text:'idle'};
+let sessions=[], focus=null, qIdx=0, answersAcc={}, hosts={};   // focus = {sid, bridge} | null; hosts[bridge]=machine
+let conns=[];   // per-bridge connection: {idx, ws, up}
+
+function log(msg, cls='log-sys'){ const el=document.getElementById('log');
+  const t=new Date().toLocaleTimeString();
+  el.innerHTML += `<span class="${cls}">[${t}] ${msg}</span>\n`; el.scrollTop=el.scrollHeight; }
+
+function connectBridge(idx){
+  const url = `ws://${HOST}:${PORTS[idx]}`;
+  const c = { idx, ws:null, up:false }; conns[idx]=c;
+  const open=()=>{
+    const ws=new WebSocket(url); c.ws=ws;
+    ws.onopen=()=>{ c.up=true; updateConn(); sendTo(idx,{type:'hello',name:'mock-device',fw:'mock-0.1',caps:['decide','macros','voice','hud']}); log(`b${idx} connected (${url})`); };
+    ws.onclose=()=>{ c.up=false; updateConn(); bridgeGone(idx); setTimeout(open,1000); };
+    ws.onmessage=(e)=>{ let m; try{m=JSON.parse(e.data)}catch{return;} log(`◀b${idx} ${e.data}`,'log-rx'); handle(m, idx); };
+  };
+  open();
+}
+function updateConn(){ const up=conns.filter(c=>c&&c.up).length;
+  const el=document.getElementById('connstate'); el.textContent=up?`connected (${up}/${PORTS.length})`:'disconnected'; el.className=up?'up':'down'; }
+function sendTo(bridge, o){ const c=conns[bridge]; if(c&&c.ws&&c.ws.readyState===1){ c.ws.send(JSON.stringify(o)); log(`▶b${bridge} ${JSON.stringify(o)}`,'log-tx'); } }
+function sendFocus(o){ if(focus) sendTo(focus.bridge, o); }   // macros/voice/answers -> the focused session's bridge
+function concernsFocus(m, bridge){ return focus && focus.bridge===bridge && (m.sid==null || m.sid===focus.sid); }
+
+function handle(m, bridge){
+  switch(m.type){
+    case 'sessions': if(m.host) hosts[bridge]=m.host; mergeSessions(m.list||[], bridge); renderSessions(); renderStatus(); if(mode==='decide') render(); break;
+    case 'status': if(concernsFocus(m,bridge)){ state=m; renderStatus(); } break;
+    case 'ask': if(m.sid){ focus={sid:m.sid, bridge}; } ask=m; qIdx=0; answersAcc={}; sel={}; mode='decide'; setTab(); renderSessions(); renderStatus(); render(); flash(); break;
+    case 'ask_cancel': if(concernsFocus(m,bridge)){ ask=null; render(); } break;
+    case 'hud': if(concernsFocus(m,bridge)){ hud=m; if(mode==='hud') render(); } break;
+    case 'macros': macros=m.items||[]; if(mode==='macros') render(); break;
+    case 'alert': flash(); log('ALERT: '+m.text,'log-sys'); break;
+  }
+}
+function mergeSessions(list, bridge){
+  sessions = sessions.filter(s=>s.bridge!==bridge).concat(list.map(s=>({...s, bridge})));
+  if(focus && !sessions.find(s=>s.bridge===focus.bridge && s.sid===focus.sid)){ focus=null; ask=null; }
+  if(!focus && sessions.length){ focus={sid:sessions[0].sid, bridge:sessions[0].bridge}; }
+}
+function bridgeGone(bridge){
+  sessions = sessions.filter(s=>s.bridge!==bridge);
+  if(focus && focus.bridge===bridge){ focus=null; ask=null; }
+  renderSessions(); renderStatus(); render();
+}
+function focusedTitle(){ const s=focus && sessions.find(x=>x.bridge===focus.bridge && x.sid===focus.sid); return s?s.title:'—'; }
+function renderSessions(){ const sb=document.getElementById('sessbar'); sb.innerHTML='';
+  if(sessions.length<=1){ return; }
+  sessions.forEach(s=>{ const c=document.createElement('div');
+    const isFoc = focus && s.bridge===focus.bridge && s.sid===focus.sid;
+    c.className='chip'+(isFoc?' focus':'')+(s.needs?' needs':'');
+    const clash = sessions.some(o=>o!==s && o.bridge!==s.bridge && o.title===s.title);
+    c.innerHTML = s.title + (clash && hosts[s.bridge] ? `<span class="host">@${hosts[s.bridge]}</span>` : '');
+    c.title=`${s.sid} @ bridge ${s.bridge}`;
+    c.onclick=()=>{ focus={sid:s.sid, bridge:s.bridge}; sendTo(s.bridge,{type:'focus', sid:s.sid}); renderSessions(); renderStatus(); };
+    sb.appendChild(c); }); }
+function renderStatus(){ document.getElementById('dot').className='dot '+(state.state||'idle');
+  document.getElementById('titletxt').textContent=focusedTitle();
+  document.getElementById('statetxt').textContent=(state.text||state.state||''); }
+function flash(){ const f=document.getElementById('flash'); f.classList.remove('on'); void f.offsetWidth; f.classList.add('on'); }
+
+function render(){
+  const b=document.getElementById('body'); b.innerHTML='';
+  if(mode==='decide'){
+    if(!ask){ b.innerHTML='<div class="placeholder">No question.<br>Waiting for Claude…</div>'; return; }
+    const q=ask.questions[qIdx];
+    const prog = ask.questions.length>1 ? ` (${qIdx+1}/${ask.questions.length})` : '';
+    b.innerHTML += `<span class="hdr">${(q.header||'Question')+prog}</span><div class="q">${q.question}</div>`;
+    q.options.forEach((o,i)=>{
+      const d=document.createElement('div'); d.className='opt'+(sel[i]?' sel':'');
+      d.innerHTML=`<div class="l">${o.label}</div>${o.description?`<div class="d">${o.description}</div>`:''}`;
+      d.onclick=()=>chooseOption(q,i); b.appendChild(d);
+    });
+    if(q.multiSelect){ const c=document.createElement('button'); c.className='confirm';
+      c.textContent='Confirm selection'; c.onclick=()=>confirmMulti(q); b.appendChild(c); }
+  } else if(mode==='macros'){
+    if(!macros.length){ b.innerHTML='<div class="placeholder">No macros configured.</div>'; return; }
+    const g=document.createElement('div'); g.className='macros';
+    macros.forEach(mc=>{ const d=document.createElement('div'); d.className='macro';
+      d.innerHTML=`<div class="i">${mc.icon||'▷'}</div><div class="t">${mc.label}</div>`;
+      d.onclick=()=>sendFocus({type:'macro', id:mc.id}); g.appendChild(d); });
+    b.appendChild(g);
+  } else if(mode==='voice'){
+    const v=document.createElement('div'); v.className='voicebtn'; v.textContent='HOLD';
+    v.onpointerdown=()=>{ v.classList.add('rec'); v.textContent='REC…'; sendFocus({type:'voice_start'}); };
+    const stop=()=>{ if(v.classList.contains('rec')){ v.classList.remove('rec'); v.textContent='HOLD'; sendFocus({type:'voice_end'}); } };
+    v.onpointerup=stop; v.onpointerleave=stop; b.appendChild(v);
+    b.innerHTML += '<div class="placeholder">Hold to talk →<br>transcribed into Claude</div>';
+  } else if(mode==='hud'){
+    const rows=[['model',hud.model||'—'],['elapsed',hud.elapsedMs?Math.round(hud.elapsedMs/1000)+'s':'—'],
+      ['tokens',hud.tokens??'—'],['cost',hud.costUSD!=null?'$'+(+hud.costUSD).toFixed(3):'—'],
+      ['last tool',hud.lastTool||'—'],['todos',(hud.todos&&hud.todos.length)||0]];
+    const w=document.createElement('div'); w.className='hud';
+    rows.forEach(([k,v])=>{ w.innerHTML+=`<div class="row"><span class="k">${k}</span><span class="v">${v}</span></div>`; });
+    b.appendChild(w);
+  }
+}
+function advanceAsk(){ qIdx++;
+  if(qIdx < ask.questions.length){ sel={}; render(); }      // more questions in this ask
+  else { sendFocus({type:'answer', id:ask.id, answers:answersAcc}); ask=null; render(); } }
+function chooseOption(q,i){ if(q.multiSelect){ sel[i]=!sel[i]; render(); }
+  else { answersAcc[q.question]=q.options[i].label; advanceAsk(); } }
+function confirmMulti(q){ answersAcc[q.question]=q.options.filter((_,i)=>sel[i]).map(o=>o.label).join(', '); advanceAsk(); }
+function setTab(){ document.querySelectorAll('.tab').forEach(t=>t.classList.toggle('active', t.dataset.m===mode)); }
+document.querySelectorAll('.tab').forEach(t=> t.onclick=()=>{ mode=t.dataset.m; setTab(); render(); });
+
+renderStatus(); render(); PORTS.forEach((_,i)=>connectBridge(i));
+</script>
+</body>
+</html>

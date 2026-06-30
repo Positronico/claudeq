@@ -1,0 +1,54 @@
+name: CI
+
+# Builds the whole system on every push/PR: the ESP-IDF firmware (and repackages the flashable
+# image) plus a sanity check of the Node bridge. Managed components are re-fetched from
+# dependencies.lock, so they don't need to live in the repo.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  firmware:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build firmware + repackage dist
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: v5.4.1
+          target: esp32s3
+          path: firmware/companion
+          command: idf.py build && ../dist/build-dist.sh
+      - name: Upload firmware artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: claudeq-firmware
+          path: |
+            firmware/dist/claudeq-firmware.bin
+            firmware/dist/bootloader.bin
+            firmware/dist/partition-table.bin
+            firmware/dist/claudeq-app.bin
+            firmware/dist/manifest.json
+          if-no-files-found: error
+
+  bridge:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install deps (from lockfile)
+        run: cd bridge && npm ci
+      - name: Syntax-check bridge + hooks
+        run: |
+          node --check bridge/bridge.mjs
+          for f in bridge/hooks/*.mjs; do node --check "$f"; done
+      - name: Shellcheck launcher + flash scripts
+        run: |
+          sudo apt-get update && sudo apt-get install -y shellcheck
+          shellcheck -S warning bridge/claudeq firmware/dist/flash.sh firmware/dist/build-dist.sh || true

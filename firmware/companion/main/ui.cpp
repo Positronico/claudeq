@@ -35,7 +35,7 @@ static int  sess_bridge[MAX_SESS];   // which bridge connection owns each sessio
 static int  sess_n = 0;
 static char focus_sid[48];
 static int  focus_bridge = -1;       // the focused session lives on this bridge
-#define MAX_BRIDGES 4
+// MAX_BRIDGES is defined in app.h (shared with net.cpp)
 static char bridge_host[MAX_BRIDGES][24];  // machine name per bridge (shown on a chip only on a title clash)
 // pages + bottom nav grid
 static lv_obj_t *t_decide, *t_macros, *t_voice, *t_hud;
@@ -81,9 +81,12 @@ static void style_card(lv_obj_t *o) {
 static void opt_clicked(lv_event_t *e);
 
 // ---------- activity feed (live "what's Claude doing" on the Decide page) ----------
+// The colored icon is the ONLY kind indicator now (no label word), so glyph + colour must read at a
+// glance: you=orange ›, Claude's tool=blue ›, done=green ✓, Claude's reply=green ‹, needs-you=yellow bell.
 static const char *feed_sym(const char *kind) {
     if (!kind) return LV_SYMBOL_RIGHT;
     if (!strcmp(kind, "done"))   return LV_SYMBOL_OK;
+    if (!strcmp(kind, "reply"))  return LV_SYMBOL_LEFT;
     if (!strcmp(kind, "notify")) return LV_SYMBOL_BELL;
     if (!strcmp(kind, "prompt")) return LV_SYMBOL_RIGHT;
     if (!strcmp(kind, "start"))  return LV_SYMBOL_PLAY;
@@ -91,6 +94,7 @@ static const char *feed_sym(const char *kind) {
 }
 static uint32_t feed_col(const char *kind) {
     if (kind && !strcmp(kind, "done"))   return COL_OK;
+    if (kind && !strcmp(kind, "reply"))  return COL_OK;
     if (kind && !strcmp(kind, "notify")) return COL_WARN;
     if (kind && !strcmp(kind, "prompt")) return COL_ACCENT;
     if (kind && !strcmp(kind, "start"))  return COL_DIM;
@@ -130,18 +134,18 @@ static void feed_add_row(const char *kind, const char *label, const char *detail
     lv_obj_set_style_radius(row, 4, 0);
     lv_obj_set_style_pad_hor(row, 2, 0);
     lv_obj_set_style_pad_ver(row, 2, 0);
-    lv_obj_set_style_pad_column(row, 4, 0);
+    lv_obj_set_style_pad_column(row, 5, 0);
     lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);  // icon at the first text line
     lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
-    uint32_t col = feed_col(kind);
-    lv_obj_t *pf = mklabel(row, feed_sym(kind), &lv_font_montserrat_12, col);
-    lv_obj_set_width(pf, 12);
-    lv_obj_t *lb = mklabel(row, label && label[0] ? label : "", &lv_font_montserrat_12, col);
-    lv_obj_set_width(lb, 44);
+    // Colored icon ONLY — the label word is dropped so the detail keeps (almost) the full width and
+    // wraps instead of being squeezed into a narrow column.
+    (void)label;
+    lv_obj_t *pf = mklabel(row, feed_sym(kind), &lv_font_montserrat_16, feed_col(kind));
+    lv_obj_set_width(pf, 20);
     lv_obj_t *dt = mklabel(row, detail ? detail : "", &lv_font_montserrat_12, COL_INK);
-    lv_label_set_long_mode(dt, LV_LABEL_LONG_DOT);
-    lv_obj_set_width(dt, 90);
+    lv_label_set_long_mode(dt, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(dt, 128);
     s_feed_n++;
     lv_obj_scroll_to_view(row, LV_ANIM_OFF);   // keep newest visible
 }

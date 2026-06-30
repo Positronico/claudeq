@@ -79,3 +79,6 @@ vendor/
 # bridge/node_modules/
 npm-debug.log*
 yarn-error.log*
+
+# Claude Code local state (settings, scheduled tasks) — never commit
+.claude/

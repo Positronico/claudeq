@@ -120,6 +120,7 @@ brew install cmake ninja node tmux ffmpeg
 
 **Firmware:**
 ```bash
+git submodule update --init --recursive   # microlink (Tailscale client) is a submodule
 . ~/esp/esp-idf/export.sh
 cd firmware/companion
 idf.py build

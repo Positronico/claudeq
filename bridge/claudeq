@@ -26,6 +26,22 @@ if [ "${1:-}" = "flash" ]; then
   exit 1
 fi
 
+# ---- `claudeq restart-bridge` — stop + relaunch the bridge (picks up edited bridge code) ----
+if [ "${1:-}" = "restart-bridge" ] || [ "${1:-}" = "restart" ]; then
+  PORT="${CCDECK_PORT:-8787}"
+  echo "claudeq: restarting bridge on :${PORT}..."
+  lsof -ti tcp:"$PORT" 2>/dev/null | xargs kill 2>/dev/null || true   # kill whatever holds the port
+  pkill -f "$SCRIPT_DIR/bridge.mjs" 2>/dev/null || true               # and any launcher-started copy
+  sleep 1
+  CCDECK_PORT="$PORT" nohup node "$SCRIPT_DIR/bridge.mjs" >>"$SCRIPT_DIR/bridge.log" 2>&1 &
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    curl -fsS -m 1 "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1 && { echo "claudeq: bridge restarted on :${PORT}."; exit 0; }
+    sleep 0.3
+  done
+  echo "claudeq: bridge failed to restart — see $SCRIPT_DIR/bridge.log" >&2
+  exit 1
+fi
+
 PORT="${CCDECK_PORT:-8787}"
 export CCDECK_PORT="$PORT"
 

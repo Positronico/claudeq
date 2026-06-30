@@ -14,11 +14,15 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import os from 'node:os';
 import { spawn, spawnSync } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { WebSocketServer } from 'ws';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = parseInt(process.env.CCDECK_PORT || '8787', 10);
 const SHORT_HOST = (process.env.CCDECK_HOST || os.hostname() || 'host').replace(/\.local$/, '').split('.')[0].slice(0, 16);  // for the deck to label chips on title clashes; override with CCDECK_HOST
+// Stable per-process id so the deck can tell that this bridge — reached via the LAN and via the tailnet
+// at two different IPs — is ONE machine, and show its sessions once. Override with CCDECK_BRIDGE_ID.
+const BRIDGE_ID = process.env.CCDECK_BRIDGE_ID || randomUUID();
 const DEFAULT_TMUX = process.env.CCDECK_TMUX_TARGET || 'ccdeck';   // fallback for legacy `cc`
 const ASK_TIMEOUT_MS = parseInt(process.env.CCDECK_ASK_TIMEOUT_MS || '280000', 10);
 const PRUNE_GRACE_MS = parseInt(process.env.CCDECK_PRUNE_GRACE_MS || '20000', 10);
@@ -64,6 +68,7 @@ function newSession(sid) {
     state: 'idle', text: 'idle', tool: null, attn: false,
     hud: { model: null, elapsedMs: 0, lastTool: null, todos: [], cwd: null },
     feed: [],                              // recent activity lines (for the "follow along" screen)
+    lastReplyId: '',                       // id of the last reply shown, so a flush race can't re-push a stale turn
     promptStartedAt: 0, pendingAsk: null, lastSeen: Date.now(),
   };
 }
@@ -105,7 +110,7 @@ function sessionsList() {
     .map((s) => ({ sid: s.sid, title: s.title, needs: needsAttn(s) }));
 }
 function broadcastSessions() {
-  broadcast({ type: 'sessions', list: sessionsList(), focus: focusedSid, host: SHORT_HOST });
+  broadcast({ type: 'sessions', list: sessionsList(), focus: focusedSid, host: SHORT_HOST, bridge_id: BRIDGE_ID });
 }
 function statusMsg(s) { return { type: 'status', sid: s.sid, state: s.state, text: s.text, tool: s.tool }; }
 function hudMsg(s) { return { type: 'hud', sid: s.sid, ...s.hud }; }
@@ -129,6 +134,36 @@ function describeTool(name, ti = {}) {
     case 'Skill': return clip(ti.command || ti.skill || ti.name);
     case 'TodoWrite': return ti.todos?.length ? ti.todos.length + ' items' : '';
     default: return '';
+  }
+}
+// Pull Claude's last text response out of the session transcript (read on Stop) so the deck can show
+// what Claude actually said, not just the tool activity. Returns '' if unavailable.
+function lastReply(transcriptPath) {
+  try {
+    const lines = fs.readFileSync(transcriptPath, 'utf8').split('\n');
+    for (let i = lines.length - 1; i >= 0; i--) {
+      if (!lines[i].trim()) continue;
+      let o; try { o = JSON.parse(lines[i]); } catch { continue; }
+      const m = o.message;
+      if (o.type !== 'assistant' && m?.role !== 'assistant') continue;
+      if (!Array.isArray(m?.content)) continue;
+      const text = m.content.filter((b) => b?.type === 'text').map((b) => b.text).join(' ').trim();
+      if (text) return { text, id: o.uuid || m.id || String(i) };  // id = this turn's message identity
+    }
+  } catch {}
+  return null;
+}
+// Push Claude's reply once the transcript has it. The Stop hook can fire before the final assistant
+// text message is flushed to disk (notably after extended thinking), so we retry briefly — and wait for a
+// reply from a NEW transcript message (by id), so a flush race never re-shows the prior turn AND two
+// turns with identical prose ("Done.") both still show.
+function pushReplyWhenReady(sid, transcriptPath, tries, prevId) {
+  const r = lastReply(transcriptPath);
+  if (r && r.id !== prevId) {
+    const s = sessions.get(sid);
+    if (s) { s.lastReplyId = r.id; pushFeed(s, 'reply', '', clip(r.text, 200)); console.log(`[reply] ${r.text.length} chars -> ${s.title}`); }
+  } else if (tries > 0) {
+    setTimeout(() => pushReplyWhenReady(sid, transcriptPath, tries - 1, prevId), 200);
   }
 }
 // Append a line to a session's feed; stream it to the deck if that session is focused.
@@ -325,6 +360,7 @@ function handleEvent(kind, ev, meta) {
       if (s.promptStartedAt) s.hud.elapsedMs = Date.now() - s.promptStartedAt;
       s.attn = false; setSessionStatus(s, 'done', 'done');
       pushFeed(s, 'done', 'done', s.hud.elapsedMs ? Math.round(s.hud.elapsedMs / 1000) + 's' : '');
+      if (ev.transcript_path) pushReplyWhenReady(s.sid, ev.transcript_path, 12, s.lastReplyId || '');
       broadcast({ type: 'alert', sid: s.sid, level: 'info', text: 'done', sound: 'soft' });
       sendSound('done'); broadcastSessions(); break;
   }
@@ -360,7 +396,7 @@ setInterval(sweepSessions, 8000).unref();
 // ---------- websocket ----------
 function sendSnapshot(ws) {
   ws.send(JSON.stringify({ type: 'macros', items: macros }));
-  ws.send(JSON.stringify({ type: 'sessions', list: sessionsList(), focus: focusedSid, host: SHORT_HOST }));
+  ws.send(JSON.stringify({ type: 'sessions', list: sessionsList(), focus: focusedSid, host: SHORT_HOST, bridge_id: BRIDGE_ID }));
   const s = sessions.get(focusedSid);
   if (s) {
     ws.send(JSON.stringify(statusMsg(s)));

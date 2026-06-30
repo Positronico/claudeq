@@ -29,6 +29,7 @@ bool cfg_load(claudeq_cfg_t *out) {
     snprintf(out->pass, sizeof(out->pass), "%s", WIFI_PASSWORD);
     snprintf(out->bridge, sizeof(out->bridge), "%s", BRIDGE_HOST);
     out->port = BRIDGE_PORT;
+    out->tailscale_authkey[0] = 0;
 
     bool forced = false, have_nvs = false;
     nvs_handle_t h;
@@ -39,6 +40,7 @@ bool cfg_load(claudeq_cfg_t *out) {
         n = sizeof(out->pass);   nvs_get_str(h, "pass", out->pass, &n);
         n = sizeof(out->bridge); nvs_get_str(h, "bridge", out->bridge, &n);
         uint16_t p; if (nvs_get_u16(h, "port", &p) == ESP_OK && p) out->port = p;
+        n = sizeof(out->tailscale_authkey); nvs_get_str(h, "authkey", out->tailscale_authkey, &n);
         nvs_close(h);
     }
     if (forced) return false;                 // user asked to re-run setup
@@ -46,13 +48,14 @@ bool cfg_load(claudeq_cfg_t *out) {
     return strlen(out->ssid) > 0 && strcmp(out->ssid, "YOUR_WIFI_SSID") != 0;  // else only usable if compiled-in
 }
 
-void cfg_save(const char *ssid, const char *pass, const char *bridge, int port) {
+void cfg_save(const char *ssid, const char *pass, const char *bridge, int port, const char *authkey) {
     nvs_handle_t h;
     if (nvs_open(NVS_NS, NVS_READWRITE, &h) != ESP_OK) return;
     nvs_set_str(h, "ssid", ssid ? ssid : "");
     nvs_set_str(h, "pass", pass ? pass : "");
     nvs_set_str(h, "bridge", bridge ? bridge : "");
     nvs_set_u16(h, "port", (uint16_t)(port > 0 ? port : BRIDGE_PORT));
+    nvs_set_str(h, "authkey", authkey ? authkey : "");
     nvs_set_u8(h, "force", 0);
     nvs_commit(h); nvs_close(h);
 }
@@ -97,6 +100,8 @@ static const char *FORM_HTML =
 "<label>WiFi password</label><input name=pass type=password placeholder=\"(leave blank if open)\">"
 "<label>Bridge address (your Mac's LAN IP)</label><input name=bridge value=\"%s\">"
 "<label>Bridge port</label><input name=port value=\"%d\">"
+"<label>Tailscale auth key (optional &mdash; to reach sessions across networks)</label>"
+"<input name=authkey type=password placeholder=\"tskey-auth-... (blank to skip)\">"
 "<button type=submit>Save &amp; restart</button></form></body></html>";
 
 static esp_err_t root_get(httpd_req_t *req) {
@@ -114,7 +119,7 @@ static esp_err_t root_get(httpd_req_t *req) {
 static void restart_task(void *arg) { vTaskDelay(pdMS_TO_TICKS(1200)); esp_restart(); }
 
 static esp_err_t save_post(httpd_req_t *req) {
-    char body[512];
+    char body[768];   // room for WiFi + bridge + a long Tailscale auth key
     int want = req->content_len < sizeof(body) - 1 ? (int)req->content_len : (int)sizeof(body) - 1;
     int total = 0;
     while (total < want) {
@@ -124,18 +129,19 @@ static esp_err_t save_post(httpd_req_t *req) {
         total += r;
     }
     body[total] = 0;
-    char ssid[65] = {0}, pass[65] = {0}, bridge[64] = {0}, port[8] = {0};
+    char ssid[65] = {0}, pass[65] = {0}, bridge[64] = {0}, port[8] = {0}, authkey[128] = {0};
     httpd_query_key_value(body, "ssid", ssid, sizeof(ssid));
     httpd_query_key_value(body, "pass", pass, sizeof(pass));
     httpd_query_key_value(body, "bridge", bridge, sizeof(bridge));
     httpd_query_key_value(body, "port", port, sizeof(port));
-    urldecode(ssid); urldecode(pass); urldecode(bridge); urldecode(port);
+    httpd_query_key_value(body, "authkey", authkey, sizeof(authkey));
+    urldecode(ssid); urldecode(pass); urldecode(bridge); urldecode(port); urldecode(authkey);
     if (!ssid[0] || strlen(ssid) > 32) {     // 802.11 SSID is <=32 octets; also reject empty
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Enter a WiFi network name (max 32 characters).");
         return ESP_FAIL;
     }
-    ESP_LOGI(TAG, "saving config: ssid=%s bridge=%s:%s", ssid, bridge, port);
-    cfg_save(ssid, pass, bridge, atoi(port));
+    ESP_LOGI(TAG, "saving config: ssid=%s bridge=%s:%s tailnet=%s", ssid, bridge, port, authkey[0] ? "yes" : "no");
+    cfg_save(ssid, pass, bridge, atoi(port), authkey);
     const char *ok = "<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>"
         "<body style='font-family:-apple-system,sans-serif;background:#0a0b0f;color:#e9edf5;text-align:center;padding-top:64px'>"
         "<h2 style='color:#46c46a'>Saved.</h2><p>Claudeq is restarting and will join your network.</p></body>";

@@ -18,14 +18,15 @@ void ui_set_connection(bool connected);  // update WiFi/WS indicator; takes the 
 void ui_show_setup(const char *ap_ssid, const char *ap_ip); // overlay shown while provisioning
 
 // --- Provisioning / config (provision.cpp) ---
-typedef struct { char ssid[33]; char pass[65]; char bridge[64]; int port; } claudeq_cfg_t;
+typedef struct { char ssid[33]; char pass[65]; char bridge[64]; int port; char tailscale_authkey[128]; } claudeq_cfg_t;
 bool cfg_load(claudeq_cfg_t *out);       // fill out (NVS or compile defaults); true if a usable SSID exists
-void cfg_save(const char *ssid, const char *pass, const char *bridge, int port);
+void cfg_save(const char *ssid, const char *pass, const char *bridge, int port, const char *authkey);
 void cfg_clear(void);                    // wipe saved config
 void provision_start(void);              // bring up the SoftAP captive portal
 void net_enter_setup(void);              // flag setup + reboot into the portal (called from the UI)
 
 // --- Net (net.cpp) ---
+#define MAX_BRIDGES 8                    // max simultaneous bridge connections (LAN mDNS + tailnet); shared by net.cpp + ui.cpp
 void net_start(void);                    // start wifi + multi-bridge discovery/websockets
 void net_send_to(int bridge, const char *json);     // send text to a specific bridge connection
 void net_send_text(const char *json);    // send text to the currently focused bridge

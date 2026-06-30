@@ -51,11 +51,11 @@
   .feed{ display:flex; flex-direction:column; gap:1px; }
   .feedline{ display:flex; align-items:baseline; gap:6px; padding:3px 3px; border-bottom:1px solid rgba(34,38,51,.5);
              font:11.5px/1.4 ui-monospace,Menlo,monospace; }
-  .feedline .fk{ flex:0 0 auto; width:10px; color:var(--dim); text-align:center; }
-  .feedline .fl{ flex:0 0 auto; min-width:58px; color:var(--accent2); font-weight:600; }
-  .feedline .fd{ flex:1 1 auto; color:var(--ink); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-  .feedline.k-done .fl{ color:var(--ok); } .feedline.k-notify .fl{ color:var(--warn); }
-  .feedline.k-prompt .fl{ color:var(--accent); } .feedline.k-start{ color:var(--dim); }
+  .feedline .fk{ flex:0 0 auto; width:15px; text-align:center; font-size:14px; color:var(--accent2); }  /* tool = blue, default */
+  .feedline .fd{ flex:1 1 auto; min-width:0; color:var(--ink); white-space:normal; overflow-wrap:anywhere; }
+  .feedline.k-prompt .fk{ color:var(--accent); }                              /* you = orange */
+  .feedline.k-done .fk{ color:var(--ok); } .feedline.k-reply .fk{ color:var(--ok); }   /* done/reply = green */
+  .feedline.k-notify .fk{ color:var(--warn); } .feedline.k-start .fk{ color:var(--dim); }
   .feedline.now{ background:rgba(122,162,255,.12); border-radius:4px; }
   .feedhint{ color:var(--dim); text-align:center; margin-top:30px; font-size:12px; }
   .macros{ display:flex; flex-direction:column; gap:7px; }
@@ -119,6 +119,9 @@ let mode='decide', ask=null, sel={}, hud={}, macros=[], state={state:'idle',text
 let sessions=[], focus=null, qIdx=0, answersAcc={}, hosts={};   // focus = {sid, bridge} | null; hosts[bridge]=machine
 let feed=[];                                                     // activity lines for the focused session
 let conns=[];   // per-bridge connection: {idx, ws, up}
+// dedup: a machine reachable via the LAN and the tailnet sends the same bridge_id from two connections.
+// Keep both; only the "primary" (lowest connected index here; the firmware prefers the LAN path) shows.
+let bidByBridge={}, lastListByBridge={}, primaryByBridge={};
 
 function log(msg, cls='log-sys'){ const el=document.getElementById('log');
   const t=new Date().toLocaleTimeString();
@@ -143,7 +146,11 @@ function concernsFocus(m, bridge){ return focus && focus.bridge===bridge && (m.s
 
 function handle(m, bridge){
   switch(m.type){
-    case 'sessions': if(m.host) hosts[bridge]=m.host; mergeSessions(m.list||[], bridge); renderSessions(); renderStatus(); if(mode==='decide') render(); break;
+    case 'sessions':
+      if(m.host) hosts[bridge]=m.host;
+      bidByBridge[bridge]=m.bridge_id??null; lastListByBridge[bridge]=m.list||[];
+      electPrimary(); rebuildSessions(); renderSessions(); renderStatus(); if(mode==='decide') render();
+      break;
     case 'status': if(concernsFocus(m,bridge)){ state=m; renderStatus(); } break;
     case 'ask': if(m.sid){ if(!focus || focus.bridge!==bridge || focus.sid!==m.sid) feed=[]; focus={sid:m.sid, bridge}; } ask=m; qIdx=0; answersAcc={}; sel={}; mode='decide'; setTab(); renderSessions(); renderStatus(); render(); flash(); break;
     case 'ask_cancel': if(concernsFocus(m,bridge)){ ask=null; render(); } break;
@@ -156,13 +163,26 @@ function handle(m, bridge){
     case 'alert': flash(); log('ALERT: '+m.text,'log-sys'); break;
   }
 }
-function mergeSessions(list, bridge){
-  sessions = sessions.filter(s=>s.bridge!==bridge).concat(list.map(s=>({...s, bridge})));
+// Elect one primary connection per bridge_id (lowest connected index wins; a bridge with no id is its
+// own primary — backward compatible). Shadows stay connected but contribute no sessions.
+function electPrimary(){
+  primaryByBridge={}; const winner={};
+  conns.forEach(c=>{ if(!c||!c.up) return; const b=c.idx, id=bidByBridge[b];
+    if(id==null){ primaryByBridge[b]=true; return; }
+    if(winner[id]===undefined || b<winner[id]) winner[id]=b; });
+  conns.forEach(c=>{ if(!c||!c.up) return; const b=c.idx, id=bidByBridge[b];
+    if(id!=null) primaryByBridge[b]=(winner[id]===b); });
+}
+function rebuildSessions(){
+  sessions=[];
+  conns.forEach(c=>{ if(!c||!c.up||!primaryByBridge[c.idx]) return;
+    (lastListByBridge[c.idx]||[]).forEach(s=>sessions.push({...s, bridge:c.idx})); });
   if(focus && !sessions.find(s=>s.bridge===focus.bridge && s.sid===focus.sid)){ focus=null; ask=null; feed=[]; }
   if(!focus && sessions.length){ focus={sid:sessions[0].sid, bridge:sessions[0].bridge}; feed=[]; }
 }
 function bridgeGone(bridge){
-  sessions = sessions.filter(s=>s.bridge!==bridge);
+  delete bidByBridge[bridge]; delete lastListByBridge[bridge]; delete primaryByBridge[bridge];
+  electPrimary(); rebuildSessions();   // a surviving shadow on another path is promoted -> its sessions show
   if(focus && focus.bridge===bridge){ focus=null; ask=null; feed=[]; }
   renderSessions(); renderStatus(); render();
 }
@@ -218,14 +238,14 @@ function render(){
     b.appendChild(w);
   }
 }
-const FEED_SYM={tool:'›', prompt:'»', notify:'!', done:'✓', start:'·', thinking:'…'};
+const FEED_SYM={tool:'›', prompt:'›', notify:'!', done:'✓', start:'·', thinking:'…', reply:'‹'};
 function renderFeed(b){
   if(!feed.length){ b.innerHTML='<div class="feedhint">'+(focus?'Claude is idle.<br>Following along…':'Waiting for a session…')+'</div>'; return; }
   const active = state.state==='working' || state.state==='thinking';
   const w=document.createElement('div'); w.className='feed';
   feed.forEach((ln,i)=>{ const d=document.createElement('div');
     d.className='feedline k-'+(ln.kind||'tool')+(active && i===feed.length-1?' now':'');
-    d.innerHTML=`<span class="fk">${FEED_SYM[ln.kind]||'›'}</span><span class="fl">${ln.label||''}</span><span class="fd">${ln.detail||''}</span>`;
+    d.innerHTML=`<span class="fk">${FEED_SYM[ln.kind]||'›'}</span><span class="fd">${ln.detail||''}</span>`;
     w.appendChild(d); });
   b.appendChild(w);
   b.scrollTop=b.scrollHeight;   // auto-scroll to newest

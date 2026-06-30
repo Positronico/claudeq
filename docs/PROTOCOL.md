@@ -21,7 +21,7 @@ focused session's tmux target on its bridge. A question auto-focuses the session
 ## Bridge → Device
 | type | fields | meaning |
 |---|---|---|
-| `sessions` | `list[]` = `{sid, title, needs}`, `focus` (sid), `host` | Session chips + which is focused + the bridge's machine name. `needs` = pending question/attention. The deck shows `host` on a chip only when that title also exists on another bridge (a cross-machine clash). Override the name with `CCDECK_HOST`. |
+| `sessions` | `list[]` = `{sid, title, needs}`, `focus` (sid), `host`, `bridge_id` | Session chips + which is focused + the bridge's machine name + a stable per-process id. `needs` = pending question/attention. The deck shows `host` on a chip only when that title also exists on another bridge (a cross-machine clash). `bridge_id` lets the deck recognize that the same bridge reached via the LAN *and* the tailnet (two different IPs) is one machine, and show its sessions once (keeping both connections, preferring the LAN path, failing over instantly if it drops). Override with `CCDECK_HOST` / `CCDECK_BRIDGE_ID`. |
 | `status` | `sid`, `state` (`idle`/`thinking`/`working`/`waiting`/`done`/`error`), `text`, `tool` | Live state of the focused session for the status strip |
 | `ask` | `id`, `sid`, `questions[]` = `{question, header, multiSelect, options[]:{label,description}}` | A question to render; user taps to choose. Sent **after** the `sessions` message that focuses `sid` |
 | `ask_cancel` | `sid`, `id?`, `reason` | Question resolved/cancelled (or focus moved to a session with no pending question) — clear it |

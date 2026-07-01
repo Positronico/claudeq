@@ -175,5 +175,6 @@ Two ways the deck reaches a session:
 | `packaging/homebrew/` | Homebrew formula for the bridge |
 | `docs/PINOUT.md` | hardware pinout, V1/V2 detection, audio gotchas |
 | `docs/PROTOCOL.md` | device ↔ bridge WebSocket message protocol |
+| `docs/HARDWARE.md` | alternative boards for a quick hardware swap, ranked by port effort |
 
 </details>

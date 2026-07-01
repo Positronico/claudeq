@@ -28,9 +28,11 @@ static uint16_t *lvgl_dma_buf = NULL;
 static SemaphoreHandle_t lvgl_flush_semap;
 static esp_io_expander_handle_t io_expander = NULL;
 
-#if (Rotated == USER_DISP_ROT_90)
+// Rotated framebuffer + runtime rotation flag — declared UNCONDITIONALLY (landscape is a runtime toggle now,
+// not the compile-time `Rotated` default). false = native portrait (172x640), true = landscape (640x172).
+// Read by flush_cb + touch_cb, set by app_set_rotation(); all run in the LVGL task, so no locking needed.
 uint16_t* rotat_ptr = NULL;
-#endif
+static volatile bool g_landscape = false;
 
 
 #define LCD_BIT_PER_PIXEL (16)
@@ -110,10 +112,9 @@ static void example_lcd_backlight_set(bool enable)
 extern "C" void app_main(void)
 {
     example_lcd_pwm_off_early();
-#if (Rotated == USER_DISP_ROT_90)
+    // landscape reader rotates into this buffer; allocate always (same pixel count as portrait: 172*640 = 640*172)
     rotat_ptr = (uint16_t*)heap_caps_malloc(EXAMPLE_LCD_H_RES * EXAMPLE_LCD_V_RES * sizeof(uint16_t), MALLOC_CAP_SPIRAM);
     assert(rotat_ptr);
-#endif
     lvgl_flush_semap = xSemaphoreCreateBinary();
     i2c_master_Init();
     example_lcd_exio_init();
@@ -203,6 +204,7 @@ extern "C" void app_main(void)
   	assert(lvgl_mux);
   	xTaskCreatePinnedToCore(example_lvgl_port_task, "LVGL", 4000, NULL, 4, NULL,0); //运行于内核_0
   	xTaskCreatePinnedToCore(example_backlight_loop_task, "example_backlight_loop_task", 4 * 1024, NULL, 2, NULL,0); 
+    net_preload_config();   // load saved config so the Settings switches reflect real state at build time
     if (example_lvgl_lock(-1))
   	{
   	  	ui_init();
@@ -213,17 +215,22 @@ extern "C" void app_main(void)
 }
 static void example_lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *color_map)
 {
-#if (Rotated == USER_DISP_ROT_90)
-    uint32_t index = 0;
-    uint16_t *data_ptr = (uint16_t *)color_map;
-    for (uint16_t j = 0; j < EXAMPLE_LCD_H_RES; j++)
-    {
-        for (uint16_t i = 0; i < EXAMPLE_LCD_V_RES; i++)
-        {
-            rotat_ptr[index++] = data_ptr[EXAMPLE_LCD_H_RES * (EXAMPLE_LCD_V_RES - i - 1) + j];             
-        }
+    (void)area;
+    // Runtime rotation. Portrait: draw the buffer as-is. Landscape (LVGL renders a 640x172 logical frame
+    // with sw_rotate=0 + ROT_90): rotate it into the 172x640 physical panel. Uses the FIXED panel dims
+    // (LCD_NOROT_*), so the transform is correct regardless of the compile-time `Rotated` default and the
+    // portrait path stays byte-identical to before.
+    uint16_t *map;
+    if (g_landscape) {
+        uint16_t *src = (uint16_t *)color_map;
+        uint32_t index = 0;
+        for (int j = 0; j < LCD_NOROT_VRES; j++)
+            for (int i = 0; i < LCD_NOROT_HRES; i++)
+                rotat_ptr[index++] = src[LCD_NOROT_VRES * (LCD_NOROT_HRES - 1 - i) + j];
+        map = rotat_ptr;
+    } else {
+        map = (uint16_t *)color_map;
     }
-#endif
     esp_lcd_panel_handle_t panel_handle = (esp_lcd_panel_handle_t) drv->user_data;
     const int flush_coun = (LVGL_SPIRAM_BUFF_LEN / LVGL_DMA_BUFF_LEN);
     const int offgap = (LCD_NOROT_VRES / flush_coun);
@@ -232,12 +239,6 @@ static void example_lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_
     int offsety1 = 0;
     int offsetx2 = LCD_NOROT_HRES;
     int offsety2 = offgap;
-
-#if (Rotated == USER_DISP_ROT_90)
-    uint16_t *map = (uint16_t *)rotat_ptr;
-#else
-    uint16_t *map = (uint16_t *)color_map;
-#endif
 
     xSemaphoreGive(lvgl_flush_semap);
     for(int i = 0; i<flush_coun; i++)
@@ -301,17 +302,17 @@ static void example_lvgl_touch_cb(lv_indev_drv_t *drv, lv_indev_data_t *data)
     if (buff[1]>0 && buff[1]<5)
     {
         data->state = LV_INDEV_STATE_PR;
-#if (Rotated == USER_DISP_ROT_NONO)
-        if(pointX > EXAMPLE_LCD_V_RES) pointX = EXAMPLE_LCD_V_RES;
-        if(pointY > EXAMPLE_LCD_H_RES) pointY = EXAMPLE_LCD_H_RES;
-        data->point.x = pointY;
-        data->point.y = (EXAMPLE_LCD_V_RES-pointX);
-#else
-        if(pointX > EXAMPLE_LCD_H_RES) pointX = EXAMPLE_LCD_H_RES;
-        if(pointY > EXAMPLE_LCD_V_RES) pointY = EXAMPLE_LCD_V_RES;
-        data->point.x = (EXAMPLE_LCD_H_RES - pointX);
-        data->point.y = (EXAMPLE_LCD_V_RES - pointY);
-#endif
+        // Native touch coords: long axis (0..640) in pointX, short axis (0..172) in pointY. Map to LVGL
+        // logical coords for the CURRENT rotation (fixed panel dims; matches the reference portrait/landscape).
+        if (pointX > LCD_NOROT_VRES) pointX = LCD_NOROT_VRES;
+        if (pointY > LCD_NOROT_HRES) pointY = LCD_NOROT_HRES;
+        if (!g_landscape) {   // portrait
+            data->point.x = pointY;
+            data->point.y = (LCD_NOROT_VRES - pointX);
+        } else {              // landscape (640x172)
+            data->point.x = (LCD_NOROT_VRES - pointX);
+            data->point.y = (LCD_NOROT_HRES - pointY);
+        }
     }
     else 
     {
@@ -340,6 +341,20 @@ static void example_backlight_loop_task(void *arg)
 
 // Bridge between net/ui modules and the LVGL mutex owned by this translation unit.
 extern "C" bool ui_lock(int timeout_ms) { return example_lvgl_lock(timeout_ms); }
+
+// Toggle the display between native portrait and landscape (for the reader). Call under the LVGL lock.
+// NOTE: we deliberately do NOT use lv_disp_set_rotation() — that also makes LVGL rotate the touch input
+// (lv_indev.c), which would double-transform on top of our own touch_cb rotation. Instead we swap only the
+// logical resolution (rotated stays NONE), so LVGL lays out landscape while our flush_cb + touch_cb own the
+// rotation consistently. Buffer is fine either way: 172*640 == 640*172 pixels.
+extern "C" void app_set_rotation(bool landscape) {
+    g_landscape = landscape;
+    lv_disp_t *disp = lv_disp_get_default();
+    if (!disp) return;
+    disp->driver->hor_res = landscape ? LCD_NOROT_VRES : LCD_NOROT_HRES;   // 640 or 172
+    disp->driver->ver_res = landscape ? LCD_NOROT_HRES : LCD_NOROT_VRES;   // 172 or 640
+    lv_disp_drv_update(disp, disp->driver);
+}
 extern "C" void ui_unlock(void) { example_lvgl_unlock(); }
 extern "C" void app_io_set_pa(bool on) {
     if (io_expander) esp_io_expander_set_level(io_expander, EXAMPLE_EXIO_PIN_NS_MODE, on ? 1 : 0);

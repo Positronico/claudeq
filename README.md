@@ -3,8 +3,9 @@
 A Waveshare **ESP32-S3-Touch-LCD-3.49** turned into a physical control surface for **Claude Code**.
 
 When Claude asks you something, the options pop up on the little touchscreen and you **tap to answer**.
-The screen shows what Claude is doing, chirps when it needs you, and has a macro deck and hold-to-talk
-voice. Run it across **as many Claude sessions as you like** — each becomes a tappable chip.
+The screen shows what Claude is doing, chirps when it needs you, and has a macro deck and tap-to-talk
+voice — with an on-screen **Send/Cancel** so nothing reaches Claude until you approve it. Run it across
+**as many Claude sessions as you like** — each becomes a tappable chip.
 
 <p align="center"><i>Tap to answer · glance at status · fire macros · talk to Claude — for every session, from one little screen.</i></p>
 
@@ -34,8 +35,8 @@ creates a temporary hotspot:
 3. Enter your **2.4 GHz WiFi** and **Save**. *(Leave Bridge address blank — the deck finds every
    bridge on your network automatically via mDNS.)*
 
-The deck restarts and connects. Settings live on the device. To change networks later, **hold the
-"WiFi setup" button on the HUD tab** — or just power it up somewhere new.
+The deck restarts and connects. Settings live on the device. To change networks later, open the
+**Settings** tab and **hold** "WiFi portal" — or just power it up somewhere new.
 
 ### Voice (optional) — local transcription, no API key
 Download the model to a fixed location and point the bridge at it (works for both the `brew` and
@@ -69,8 +70,8 @@ after the project (so it shows up as a chip), and enables the deck. Plain `claud
 | Claude asks a question | The options appear — **tap one to answer**. Multi-question prompts step through each. |
 | **Tap a session chip** (top) | Switch which session the deck controls. Chips glow when a session needs you. |
 | **Macros** tab | Tap a saved prompt/slash-command → sent to the focused session. |
-| **Voice** tab | **Hold** the button and talk → transcribed into the focused session's prompt. |
-| **HUD** tab | Live model / elapsed / last tool / todo count. |
+| **Voice** (mic) | **Tap** the mic and speak, then **Stop** → review the transcript and tap **Send** (or Cancel). |
+| **Settings** tab | Toggle **WiFi** / **Tailscale**, or hold **WiFi portal** to reconfigure. (Live model/elapsed/tool/todos now shows at the bottom of the **Session** tab.) |
 
 **Multiple sessions — even across computers:** run `claudeq` in more terminals or projects, on this Mac
 *or any other machine on the same network*. The deck auto-discovers every bridge (mDNS) and merges all

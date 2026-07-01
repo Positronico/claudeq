@@ -30,6 +30,8 @@ bool cfg_load(claudeq_cfg_t *out) {
     snprintf(out->bridge, sizeof(out->bridge), "%s", BRIDGE_HOST);
     out->port = BRIDGE_PORT;
     out->tailscale_authkey[0] = 0;
+    out->wifi_enabled = 1;         // Settings toggles default ON; only NVS turns them off
+    out->tailscale_enabled = 1;
 
     bool forced = false, have_nvs = false;
     nvs_handle_t h;
@@ -41,6 +43,8 @@ bool cfg_load(claudeq_cfg_t *out) {
         n = sizeof(out->bridge); nvs_get_str(h, "bridge", out->bridge, &n);
         uint16_t p; if (nvs_get_u16(h, "port", &p) == ESP_OK && p) out->port = p;
         n = sizeof(out->tailscale_authkey); nvs_get_str(h, "authkey", out->tailscale_authkey, &n);
+        uint8_t en; if (nvs_get_u8(h, "wifi_en", &en) == ESP_OK) out->wifi_enabled = en;
+        if (nvs_get_u8(h, "ts_en", &en) == ESP_OK) out->tailscale_enabled = en;
         nvs_close(h);
     }
     if (forced) return false;                 // user asked to re-run setup
@@ -57,7 +61,20 @@ void cfg_save(const char *ssid, const char *pass, const char *bridge, int port, 
     nvs_set_u16(h, "port", (uint16_t)(port > 0 ? port : BRIDGE_PORT));
     nvs_set_str(h, "authkey", authkey ? authkey : "");
     nvs_set_u8(h, "force", 0);
+    nvs_set_u8(h, "wifi_en", 1);   // provisioning WiFi implies wanting it on (clears a prior Settings disable)
     nvs_commit(h); nvs_close(h);
+}
+
+void cfg_set_wifi_enabled(uint8_t v) {
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS, NVS_READWRITE, &h) != ESP_OK) return;
+    nvs_set_u8(h, "wifi_en", v ? 1 : 0); nvs_commit(h); nvs_close(h);
+}
+
+void cfg_set_tailscale_enabled(uint8_t v) {
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS, NVS_READWRITE, &h) != ESP_OK) return;
+    nvs_set_u8(h, "ts_en", v ? 1 : 0); nvs_commit(h); nvs_close(h);
 }
 
 void cfg_clear(void) {

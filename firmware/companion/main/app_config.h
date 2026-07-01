@@ -27,5 +27,5 @@
 #endif
 #define BRIDGE_WS_URI  "ws://" BRIDGE_HOST ":8787/"
 
-#define DEVICE_NAME    "claude-deck"
-#define DEVICE_FW      "0.1.2"
+#define DEVICE_NAME    "claudeq"
+#define DEVICE_FW      "0.2.0"

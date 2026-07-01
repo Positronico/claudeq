@@ -31,7 +31,7 @@ activity feed) is unchanged and routes over the surviving connection.
 ## What runs where
 | Piece | Change |
 |---|---|
-| **Deck** | adds the `microlink` component; `net.cpp` keeps mDNS discovery and adds tailnet-peer discovery; the setup portal gains a **Tailscale auth key** field (stored in NVS). microlink rides the existing WiFi STA connection — it does **not** manage WiFi. |
+| **Deck** | adds the `microlink` component; `net.cpp` keeps mDNS discovery and adds tailnet-peer discovery; the setup portal gains a **Tailscale auth key** field (stored in NVS). The deck joins the tailnet as node **`claudeq`**. The on-device **Settings** page toggles the tailnet on/off live (and WiFi, which reboots to apply). microlink rides the existing WiFi STA connection — it does **not** manage WiFi. |
 | **Bridge machines you want to reach remotely** | join your tailnet (stock Tailscale, or self-hosted Headscale) and bind the bridge to the tailnet IP. Machines you only reach at home need no Tailscale — mDNS covers them. |
 
 ## ⚠️ Key security on the device — read before shipping
@@ -44,7 +44,7 @@ as a device that can be lost or stolen.**
   dump flash and extract the node key — which is a credential that can join/impersonate the deck on your
   tailnet until revoked.
 - **Mitigations (do these):**
-  - **Scope the key.** Use a **tagged** auth key (e.g. `tag:claudeq-deck`) and an **ACL** that lets that
+  - **Scope the key.** Use a **tagged** auth key (e.g. `tag:claudeq`) and an **ACL** that lets that
     tag reach **only** the bridge port (`tcp:8787`) on `tag:claudeq-bridge` — never your whole tailnet.
     Prefer **ephemeral** and/or short-lived **reusable** keys so a leaked key has a small blast radius.
   - **Revoke on loss.** If the deck is lost, **delete the node** in the Tailscale/Headscale admin console

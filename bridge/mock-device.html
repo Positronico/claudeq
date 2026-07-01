@@ -47,7 +47,7 @@
   .confirm{ width:100%; background:var(--accent); color:#1a1206; font-weight:700; border:0;
             border-radius:9px; padding:9px; margin-top:2px; cursor:pointer; }
   .placeholder{ color:var(--dim); text-align:center; margin-top:40px; font-size:12px; }
-  /* live activity feed (Decide screen when no question) */
+  /* live activity feed (Session screen when no question) */
   .feed{ display:flex; flex-direction:column; gap:1px; }
   .feedline{ display:flex; align-items:baseline; gap:6px; padding:3px 3px; border-bottom:1px solid rgba(34,38,51,.5);
              font:11.5px/1.4 ui-monospace,Menlo,monospace; }
@@ -70,6 +70,12 @@
   .hud .row{ display:flex; justify-content:space-between; border-bottom:1px solid var(--line);
              padding:6px 2px; font-size:12px; }
   .hud .row .k{ color:var(--dim); } .hud .row .v{ font-weight:600; }
+  /* compact telemetry strip at the bottom of the Session page */
+  .hudstrip{ margin-top:10px; padding-top:6px; border-top:1px solid var(--line); color:var(--dim);
+             font-size:10px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  /* Settings rows (device-local toggles; no bridge protocol) */
+  .setrow{ display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid var(--line);
+           padding:12px 2px; font-size:14px; }
   .tabs{ flex:0 0 auto; display:grid; grid-template-columns:1fr 1fr; gap:6px; padding:6px;
          border-top:1px solid var(--line); }
   .tab{ text-align:center; padding:8px 0; font-size:11px; color:var(--dim); cursor:pointer;
@@ -95,10 +101,10 @@
     <div class="sessbar" id="sessbar"></div>
     <div class="body" id="body"></div>
     <div class="tabs">
-      <div class="tab active" data-m="decide"><span class="ic">✓</span>Decide</div>
+      <div class="tab active" data-m="decide"><span class="ic">✓</span>Session</div>
       <div class="tab" data-m="macros"><span class="ic">⌨</span>Macros</div>
       <div class="tab" data-m="voice"><span class="ic">🎙</span>Voice</div>
-      <div class="tab" data-m="hud"><span class="ic">☰</span>HUD</div>
+      <div class="tab" data-m="settings"><span class="ic">⚙</span>Settings</div>
     </div>
     <div class="flash" id="flash"></div>
   </div>
@@ -118,6 +124,7 @@ document.getElementById('wsurl').textContent = PORTS.map(p=>`ws://${HOST}:${p}`)
 let mode='decide', ask=null, sel={}, hud={}, macros=[], state={state:'idle',text:'idle'};
 let sessions=[], focus=null, qIdx=0, answersAcc={}, hosts={};   // focus = {sid, bridge} | null; hosts[bridge]=machine
 let feed=[];                                                     // activity lines for the focused session
+let voiceState='idle', voiceId=0, voiceText='';                  // mic action + on-device confirm (mirrors firmware)
 let conns=[];   // per-bridge connection: {idx, ws, up}
 // dedup: a machine reachable via the LAN and the tailnet sends the same bridge_id from two connections.
 // Keep both; only the "primary" (lowest connected index here; the firmware prefers the LAN path) shows.
@@ -132,7 +139,7 @@ function connectBridge(idx){
   const c = { idx, ws:null, up:false }; conns[idx]=c;
   const open=()=>{
     const ws=new WebSocket(url); c.ws=ws;
-    ws.onopen=()=>{ c.up=true; updateConn(); sendTo(idx,{type:'hello',name:'mock-device',fw:'mock-0.1',caps:['decide','macros','voice','hud']}); log(`b${idx} connected (${url})`); };
+    ws.onopen=()=>{ c.up=true; updateConn(); sendTo(idx,{type:'hello',name:'mock-device',fw:'mock-0.2',caps:['session','macros','voice','settings']}); log(`b${idx} connected (${url})`); };
     ws.onclose=()=>{ c.up=false; updateConn(); bridgeGone(idx); setTimeout(open,1000); };
     ws.onmessage=(e)=>{ let m; try{m=JSON.parse(e.data)}catch{return;} log(`◀b${idx} ${e.data}`,'log-rx'); handle(m, idx); };
   };
@@ -154,7 +161,8 @@ function handle(m, bridge){
     case 'status': if(concernsFocus(m,bridge)){ state=m; renderStatus(); } break;
     case 'ask': if(m.sid){ if(!focus || focus.bridge!==bridge || focus.sid!==m.sid) feed=[]; focus={sid:m.sid, bridge}; } ask=m; qIdx=0; answersAcc={}; sel={}; mode='decide'; setTab(); renderSessions(); renderStatus(); render(); flash(); break;
     case 'ask_cancel': if(concernsFocus(m,bridge)){ ask=null; render(); } break;
-    case 'hud': if(concernsFocus(m,bridge)){ hud=m; if(mode==='hud') render(); } break;
+    case 'hud': if(concernsFocus(m,bridge)){ hud=m; if(mode==='decide' && voiceState==='idle') render(); } break;
+    case 'transcript': if(voiceState==='wait' && m.id===voiceId){ voiceState='confirm'; voiceText=m.text||''; render(); } break;
     case 'activity': if(concernsFocus(m,bridge)){
         if(m.feed){ feed=m.feed.slice(); } else if(m.line){ feed.push(m.line); if(feed.length>40) feed.shift(); }
         if(mode==='decide' && !ask) render();
@@ -204,18 +212,22 @@ function flash(){ const f=document.getElementById('flash'); f.classList.remove('
 
 function render(){
   const b=document.getElementById('body'); b.innerHTML='';
+  if(voiceState!=='idle'){ renderVoice(b); return; }   // mic action overlays whatever tab is showing
   if(mode==='decide'){
-    if(!ask){ renderFeed(b); return; }
-    const q=ask.questions[qIdx];
-    const prog = ask.questions.length>1 ? ` (${qIdx+1}/${ask.questions.length})` : '';
-    b.innerHTML += `<span class="hdr">${(q.header||'Question')+prog}</span><div class="q">${q.question}</div>`;
-    q.options.forEach((o,i)=>{
-      const d=document.createElement('div'); d.className='opt'+(sel[i]?' sel':'');
-      d.innerHTML=`<div class="l">${o.label}</div>${o.description?`<div class="d">${o.description}</div>`:''}`;
-      d.onclick=()=>chooseOption(q,i); b.appendChild(d);
-    });
-    if(q.multiSelect){ const c=document.createElement('button'); c.className='confirm';
-      c.textContent='Confirm selection'; c.onclick=()=>confirmMulti(q); b.appendChild(c); }
+    if(!ask){ renderFeed(b); }
+    else {
+      const q=ask.questions[qIdx];
+      const prog = ask.questions.length>1 ? ` (${qIdx+1}/${ask.questions.length})` : '';
+      b.innerHTML += `<span class="hdr">${(q.header||'Question')+prog}</span><div class="q">${q.question}</div>`;
+      q.options.forEach((o,i)=>{
+        const d=document.createElement('div'); d.className='opt'+(sel[i]?' sel':'');
+        d.innerHTML=`<div class="l">${o.label}</div>${o.description?`<div class="d">${o.description}</div>`:''}`;
+        d.onclick=()=>chooseOption(q,i); b.appendChild(d);
+      });
+      if(q.multiSelect){ const c=document.createElement('button'); c.className='confirm';
+        c.textContent='Confirm selection'; c.onclick=()=>confirmMulti(q); b.appendChild(c); }
+    }
+    renderHudStrip(b);   // compact telemetry pinned to the bottom of the Session page
   } else if(mode==='macros'){
     if(!macros.length){ b.innerHTML='<div class="placeholder">No macros configured.</div>'; return; }
     const g=document.createElement('div'); g.className='macros';
@@ -223,21 +235,45 @@ function render(){
       d.innerHTML=`<div class="i">${mc.icon||'▷'}</div><div class="t">${mc.label}</div>`;
       d.onclick=()=>sendFocus({type:'macro', id:mc.id}); g.appendChild(d); });
     b.appendChild(g);
-  } else if(mode==='voice'){
-    const v=document.createElement('div'); v.className='voicebtn'; v.textContent='HOLD';
-    v.onpointerdown=()=>{ v.classList.add('rec'); v.textContent='REC…'; sendFocus({type:'voice_start'}); };
-    const stop=()=>{ if(v.classList.contains('rec')){ v.classList.remove('rec'); v.textContent='HOLD'; sendFocus({type:'voice_end'}); } };
-    v.onpointerup=stop; v.onpointerleave=stop; b.appendChild(v);
-    b.innerHTML += '<div class="placeholder">Hold to talk →<br>transcribed into Claude</div>';
-  } else if(mode==='hud'){
-    const rows=[['model',hud.model||'—'],['elapsed',hud.elapsedMs?Math.round(hud.elapsedMs/1000)+'s':'—'],
-      ['tokens',hud.tokens??'—'],['cost',hud.costUSD!=null?'$'+(+hud.costUSD).toFixed(3):'—'],
-      ['last tool',hud.lastTool||'—'],['todos',(hud.todos&&hud.todos.length)||0]];
-    const w=document.createElement('div'); w.className='hud';
-    rows.forEach(([k,v])=>{ w.innerHTML+=`<div class="row"><span class="k">${k}</span><span class="v">${v}</span></div>`; });
-    b.appendChild(w);
+  } else if(mode==='settings'){
+    renderSettings(b);
   }
 }
+function renderHudStrip(b){
+  const model=hud.model||'-', secs=hud.elapsedMs?Math.round(hud.elapsedMs/1000):0,
+        tool=hud.lastTool||'-', todos=(hud.todos&&hud.todos.length)||0;
+  const s=document.createElement('div'); s.className='hudstrip';
+  s.textContent=`${model} | ${secs}s | ${tool} | ${todos} todo`; b.appendChild(s);
+}
+// Settings toggles are device-local (NVS) with no bridge protocol, so they're inert stubs in the mock.
+function renderSettings(b){
+  b.innerHTML=`<div class="setrow"><span>WiFi</span><input type="checkbox" checked disabled></div>
+    <div class="setrow"><span>Tailscale</span><input type="checkbox" disabled></div>
+    <div class="placeholder" style="margin-top:16px">${'☉'} hold: WiFi portal</div>
+    <div class="placeholder" style="margin-top:6px;font-size:10px">(device-local; no bridge protocol)</div>`;
+}
+// Voice: tap mic -> record -> Stop -> transcript -> Send/Cancel. The mock sends no PCM, so the bridge
+// returns an empty transcript ("(no speech)"); this still exercises the full message round-trip + confirm UI.
+function renderVoice(b){
+  if(voiceState==='rec'){
+    b.innerHTML='<div class="placeholder" style="color:var(--ok);margin-top:60px">Listening…</div>';
+    const s=document.createElement('button'); s.className='confirm'; s.textContent='Stop'; s.onclick=voiceStop; b.appendChild(s);
+  } else if(voiceState==='wait'){
+    b.innerHTML='<div class="placeholder" style="margin-top:60px">Transcribing…</div>';
+  } else if(voiceState==='confirm'){
+    b.innerHTML=`<div class="q" style="margin-top:24px">${voiceText||'(no speech)'}</div>`;
+    if(voiceText){
+      const s=document.createElement('button'); s.className='confirm'; s.textContent='Send'; s.onclick=voiceCommit; b.appendChild(s);
+      const c=document.createElement('div'); c.className='opt'; c.style.textAlign='center'; c.textContent='Cancel'; c.onclick=voiceCancel; b.appendChild(c);
+    } else {
+      const c=document.createElement('button'); c.className='confirm'; c.textContent='Dismiss'; c.onclick=voiceCancel; b.appendChild(c);
+    }
+  }
+}
+function voiceToggle(){ if(voiceState!=='idle'||!focus) return; voiceId++; voiceState='rec'; sendFocus({type:'voice_start', id:voiceId}); render(); }
+function voiceStop(){ if(voiceState!=='rec') return; voiceState='wait'; sendFocus({type:'voice_end', id:voiceId}); render(); }
+function voiceCommit(){ sendFocus({type:'voice_commit', id:voiceId}); voiceState='idle'; render(); }
+function voiceCancel(){ sendFocus({type:'voice_cancel', id:voiceId}); voiceState='idle'; render(); }
 const FEED_SYM={tool:'›', prompt:'›', notify:'!', done:'✓', start:'·', thinking:'…', reply:'‹'};
 function renderFeed(b){
   if(!feed.length){ b.innerHTML='<div class="feedhint">'+(focus?'Claude is idle.<br>Following along…':'Waiting for a session…')+'</div>'; return; }
@@ -257,7 +293,7 @@ function chooseOption(q,i){ if(q.multiSelect){ sel[i]=!sel[i]; render(); }
   else { answersAcc[q.question]=q.options[i].label; advanceAsk(); } }
 function confirmMulti(q){ answersAcc[q.question]=q.options.filter((_,i)=>sel[i]).map(o=>o.label).join(', '); advanceAsk(); }
 function setTab(){ document.querySelectorAll('.tab').forEach(t=>t.classList.toggle('active', t.dataset.m===mode)); }
-document.querySelectorAll('.tab').forEach(t=> t.onclick=()=>{ mode=t.dataset.m; setTab(); render(); });
+document.querySelectorAll('.tab').forEach(t=> t.onclick=()=>{ if(t.dataset.m==='voice'){ voiceToggle(); return; } mode=t.dataset.m; setTab(); render(); });
 
 renderStatus(); render(); PORTS.forEach((_,i)=>connectBridge(i));
 </script>

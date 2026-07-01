@@ -1,14 +1,26 @@
 // Claudeq UI (LVGL 8.4, native portrait 172x640).
-// Top: status strip + session chip row. Body: Decide / Macros / Voice / HUD as bottom-tab pages.
+// Top: status strip + session chip row. Body: Session / Macros / (mic action) / Settings bottom-nav.
 #include <string.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include "lvgl.h"
 #include "cJSON.h"
 #include "esp_log.h"
 #include "app.h"
+#include "app_config.h"
 
 static const char *TAG = "ui";
+LV_FONT_DECLARE(font_mic_18);        // 1-glyph custom font: FontAwesome microphone (U+F130), for the Voice nav icon
+#define SYM_MIC "\xEF\x84\xB0"        // UTF-8 for U+F130, rendered with font_mic_18
+// Deck text fonts: Montserrat + Latin-1 + typographic punctuation (em-dash, curly quotes, ellipsis,
+// bullet, arrow) + the FontAwesome icon glyphs we use — so Claude's replies render real punctuation
+// instead of tofu. Replaces lv_font_montserrat_12/16 everywhere below.
+LV_FONT_DECLARE(font_deck_16);
+LV_FONT_DECLARE(font_deck_12);
+LV_FONT_DECLARE(font_back_32);       // big back-chevron (U+F053) for the reader's slim Back button
+#define lv_font_montserrat_16 font_deck_16
+#define lv_font_montserrat_12 font_deck_12
 
 #define COL_BG      0x0a0b0f
 #define COL_PANEL   0x12141c
@@ -37,16 +49,17 @@ static char focus_sid[48];
 static int  focus_bridge = -1;       // the focused session lives on this bridge
 // MAX_BRIDGES is defined in app.h (shared with net.cpp)
 static char bridge_host[MAX_BRIDGES][24];  // machine name per bridge (shown on a chip only on a title clash)
-// pages + bottom nav grid
-static lv_obj_t *t_decide, *t_macros, *t_voice, *t_hud;
+// pages + bottom nav grid. Nav index 2 (Voice) is an ACTION button (starts listening), not a page.
+static lv_obj_t *t_decide, *t_macros, *t_settings;
 static lv_obj_t *nav_btns[4], *nav_icons[4], *nav_lbls[4];
 static int cur_page = 0;
-static const char *NAV_ICON[4] = { LV_SYMBOL_OK, LV_SYMBOL_KEYBOARD, LV_SYMBOL_AUDIO, LV_SYMBOL_LIST };
-static const char *NAV_TEXT[4] = { "Decide", "Macros", "Voice", "HUD" };
+static const char *NAV_ICON[4] = { LV_SYMBOL_OK, LV_SYMBOL_KEYBOARD, SYM_MIC, LV_SYMBOL_SETTINGS };
+static const char *NAV_TEXT[4] = { "Session", "Macros", "Voice", "Settings" };
 static void set_page(int idx);
+static void voice_toggle(void);
 // decide (supports multi-question asks)
 static lv_obj_t *s_header, *s_question, *s_opts, *s_placeholder;
-static lv_obj_t *s_feed;              // live activity feed on the Decide page (when no question)
+static lv_obj_t *s_feed;              // live activity feed on the Session page (when no question)
 static int s_feed_n = 0;
 #define FEED_MAX_ROWS 30
 static char cur_id[80];
@@ -56,10 +69,15 @@ static int  cur_q_idx = 0, cur_q_total = 0;
 // macros
 static lv_obj_t *s_macros_cont;
 static char cur_macro_id[12][32];
-// hud
-static lv_obj_t *hud_model, *hud_elapsed, *hud_tool, *hud_todos;
-// voice
-static lv_obj_t *s_voice_btn, *s_voice_lbl;
+// hud: a compact one-line telemetry strip pinned to the bottom of the Session page
+static lv_obj_t *hud_line;
+// voice capture + on-device confirm (tap mic -> record -> transcribe -> Send/Cancel)
+typedef enum { VOICE_IDLE, VOICE_REC, VOICE_WAIT, VOICE_CONFIRM } voice_state_t;
+static voice_state_t s_vstate = VOICE_IDLE;
+static int  s_voice_bridge = -1;     // bridge that owns this capture (transcript/commit must go back to it)
+static int  s_voice_id = 0;          // per-capture id; ignores stale transcript messages
+static lv_obj_t *s_voice_ov = NULL;  // full-screen overlay (Listening / Transcribing / confirm)
+static lv_timer_t *s_voice_timeout = NULL;
 
 static lv_obj_t *mklabel(lv_obj_t *p, const char *t, const lv_font_t *f, uint32_t c) {
     lv_obj_t *l = lv_label_create(p);
@@ -76,11 +94,19 @@ static void style_card(lv_obj_t *o) {
     lv_obj_set_style_bg_color(o, lv_color_hex(COL_ACCENT), LV_STATE_PRESSED);
     lv_obj_clear_flag(o, LV_OBJ_FLAG_SCROLLABLE);
 }
+// Explicit on/off colors — no LVGL theme is installed, so the default switch is nearly invisible on the
+// dark panel. Off = grey track, on = green fill, knob = light; disabled = dim.
+static void style_switch(lv_obj_t *sw) {
+    lv_obj_set_style_bg_color(sw, lv_color_hex(COL_LINE), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(sw, lv_color_hex(0x2a2f3a), LV_PART_MAIN | LV_STATE_DISABLED);
+    lv_obj_set_style_bg_color(sw, lv_color_hex(COL_OK), LV_PART_INDICATOR | LV_STATE_CHECKED);
+    lv_obj_set_style_bg_color(sw, lv_color_hex(COL_INK), LV_PART_KNOB);
+}
 
 // ---------- decide (supports multi-question asks) ----------
 static void opt_clicked(lv_event_t *e);
 
-// ---------- activity feed (live "what's Claude doing" on the Decide page) ----------
+// ---------- activity feed (live "what's Claude doing" on the Session page) ----------
 // The colored icon is the ONLY kind indicator now (no label word), so glyph + colour must read at a
 // glance: you=orange ›, Claude's tool=blue ›, done=green ✓, Claude's reply=green ‹, needs-you=yellow bell.
 static const char *feed_sym(const char *kind) {
@@ -112,7 +138,52 @@ static void show_idle_view(void) {
 }
 static void feed_clear(void) { if (s_feed) { lv_obj_clean(s_feed); s_feed_n = 0; } }
 
-static void feed_add_row(const char *kind, const char *label, const char *detail, bool current) {
+// ---------- reader: full-text landscape view (tap a reply row) ----------
+static lv_obj_t *s_reader_ov = NULL;
+static char *s_last_reply = NULL;     // full text of the most recent reply (shown in the reader)
+static void reader_close_cb(lv_event_t *e) {
+    (void)e;
+    if (s_reader_ov) { lv_obj_del(s_reader_ov); s_reader_ov = NULL; }
+    app_set_rotation(false);          // back to portrait
+}
+static void ui_show_reader(const char *text) {
+    if (!text || !text[0]) return;
+    app_set_rotation(true);           // landscape: logical becomes 640 wide x 172 tall
+    lv_coord_t W = lv_disp_get_hor_res(NULL), H = lv_disp_get_ver_res(NULL);
+    lv_obj_t *ov = lv_obj_create(lv_layer_top());
+    s_reader_ov = ov;
+    lv_obj_set_size(ov, W, H);
+    lv_obj_align(ov, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_bg_color(ov, lv_color_hex(COL_BG), 0);
+    lv_obj_set_style_border_width(ov, 0, 0);
+    lv_obj_set_style_radius(ov, 0, 0);
+    lv_obj_set_style_pad_all(ov, 6, 0);
+    lv_obj_clear_flag(ov, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(ov, LV_OBJ_FLAG_CLICKABLE);   // block taps to the (portrait) UI underneath
+    // Text fills the left at FULL height; Back is a slim full-height strip on the right, so it doesn't
+    // eat the scarce vertical space in landscape.
+    lv_obj_t *tc = lv_obj_create(ov);
+    lv_obj_set_size(tc, W - 50, H - 12);         // wider text: only the thin 40px Back strip is reserved
+    lv_obj_align(tc, LV_ALIGN_LEFT_MID, 0, 0);
+    lv_obj_set_style_bg_opa(tc, LV_OPA_0, 0);
+    lv_obj_set_style_border_width(tc, 0, 0);
+    lv_obj_set_style_pad_all(tc, 0, 0);
+    lv_obj_set_scroll_dir(tc, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(tc, LV_SCROLLBAR_MODE_AUTO);
+    lv_obj_t *l = mklabel(tc, text, &lv_font_montserrat_16, COL_INK);
+    lv_obj_set_width(l, W - 62);            // ~578px wide lines (vs ~156 in portrait)
+    lv_label_set_long_mode(l, LV_LABEL_LONG_WRAP);
+    lv_obj_t *back = lv_obj_create(ov);
+    lv_obj_set_size(back, 40, H - 12);           // thin full-height strip, just a big chevron
+    style_card(back);
+    lv_obj_align(back, LV_ALIGN_RIGHT_MID, 0, 0);
+    lv_obj_add_flag(back, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(back, reader_close_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_center(mklabel(back, LV_SYMBOL_LEFT, &font_back_32, COL_INK));
+}
+static void reply_row_clicked(lv_event_t *e) { (void)e; if (s_last_reply) ui_show_reader(s_last_reply); }
+
+static void feed_add_row(const char *kind, const char *label, const char *detail, const char *full, bool current) {
     if (!s_feed) return;
     // cap: drop oldest rows beyond the limit
     while (s_feed_n >= FEED_MAX_ROWS) {
@@ -146,6 +217,12 @@ static void feed_add_row(const char *kind, const char *label, const char *detail
     lv_obj_t *dt = mklabel(row, detail ? detail : "", &lv_font_montserrat_12, COL_INK);
     lv_label_set_long_mode(dt, LV_LABEL_LONG_WRAP);
     lv_obj_set_width(dt, 128);
+    // A reply carries the full text: stash it and make the row tappable -> landscape reader.
+    if (kind && !strcmp(kind, "reply") && full && full[0]) {
+        free(s_last_reply); s_last_reply = strdup(full);
+        lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(row, reply_row_clicked, LV_EVENT_CLICKED, NULL);
+    }
     s_feed_n++;
     lv_obj_scroll_to_view(row, LV_ANIM_OFF);   // keep newest visible
 }
@@ -158,9 +235,11 @@ static void feed_replace(cJSON *arr) {
         cJSON *k = cJSON_GetObjectItem(ln, "kind");
         cJSON *l = cJSON_GetObjectItem(ln, "label");
         cJSON *d = cJSON_GetObjectItem(ln, "detail");
+        cJSON *fu = cJSON_GetObjectItem(ln, "full");
         feed_add_row(cJSON_IsString(k) ? k->valuestring : NULL,
                      cJSON_IsString(l) ? l->valuestring : "",
-                     cJSON_IsString(d) ? d->valuestring : "", i == n - 1);
+                     cJSON_IsString(d) ? d->valuestring : "",
+                     cJSON_IsString(fu) ? fu->valuestring : NULL, i == n - 1);
     }
 }
 
@@ -270,7 +349,7 @@ static void show_ask(cJSON *root) {
     cur_q_total = cJSON_GetArraySize(cJSON_GetObjectItem(s_ask, "questions"));
     cur_q_idx = 0;
     render_question();
-    set_page(0);  // jump to Decide
+    set_page(0);  // jump to Session
 }
 
 // ---------- macros ----------
@@ -310,45 +389,135 @@ static void show_macros(cJSON *root) {
     }
 }
 
-// ---------- voice ----------
-static void voice_evt(lv_event_t *e) {
-    lv_event_code_t c = lv_event_get_code(e);
-    if (c == LV_EVENT_PRESSED) {
-        lv_obj_set_style_bg_color(s_voice_btn, lv_color_hex(0x3a1414), 0);
-        lv_label_set_text(s_voice_lbl, "REC...");
-        net_send_text("{\"type\":\"voice_start\"}");
-        audio_record_start();
-    } else if (c == LV_EVENT_RELEASED || c == LV_EVENT_PRESS_LOST) {
-        audio_record_stop();
-        lv_obj_set_style_bg_color(s_voice_btn, lv_color_hex(COL_PANEL), 0);
-        lv_label_set_text(s_voice_lbl, "HOLD");
-        net_send_text("{\"type\":\"voice_end\"}");
+// ---------- voice (tap mic -> record -> on-device confirm -> Send/Cancel) ----------
+static void voice_close_overlay(void) {
+    if (s_voice_timeout) { lv_timer_del(s_voice_timeout); s_voice_timeout = NULL; }
+    if (s_voice_ov) { lv_obj_del(s_voice_ov); s_voice_ov = NULL; }
+}
+static void voice_reset(void) {   // back to IDLE: drop the overlay, un-redden the mic icon
+    voice_close_overlay();
+    s_vstate = VOICE_IDLE;
+    if (nav_icons[2]) lv_obj_set_style_text_color(nav_icons[2], lv_color_hex(COL_DIM), 0);
+}
+static void voice_send_msg(const char *type) {   // {"type":..,"id":N} back to the capture's own bridge
+    if (s_voice_bridge < 0) return;
+    char buf[64];
+    snprintf(buf, sizeof(buf), "{\"type\":\"%s\",\"id\":%d}", type, s_voice_id);
+    net_send_to(s_voice_bridge, buf);
+}
+// Full-screen overlay with a status/transcript body and up to two action buttons (bottom-stacked).
+static void voice_render(const char *body, uint32_t body_col,
+                         const char *b1, lv_event_cb_t c1,
+                         const char *b2, lv_event_cb_t c2) {
+    voice_close_overlay();
+    lv_obj_t *ov = lv_obj_create(lv_layer_top());
+    s_voice_ov = ov;
+    lv_obj_set_size(ov, SCR_W, 640);
+    lv_obj_align(ov, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_bg_color(ov, lv_color_hex(COL_BG), 0);
+    lv_obj_set_style_border_width(ov, 0, 0);
+    lv_obj_set_style_radius(ov, 0, 0);
+    lv_obj_set_style_pad_all(ov, 12, 0);
+    lv_obj_clear_flag(ov, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(ov, LV_OBJ_FLAG_CLICKABLE);   // eat taps so they don't fall through to the nav below
+    lv_obj_t *t = mklabel(ov, SYM_MIC, &font_mic_18, COL_ACCENT);
+    lv_obj_align(t, LV_ALIGN_TOP_MID, 0, 6);
+    // scrollable body area (a long transcript won't overrun the buttons)
+    lv_obj_t *bc = lv_obj_create(ov);
+    lv_obj_set_size(bc, 150, b1 ? 468 : 560);
+    lv_obj_align(bc, LV_ALIGN_TOP_MID, 0, 36);
+    lv_obj_set_style_bg_opa(bc, LV_OPA_0, 0);
+    lv_obj_set_style_border_width(bc, 0, 0);
+    lv_obj_set_style_pad_all(bc, 0, 0);
+    lv_obj_set_scroll_dir(bc, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(bc, LV_SCROLLBAR_MODE_AUTO);
+    lv_obj_t *l = mklabel(bc, body, &lv_font_montserrat_16, body_col);
+    lv_obj_set_width(l, 146);
+    lv_label_set_long_mode(l, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_align(l, LV_TEXT_ALIGN_CENTER, 0);
+    if (b1) {
+        lv_obj_t *btn = lv_obj_create(ov);
+        lv_obj_set_size(btn, 148, 52);
+        style_card(btn);
+        lv_obj_add_flag(btn, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(btn, c1, LV_EVENT_CLICKED, NULL);
+        lv_obj_align(btn, LV_ALIGN_BOTTOM_MID, 0, b2 ? -66 : -8);
+        lv_obj_center(mklabel(btn, b1, &lv_font_montserrat_16, COL_INK));
+    }
+    if (b2) {
+        lv_obj_t *btn = lv_obj_create(ov);
+        lv_obj_set_size(btn, 148, 52);
+        style_card(btn);
+        lv_obj_add_flag(btn, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(btn, c2, LV_EVENT_CLICKED, NULL);
+        lv_obj_align(btn, LV_ALIGN_BOTTOM_MID, 0, -8);
+        lv_obj_center(mklabel(btn, b2, &lv_font_montserrat_16, COL_INK));
     }
 }
+static void voice_commit_cb(lv_event_t *e)  { (void)e; voice_send_msg("voice_commit"); voice_reset(); }
+static void voice_cancel_cb(lv_event_t *e)  { (void)e; voice_send_msg("voice_cancel"); voice_reset(); }
+static void voice_timeout_cb(lv_timer_t *t) {   // no transcript came back in time
+    (void)t; s_voice_timeout = NULL;
+    if (s_vstate != VOICE_WAIT) return;
+    s_vstate = VOICE_CONFIRM;
+    voice_render("Transcription\nfailed.", COL_ERR, "Dismiss", voice_cancel_cb, NULL, NULL);
+}
+static void voice_stop_cb(lv_event_t *e) {   // "Stop" in the Listening overlay
+    (void)e;
+    if (s_vstate != VOICE_REC) return;
+    audio_record_stop();
+    voice_send_msg("voice_end");
+    s_vstate = VOICE_WAIT;
+    voice_render("Transcribing...", COL_DIM, NULL, NULL, NULL, NULL);
+    s_voice_timeout = lv_timer_create(voice_timeout_cb, 15000, NULL);
+    lv_timer_set_repeat_count(s_voice_timeout, 1);
+}
+static void voice_notice_cb(lv_event_t *e) { (void)e; voice_reset(); }   // dismiss the no-session notice
+// mic nav tap: start listening (only from IDLE; the overlay covers the nav while active).
+static void voice_toggle(void) {
+    if (s_vstate != VOICE_IDLE) return;
+    if (focus_bridge < 0 || !focus_sid[0]) {   // no session to dictate into -> tell the user, don't sit silent
+        s_voice_bridge = -1;
+        voice_render("No active session.\nStart Claude with\n'claudeq' first.", COL_WARN, "OK", voice_notice_cb, NULL, NULL);
+        return;
+    }
+    s_voice_bridge = focus_bridge;                   // PCM already routes here (net_send_binary -> focus bridge)
+    s_voice_id++;
+    s_vstate = VOICE_REC;
+    if (nav_icons[2]) lv_obj_set_style_text_color(nav_icons[2], lv_color_hex(COL_ERR), 0);
+    voice_send_msg("voice_start");
+    audio_record_start();
+    voice_render("Listening...", COL_OK, "Stop", voice_stop_cb, NULL, NULL);
+}
+// Called from ui_handle_message when a transcript arrives for this capture.
+static void voice_on_transcript(const char *text) {
+    if (s_voice_timeout) { lv_timer_del(s_voice_timeout); s_voice_timeout = NULL; }
+    s_vstate = VOICE_CONFIRM;
+    if (text && text[0]) voice_render(text, COL_INK, "Send", voice_commit_cb, "Cancel", voice_cancel_cb);
+    else                 voice_render("(no speech)", COL_DIM, "Dismiss", voice_cancel_cb, NULL, NULL);
+}
 
-// ---------- hud ----------
+// ---------- hud: compact telemetry strip at the bottom of the Session page ----------
 static void show_hud(cJSON *root) {
+    if (!hud_line) return;
     cJSON *model = cJSON_GetObjectItem(root, "model");
     cJSON *el = cJSON_GetObjectItem(root, "elapsedMs");
     cJSON *tool = cJSON_GetObjectItem(root, "lastTool");
     cJSON *todos = cJSON_GetObjectItem(root, "todos");
-    char buf[96];
-    snprintf(buf, sizeof(buf), "model:  %s", cJSON_IsString(model) ? model->valuestring : "-");
-    lv_label_set_text(hud_model, buf);
     int secs = cJSON_IsNumber(el) ? (int)(el->valuedouble / 1000.0) : 0;
-    snprintf(buf, sizeof(buf), "elapsed:  %ds", secs);
-    lv_label_set_text(hud_elapsed, buf);
-    snprintf(buf, sizeof(buf), "last tool:  %s", cJSON_IsString(tool) ? tool->valuestring : "-");
-    lv_label_set_text(hud_tool, buf);
     int tn = cJSON_IsArray(todos) ? cJSON_GetArraySize(todos) : 0;
-    snprintf(buf, sizeof(buf), "todos:  %d", tn);
-    lv_label_set_text(hud_todos, buf);
+    char buf[128];   // ASCII-only separators (the device font has no middle-dot glyph)
+    snprintf(buf, sizeof(buf), "%s | %ds | %s | %d todo",
+             cJSON_IsString(model) && model->valuestring[0] ? model->valuestring : "-", secs,
+             cJSON_IsString(tool) && tool->valuestring[0] ? tool->valuestring : "-", tn);
+    lv_label_set_text(hud_line, buf);
 }
 
 // ---------- sessions (chip strip, aggregated across bridges) ----------
 static void render_chips(void);
 
 static void chip_clicked(lv_event_t *e) {
+    if (s_vstate == VOICE_REC) return;   // don't move focus mid-capture (mic PCM routes to the focus bridge)
     int idx = (int)(intptr_t)lv_event_get_user_data(e);
     if (idx < 0 || idx >= sess_n || !sess_sid[idx][0]) return;
     set_local_focus(sess_sid[idx], sess_bridge[idx]);   // clears the feed on switch; routes macros/voice
@@ -452,6 +621,7 @@ static void show_sessions(cJSON *root, int bridge) {
 
 void ui_bridge_gone(int bridge) {
     if (!ui_lock(1000)) return;
+    if (s_vstate != VOICE_IDLE && bridge == s_voice_bridge) voice_reset();   // capture's bridge vanished
     drop_bridge_sessions(bridge);
     if (focus_bridge == bridge) { set_local_focus(NULL, -1); clear_ask(); }
     render_chips();
@@ -460,10 +630,11 @@ void ui_bridge_gone(int bridge) {
 
 // ---------- bottom nav (2x2 grid) ----------
 static void set_page(int idx) {
-    if (idx < 0 || idx > 3) return;
+    if (idx < 0 || idx > 3 || idx == 2) return;   // 2 = mic action button, not a page
     cur_page = idx;
-    lv_obj_t *pgs[4] = { t_decide, t_macros, t_voice, t_hud };
+    lv_obj_t *pgs[4] = { t_decide, t_macros, NULL, t_settings };
     for (int i = 0; i < 4; i++) {
+        if (i == 2) continue;                     // mic button keeps its own (idle/recording) icon color
         if (pgs[i]) { if (i == idx) lv_obj_clear_flag(pgs[i], LV_OBJ_FLAG_HIDDEN);
                       else lv_obj_add_flag(pgs[i], LV_OBJ_FLAG_HIDDEN); }
         bool a = (i == idx);
@@ -474,7 +645,9 @@ static void set_page(int idx) {
     }
 }
 static void nav_clicked(lv_event_t *e) {
-    set_page((int)(intptr_t)lv_event_get_user_data(e));
+    int i = (int)(intptr_t)lv_event_get_user_data(e);
+    if (i == 2) { voice_toggle(); return; }       // mic: start listening instead of switching pages
+    set_page(i);
 }
 
 // ---------- status ----------
@@ -517,6 +690,12 @@ void ui_handle_message(cJSON *root, int bridge) {
         if (concerns_focus(root, bridge)) clear_ask();
     } else if (!strcmp(t, "hud")) {
         if (concerns_focus(root, bridge)) show_hud(root);
+    } else if (!strcmp(t, "transcript")) {   // voice: bridge returned the transcript for confirmation
+        cJSON *id = cJSON_GetObjectItem(root, "id");
+        cJSON *txt = cJSON_GetObjectItem(root, "text");
+        if (s_vstate == VOICE_WAIT && bridge == s_voice_bridge &&
+            cJSON_IsNumber(id) && (int)id->valuedouble == s_voice_id)
+            voice_on_transcript(cJSON_IsString(txt) ? txt->valuestring : "");
     } else if (!strcmp(t, "activity")) {
         if (concerns_focus(root, bridge)) {
             cJSON *feed = cJSON_GetObjectItem(root, "feed");
@@ -527,9 +706,11 @@ void ui_handle_message(cJSON *root, int bridge) {
                 cJSON *k = cJSON_GetObjectItem(line, "kind");
                 cJSON *l = cJSON_GetObjectItem(line, "label");
                 cJSON *d = cJSON_GetObjectItem(line, "detail");
+                cJSON *fu = cJSON_GetObjectItem(line, "full");
                 feed_add_row(cJSON_IsString(k) ? k->valuestring : NULL,
                              cJSON_IsString(l) ? l->valuestring : "",
-                             cJSON_IsString(d) ? d->valuestring : "", true);
+                             cJSON_IsString(d) ? d->valuestring : "",
+                             cJSON_IsString(fu) ? fu->valuestring : NULL, true);
             }
             if (!s_ask) show_idle_view();
         }
@@ -548,6 +729,10 @@ void ui_set_connection(bool connected) {
     if (!ui_lock(1000)) return;
     lv_label_set_text(s_conn, connected ? LV_SYMBOL_WIFI : LV_SYMBOL_CLOSE);
     lv_obj_set_style_text_color(s_conn, lv_color_hex(connected ? COL_OK : COL_ERR), 0);
+    // With no session in focus there's no per-session status to show, so the strip would keep its stale
+    // "connecting..." init text even while online — reflect the actual link state instead.
+    if (s_state && !focus_sid[0])
+        lv_label_set_text(s_state, connected ? "ready - no session" : "connecting...");
     ui_unlock();
 }
 
@@ -574,6 +759,58 @@ void ui_show_setup(const char *ap_ssid, const char *ap_ip) {
     ui_unlock();
 }
 static void setup_btn_cb(lv_event_t *e) { (void)e; net_enter_setup(); }   // long-press -> reboot into portal
+
+// ---------- settings ----------
+static lv_obj_t *s_modal = NULL;
+static void (*s_modal_yes)(void) = NULL;
+static void modal_close(void) { if (s_modal) { lv_obj_del(s_modal); s_modal = NULL; } s_modal_yes = NULL; }
+static void modal_yes_cb(lv_event_t *e) { (void)e; void (*fn)(void) = s_modal_yes; modal_close(); if (fn) fn(); }
+static void modal_no_cb(lv_event_t *e)  { (void)e; modal_close(); }
+static void show_modal(const char *title, const char *body, const char *yes, void (*onyes)(void)) {
+    modal_close();
+    lv_obj_t *ov = lv_obj_create(lv_layer_top());
+    s_modal = ov;
+    lv_obj_set_size(ov, SCR_W, 640);
+    lv_obj_align(ov, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_bg_color(ov, lv_color_hex(COL_BG), 0);
+    lv_obj_set_style_border_width(ov, 0, 0);
+    lv_obj_set_style_radius(ov, 0, 0);
+    lv_obj_set_style_pad_all(ov, 12, 0);
+    lv_obj_clear_flag(ov, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(ov, LV_OBJ_FLAG_CLICKABLE);   // eat taps so they don't fall through to the nav below
+    lv_obj_t *tl = mklabel(ov, title, &lv_font_montserrat_16, COL_ACCENT);
+    lv_obj_align(tl, LV_ALIGN_TOP_MID, 0, 6);
+    lv_obj_t *l = mklabel(ov, body, &lv_font_montserrat_16, COL_INK);
+    lv_obj_set_style_text_align(l, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_width(l, 148);
+    lv_label_set_long_mode(l, LV_LABEL_LONG_WRAP);
+    lv_obj_align(l, LV_ALIGN_TOP_MID, 0, 40);
+    s_modal_yes = onyes;
+    lv_obj_t *y = lv_obj_create(ov);
+    lv_obj_set_size(y, 148, 52); style_card(y);
+    lv_obj_add_flag(y, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(y, modal_yes_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_align(y, LV_ALIGN_BOTTOM_MID, 0, -66);
+    lv_obj_center(mklabel(y, yes, &lv_font_montserrat_16, COL_ERR));
+    lv_obj_t *no = lv_obj_create(ov);
+    lv_obj_set_size(no, 148, 52); style_card(no);
+    lv_obj_add_flag(no, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(no, modal_no_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_align(no, LV_ALIGN_BOTTOM_MID, 0, -8);
+    lv_obj_center(mklabel(no, "Cancel", &lv_font_montserrat_16, COL_INK));
+}
+static void do_wifi_off(void) { net_wifi_set_enabled(false); }
+static void wifi_sw_cb(lv_event_t *e) {
+    lv_obj_t *sw = lv_event_get_target(e);
+    bool on = lv_obj_has_state(sw, LV_STATE_CHECKED);
+    if (on) { net_wifi_set_enabled(true); return; }        // enabling: persist + reboot back online
+    lv_obj_add_state(sw, LV_STATE_CHECKED);                // keep it visually ON until the user confirms
+    show_modal("WiFi", "Disable WiFi?\nThe deck goes\noffline until you\nre-enable it here.", "Disable", do_wifi_off);
+}
+static void tailscale_sw_cb(lv_event_t *e) {
+    lv_obj_t *sw = lv_event_get_target(e);
+    net_tailnet_set_enabled(lv_obj_has_state(sw, LV_STATE_CHECKED));   // live, no reboot
+}
 
 // A full-screen content page in the area between the chip strip and the bottom nav.
 static lv_obj_t *make_page(lv_obj_t *parent) {
@@ -628,11 +865,10 @@ void ui_init(void) {
     lv_obj_set_scroll_dir(s_sessbar, LV_DIR_HOR);
     lv_obj_set_scrollbar_mode(s_sessbar, LV_SCROLLBAR_MODE_OFF);
 
-    // --- content pages (one visible at a time) ---
-    t_decide = make_page(scr);
-    t_macros = make_page(scr);
-    t_voice  = make_page(scr);
-    t_hud    = make_page(scr);
+    // --- content pages (one visible at a time; nav index 2 is the mic action, no page) ---
+    t_decide   = make_page(scr);
+    t_macros   = make_page(scr);
+    t_settings = make_page(scr);
 
     // --- bottom nav: 2x2 grid of big buttons ---
     lv_obj_t *nav = lv_obj_create(scr);
@@ -661,12 +897,13 @@ void ui_init(void) {
         lv_obj_set_flex_flow(b, LV_FLEX_FLOW_COLUMN);
         lv_obj_set_flex_align(b, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
         lv_obj_add_event_cb(b, nav_clicked, LV_EVENT_CLICKED, (void *)(intptr_t)i);
-        nav_icons[i] = mklabel(b, NAV_ICON[i], &lv_font_montserrat_16, COL_DIM);
+        const lv_font_t *icf = (i == 2) ? &font_mic_18 : &lv_font_montserrat_16;   // mic glyph needs its own font
+        nav_icons[i] = mklabel(b, NAV_ICON[i], icf, COL_DIM);
         nav_lbls[i]  = mklabel(b, NAV_TEXT[i], &lv_font_montserrat_12, COL_DIM);
         nav_btns[i]  = b;
     }
 
-    // --- Decide page ---
+    // --- Session page (question/answer + activity feed + telemetry strip) ---
     s_header = mklabel(t_decide, "QUESTION", &lv_font_montserrat_12, COL_ACCENT);
     lv_obj_align(s_header, LV_ALIGN_TOP_LEFT, 0, 0);
     lv_obj_add_flag(s_header, LV_OBJ_FLAG_HIDDEN);
@@ -689,9 +926,9 @@ void ui_init(void) {
     s_placeholder = mklabel(t_decide, "Claudeq ready.\nFollowing\nClaude...", &lv_font_montserrat_16, COL_DIM);
     lv_obj_set_style_text_align(s_placeholder, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_center(s_placeholder);
-    // live activity feed — fills the Decide page; shown when idle (no question) and has rows
+    // live activity feed — fills the Session page; shown when idle (no question) and has rows
     s_feed = lv_obj_create(t_decide);
-    lv_obj_set_size(s_feed, 160, 422);
+    lv_obj_set_size(s_feed, 160, 404);
     lv_obj_align(s_feed, LV_ALIGN_TOP_LEFT, 0, 0);
     lv_obj_set_style_bg_opa(s_feed, LV_OPA_0, 0);
     lv_obj_set_style_border_width(s_feed, 0, 0);
@@ -699,6 +936,11 @@ void ui_init(void) {
     lv_obj_set_style_pad_row(s_feed, 1, 0);
     lv_obj_set_flex_flow(s_feed, LV_FLEX_FLOW_COLUMN);
     lv_obj_add_flag(s_feed, LV_OBJ_FLAG_HIDDEN);
+    // compact telemetry strip pinned to the bottom (model / elapsed / last tool / todos)
+    hud_line = mklabel(t_decide, "", &lv_font_montserrat_12, COL_DIM);
+    lv_label_set_long_mode(hud_line, LV_LABEL_LONG_DOT);
+    lv_obj_set_width(hud_line, 160);
+    lv_obj_align(hud_line, LV_ALIGN_BOTTOM_LEFT, 0, 0);
 
     // --- Macros page ---
     s_macros_cont = lv_obj_create(t_macros);
@@ -713,40 +955,41 @@ void ui_init(void) {
     lv_obj_set_scroll_dir(s_macros_cont, LV_DIR_VER);
     lv_obj_set_scrollbar_mode(s_macros_cont, LV_SCROLLBAR_MODE_AUTO);
 
-    // --- Voice page ---
-    s_voice_btn = lv_obj_create(t_voice);
-    lv_obj_set_size(s_voice_btn, 120, 120);
-    lv_obj_set_style_radius(s_voice_btn, 60, 0);
-    style_card(s_voice_btn);
-    lv_obj_set_style_border_color(s_voice_btn, lv_color_hex(COL_ACCENT), 0);
-    lv_obj_set_style_border_width(s_voice_btn, 2, 0);
-    lv_obj_align(s_voice_btn, LV_ALIGN_CENTER, 0, -40);
-    lv_obj_add_flag(s_voice_btn, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(s_voice_btn, voice_evt, LV_EVENT_ALL, NULL);
-    s_voice_lbl = mklabel(s_voice_btn, "HOLD", &lv_font_montserrat_16, COL_ACCENT);
-    lv_obj_center(s_voice_lbl);
-    lv_obj_t *vh = mklabel(t_voice, "Hold to talk " LV_SYMBOL_RIGHT "\ndictated into the\nfocused session.", &lv_font_montserrat_16, COL_DIM);
-    lv_obj_set_style_text_align(vh, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_align(vh, LV_ALIGN_CENTER, 0, 70);
+    // --- Settings page (WiFi / Tailscale toggles + on-demand WiFi portal) ---
+    bool wifi_en = true, ts_en = true, ts_has_key = false;
+    net_get_flags(&wifi_en, &ts_en, &ts_has_key);
+    lv_obj_t *wl = mklabel(t_settings, "WiFi", &lv_font_montserrat_16, COL_INK);
+    lv_obj_align(wl, LV_ALIGN_TOP_LEFT, 0, 10);
+    lv_obj_t *wsw = lv_switch_create(t_settings);
+    style_switch(wsw);
+    lv_obj_align(wsw, LV_ALIGN_TOP_RIGHT, 0, 4);
+    if (wifi_en) lv_obj_add_state(wsw, LV_STATE_CHECKED);
+    lv_obj_add_event_cb(wsw, wifi_sw_cb, LV_EVENT_VALUE_CHANGED, NULL);
 
-    // --- HUD page ---
-    hud_model   = mklabel(t_hud, "model:  -",     &lv_font_montserrat_16, COL_INK);
-    hud_elapsed = mklabel(t_hud, "elapsed:  0s",  &lv_font_montserrat_16, COL_INK);
-    hud_tool    = mklabel(t_hud, "last tool:  -", &lv_font_montserrat_16, COL_INK);
-    hud_todos   = mklabel(t_hud, "todos:  0",     &lv_font_montserrat_16, COL_INK);
-    lv_label_set_long_mode(hud_tool, LV_LABEL_LONG_WRAP); lv_obj_set_width(hud_tool, 156);
-    lv_obj_align(hud_model,   LV_ALIGN_TOP_LEFT, 0, 6);
-    lv_obj_align(hud_elapsed, LV_ALIGN_TOP_LEFT, 0, 34);
-    lv_obj_align(hud_tool,    LV_ALIGN_TOP_LEFT, 0, 62);
-    lv_obj_align(hud_todos,   LV_ALIGN_TOP_LEFT, 0, 90);
-    lv_obj_t *setup_btn = lv_obj_create(t_hud);
+    lv_obj_t *tsl = mklabel(t_settings, "Tailscale", &lv_font_montserrat_16, COL_INK);
+    lv_obj_align(tsl, LV_ALIGN_TOP_LEFT, 0, 58);
+    lv_obj_t *tsw = lv_switch_create(t_settings);
+    style_switch(tsw);
+    lv_obj_align(tsw, LV_ALIGN_TOP_RIGHT, 0, 52);
+    if (ts_en && ts_has_key) lv_obj_add_state(tsw, LV_STATE_CHECKED);
+    if (!ts_has_key) {
+        lv_obj_add_state(tsw, LV_STATE_DISABLED);
+        lv_obj_t *th = mklabel(t_settings, "add an auth key in WiFi setup", &lv_font_montserrat_12, COL_DIM);
+        lv_label_set_long_mode(th, LV_LABEL_LONG_WRAP); lv_obj_set_width(th, 156);
+        lv_obj_align(th, LV_ALIGN_TOP_LEFT, 0, 84);
+    }
+    lv_obj_add_event_cb(tsw, tailscale_sw_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+    lv_obj_t *setup_btn = lv_obj_create(t_settings);
     lv_obj_set_size(setup_btn, 152, 46);
     style_card(setup_btn);
-    lv_obj_align(setup_btn, LV_ALIGN_TOP_LEFT, 0, 130);
+    lv_obj_align(setup_btn, LV_ALIGN_TOP_LEFT, 0, 120);
     lv_obj_add_flag(setup_btn, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(setup_btn, setup_btn_cb, LV_EVENT_LONG_PRESSED, NULL);
-    lv_obj_t *sl = mklabel(setup_btn, LV_SYMBOL_WIFI "  hold: WiFi setup", &lv_font_montserrat_12, COL_DIM);
-    lv_obj_center(sl);
+    lv_obj_center(mklabel(setup_btn, LV_SYMBOL_WIFI "  hold: WiFi portal", &lv_font_montserrat_12, COL_DIM));
+
+    lv_obj_t *fw = mklabel(t_settings, "claudeq  v" DEVICE_FW, &lv_font_montserrat_12, COL_DIM);
+    lv_obj_align(fw, LV_ALIGN_BOTTOM_MID, 0, -2);
 
     set_page(0);
     ESP_LOGI(TAG, "ui ready (portrait, 2x2 nav)");

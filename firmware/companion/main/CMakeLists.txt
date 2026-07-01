@@ -1,4 +1,4 @@
-idf_component_register(SRCS "main.cpp" "net.cpp" "ui.cpp" "audio.cpp" "provision.cpp"
+idf_component_register(SRCS "main.cpp" "net.cpp" "ui.cpp" "audio.cpp" "provision.cpp" "font_mic_18.c" "font_deck_16.c" "font_deck_12.c" "font_back_32.c"
                     REQUIRES i2c_bsp lcd_bl_pwm_bsp espressif__esp_io_expander_tca9554
                              esp_wifi esp_event nvs_flash esp_netif json
                              esp_http_server lwip mdns

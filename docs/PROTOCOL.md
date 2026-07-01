@@ -25,10 +25,11 @@ focused session's tmux target on its bridge. A question auto-focuses the session
 | `status` | `sid`, `state` (`idle`/`thinking`/`working`/`waiting`/`done`/`error`), `text`, `tool` | Live state of the focused session for the status strip |
 | `ask` | `id`, `sid`, `questions[]` = `{question, header, multiSelect, options[]:{label,description}}` | A question to render; user taps to choose. Sent **after** the `sessions` message that focuses `sid` |
 | `ask_cancel` | `sid`, `id?`, `reason` | Question resolved/cancelled (or focus moved to a session with no pending question) — clear it |
-| `hud` | `sid`, `model`, `elapsedMs`, `tokens`, `costUSD`, `lastTool`, `todos[]`, `cwd` | Telemetry of the focused session for the HUD screen |
-| `activity` | `sid`, and **either** `line` = `{ts, kind, label, detail}` (append one) **or** `feed[]` (full snapshot, replace) | Live "what's Claude doing" feed for the Decide screen. `kind` ∈ `tool`/`prompt`/`notify`/`done`/`start`; `label` is the tool name (or `you`/`done`), `detail` the target (file, command, pattern…). A snapshot is sent on focus/connect (**after** any `ask`, so the deck has adopted the new focus before it lands); single lines stream as events arrive. Only for the focused session. The deck clears its feed on every focus change so one session's activity never appends onto another's. |
+| `hud` | `sid`, `model`, `elapsedMs`, `tokens`, `costUSD`, `lastTool`, `todos[]`, `cwd` | Telemetry of the focused session; shown as a compact strip at the bottom of the Session screen |
+| `activity` | `sid`, and **either** `line` = `{ts, kind, label, detail, full?}` (append one) **or** `feed[]` (full snapshot, replace) | Live "what's Claude doing" feed for the Session screen. `kind` ∈ `tool`/`prompt`/`notify`/`done`/`reply`/`start`; a `reply` line also carries `full` = the complete (deck-safe, ≤2000 char) reply text — tapping the reply row opens it in the deck's landscape reader. `label` is the tool name (or `you`/`done`), `detail` the target (file, command, pattern…). A snapshot is sent on focus/connect (**after** any `ask`, so the deck has adopted the new focus before it lands); single lines stream as events arrive. Only for the focused session. The deck clears its feed on every focus change so one session's activity never appends onto another's. |
 | `macros` | `items[]` = `{id,label,icon,prompt}` | The macro deck contents (global) |
 | `alert` | `sid`, `level` (`info`/`attn`/`error`), `text`, `sound` | Pull-attention: chirp + flash |
+| `transcript` | `id`, `text`, `sid` | Voice: the transcript for capture `id`, awaiting on-device confirmation. Replaces the old auto-inject — the deck shows `text` with **Send/Cancel** and the bridge holds it until `voice_commit`/`voice_cancel` (or 120 s). Empty `text` = nothing recognized. |
 
 ## Device → Bridge
 | type | fields | meaning |
@@ -38,7 +39,9 @@ focused session's tmux target on its bridge. A question auto-focuses the session
 | `answer` | `id`, `answers` = `{ "<question text>": "<label>" }` (multi = comma-joined) | User's selection(s) for an `ask`. Resolved by the global `id`, so it is robust even if focus changed |
 | `macro` | `id` | Fire a macro by id → injected into the focused session |
 | `perm` | `id`, `decision` (`allow`/`deny`) | Answer a permission prompt (if used) |
-| `voice_start` / `voice_end` | `id` | Brackets a hold-to-talk capture (audio as binary frames between) → transcript injected into the focused session |
+| `voice_start` / `voice_end` | `id` | Brackets a mic capture (audio as binary PCM frames between). On `voice_end` the bridge transcribes and returns a `transcript` message (id-matched) instead of injecting directly |
+| `voice_commit` | `id` | Confirm the held transcript for capture `id` → injected (and submitted, per `CCDECK_VOICE_AUTOSUBMIT`) into the session that was focused when it was captured |
+| `voice_cancel` | `id` | Discard the held transcript for capture `id` |
 | `ping` | — | Keepalive |
 
 ## How the bridge learns a session's identity

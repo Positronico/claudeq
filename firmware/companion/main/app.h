@@ -4,6 +4,7 @@ extern "C" {
 #endif
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 #include "cJSON.h"
 
 // --- LVGL thread-safe access (implemented in main.cpp) ---
@@ -18,20 +19,30 @@ void ui_set_connection(bool connected);  // update WiFi/WS indicator; takes the 
 void ui_show_setup(const char *ap_ssid, const char *ap_ip); // overlay shown while provisioning
 
 // --- Provisioning / config (provision.cpp) ---
-typedef struct { char ssid[33]; char pass[65]; char bridge[64]; int port; char tailscale_authkey[128]; } claudeq_cfg_t;
+typedef struct {
+    char ssid[33]; char pass[65]; char bridge[64]; int port; char tailscale_authkey[128];
+    uint8_t wifi_enabled;       // 0 = user disabled WiFi in Settings (deck stays offline); default 1
+    uint8_t tailscale_enabled;  // 0 = user disabled Tailscale in Settings; default 1
+} claudeq_cfg_t;
 bool cfg_load(claudeq_cfg_t *out);       // fill out (NVS or compile defaults); true if a usable SSID exists
 void cfg_save(const char *ssid, const char *pass, const char *bridge, int port, const char *authkey);
+void cfg_set_wifi_enabled(uint8_t v);        // persist the WiFi on/off flag only
+void cfg_set_tailscale_enabled(uint8_t v);   // persist the Tailscale on/off flag only
 void cfg_clear(void);                    // wipe saved config
 void provision_start(void);              // bring up the SoftAP captive portal
 void net_enter_setup(void);              // flag setup + reboot into the portal (called from the UI)
 
 // --- Net (net.cpp) ---
 #define MAX_BRIDGES 8                    // max simultaneous bridge connections (LAN mDNS + tailnet); shared by net.cpp + ui.cpp
+void net_preload_config(void);           // load saved config into g_cfg before ui_init reads it (Settings switches)
 void net_start(void);                    // start wifi + multi-bridge discovery/websockets
 void net_send_to(int bridge, const char *json);     // send text to a specific bridge connection
 void net_send_text(const char *json);    // send text to the currently focused bridge
 void net_send_binary(const void *data, size_t len); // send a binary frame (mic PCM) to the focused bridge
 void net_set_focus_bridge(int bridge);   // route net_send_text/binary to this bridge (UI sets on focus change)
+void net_wifi_set_enabled(bool on);      // persist WiFi flag + reboot to apply (Settings toggle)
+void net_tailnet_set_enabled(bool on);   // join/leave the tailnet live, no reboot (Settings toggle)
+void net_get_flags(bool *wifi_en, bool *ts_en, bool *ts_has_key); // current toggle state for the Settings UI
 
 // --- Audio (audio.cpp) ---
 void audio_init(void);                   // ES8311 speaker setup
@@ -42,6 +53,7 @@ void audio_record_stop(void);            // stop mic capture
 
 // --- Board IO (main.cpp) ---
 void app_io_set_pa(bool on);             // enable/disable speaker amp (TCA9554 bit7)
+void app_set_rotation(bool landscape);   // portrait <-> landscape (for the full-text reader)
 
 #ifdef __cplusplus
 }

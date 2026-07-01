@@ -119,7 +119,26 @@ function askMsg(s) { return { type: 'ask', id: s.pendingAsk.id, sid: s.sid, ques
 // ---------- activity feed (live "what's Claude doing") ----------
 const FEED_MAX = 40;
 function shortFile(p) { return p ? String(p).split('/').pop() : ''; }
-function clip(v, n = 52) { const s = String(v || '').replace(/\s+/g, ' ').trim(); return s.length > n ? s.slice(0, n - 1) + '…' : s; }
+// The deck font (font_deck_12/16) covers ASCII + Latin-1 + a curated set of typographic punctuation and
+// our icon glyphs, but it renders raw text (no markdown). So strip markdown MARKERS (** ` # and list
+// bullets) -- syntax, not characters -- and drop any glyph the font lacks (emoji, CJK, box-drawing) so
+// nothing shows as a tofu box. Real punctuation the font has (em-dash, curly quotes, ellipsis, bullet,
+// arrow) passes through. Applied to feed + status text only -- NOT to ask option labels, which the deck
+// echoes back verbatim as the answer (sanitizing them could break AskUserQuestion's match).
+function deckSafe(v) {
+  if (v == null) return '';
+  const t = String(v)
+    .replace(/```[\s\S]*?```/g, ' ')     // fenced code block
+    .replace(/`([^`]*)`/g, '$1')          // inline code
+    .replace(/\*\*([^*]+)\*\*/g, '$1')      // **bold**
+    .replace(/\*([^*\n]+)\*/g, '$1')        // *italic*
+    .replace(/\*{2,}/g, '')                 // stray ** from truncation
+    .replace(/^\s{0,3}#{1,6}\s+/gm, '')     // # headings
+    .replace(/^\s{0,3}[-*+]\s+/gm, '- ');   // bullet lists -> "- "
+  // keep only glyphs the deck font actually has (must match the font_deck build ranges)
+  return t.replace(/[^\t\n\r\x20-\x7E\u00A0-\u00FF\u2013\u2014\u2018\u2019\u201C\u201D\u2022\u2026\u2192]/g, '');
+}
+function clip(v, n = 52) { const s = String(v || '').replace(/\s+/g, ' ').trim(); return s.length > n ? s.slice(0, n - 1) + '\u2026' : s; }
 // Turn a tool call into a short "target" detail, by tool.
 function describeTool(name, ti = {}) {
   if (!ti) ti = {};                    // tool_input may arrive as null, not just absent
@@ -161,14 +180,15 @@ function pushReplyWhenReady(sid, transcriptPath, tries, prevId) {
   const r = lastReply(transcriptPath);
   if (r && r.id !== prevId) {
     const s = sessions.get(sid);
-    if (s) { s.lastReplyId = r.id; pushFeed(s, 'reply', '', clip(r.text, 200)); console.log(`[reply] ${r.text.length} chars -> ${s.title}`); }
+    if (s) { s.lastReplyId = r.id; pushFeed(s, 'reply', '', clip(r.text, 120), r.text); console.log(`[reply] ${r.text.length} chars -> ${s.title}`); }
   } else if (tries > 0) {
     setTimeout(() => pushReplyWhenReady(sid, transcriptPath, tries - 1, prevId), 200);
   }
 }
 // Append a line to a session's feed; stream it to the deck if that session is focused.
-function pushFeed(s, kind, label, detail = '') {
-  const line = { ts: Date.now(), kind, label, detail };
+function pushFeed(s, kind, label, detail = '', full = null) {
+  const line = { ts: Date.now(), kind, label: deckSafe(label), detail: deckSafe(detail) };
+  if (full != null) line.full = deckSafe(full).slice(0, 2000);   // full text for the deck's landscape reader
   s.feed.push(line);
   if (s.feed.length > FEED_MAX) s.feed.shift();
   if (s.sid === focusedSid) broadcast({ type: 'activity', sid: s.sid, line });
@@ -199,7 +219,7 @@ function setFocus(sid, push = true) {
 
 // mutate session status; stream to the deck only if it's the focused one
 function setSessionStatus(s, state, text, tool) {
-  s.state = state; s.text = text ?? state; s.tool = tool ?? s.tool;
+  s.state = state; s.text = deckSafe(text ?? state); s.tool = tool ?? s.tool;
   if (s.sid === focusedSid) broadcast(statusMsg(s));
 }
 
@@ -219,6 +239,7 @@ function injectToCC(text, submit = true, target = focusedTmux()) {
 const WHISPER_BIN = process.env.CCDECK_WHISPER_BIN || 'whisper-cli';
 const WHISPER_MODEL = process.env.CCDECK_WHISPER_MODEL || path.join(__dirname, '..', 'tools', 'whisper-models', 'ggml-base.en.bin');
 const VOICE_AUTOSUBMIT = process.env.CCDECK_VOICE_AUTOSUBMIT !== '0';   // type+Enter by default; set 0 to type only
+const VOICE_CONFIRM = process.env.CCDECK_VOICE_CONFIRM !== '0';         // on-device Send/Cancel; set 0 for legacy auto-inject
 let voiceSeq = 0;
 function pcmToWav(pcm, sr = 16000) {
   const ch = 1, bits = 16, dataLen = pcm.length, h = Buffer.alloc(44);
@@ -235,18 +256,30 @@ function transcribeWav(wavPath) {
 }
 function finishVoice(ws) {
   const chunks = ws._mic || []; ws._mic = []; ws._recording = false;
+  const id = ws._voiceId;
   const pcm = Buffer.concat(chunks);
   console.log(`[voice] ${pcm.length} bytes (~${(pcm.length / 2 / 16000).toFixed(1)}s)`);
-  if (pcm.length < 16000 * 2 * 0.3) { console.log('[voice] too short, ignored'); return; }
-  const tmp = path.join(os.tmpdir(), `ccdeck-voice-${process.pid}-${++voiceSeq}.wav`);
-  try {
-    fs.writeFileSync(tmp, pcmToWav(pcm));
-    const text = transcribeWav(tmp);
-    fs.unlink(tmp, () => {});
-    const s = sessions.get(focusedSid);
-    console.log(`[voice] -> ${s ? s.title : '?'}: "${text}"`);
+  let text = '';
+  if (pcm.length < 16000 * 2 * 0.3) {
+    console.log('[voice] too short, ignored');
+  } else {
+    const tmp = path.join(os.tmpdir(), `ccdeck-voice-${process.pid}-${++voiceSeq}.wav`);
+    try { fs.writeFileSync(tmp, pcmToWav(pcm)); text = transcribeWav(tmp); fs.unlink(tmp, () => {}); }
+    catch (e) { console.error('[voice] error', e.message); }
+  }
+  const s = sessions.get(focusedSid);
+  console.log(`[voice] -> ${s ? s.title : '?'}: "${text}"`);
+  if (!VOICE_CONFIRM) {   // legacy: inject immediately (old firmware / mock with no confirm step)
     if (text) { if (s) setSessionStatus(s, 'working', 'voice: ' + text.slice(0, 32)); injectToCC(text, VOICE_AUTOSUBMIT); }
-  } catch (e) { console.error('[voice] error', e.message); }
+    return;
+  }
+  // Return the transcript to the deck for on-device Send/Cancel; hold it (bound to the focus AT THIS MOMENT,
+  // so a later focus change can't misroute the injection) until voice_commit/voice_cancel, or 120s.
+  try { ws.send(JSON.stringify({ type: 'transcript', id, text, sid: focusedSid })); } catch {}
+  // Hold the transcript (bound to the focus captured NOW) until the deck confirms/cancels, the next
+  // capture on this socket overwrites it, or the socket closes — no wall-clock expiry, so a slow
+  // confirm can never desync (a late Send still injects into the originally-focused session).
+  ws._pendingVoice = text ? { id, text, sid: focusedSid, tmux: focusedTmux() } : null;
 }
 
 // ---------- http ----------
@@ -417,8 +450,25 @@ wss.on('connection', (ws, req) => {
     let m; try { m = JSON.parse(buf.toString()); } catch { return; }
     switch (m.type) {
       case 'hello': console.log(`[ws] hello from ${m.name} (${m.fw})`); sendSound('done'); break;
-      case 'voice_start': ws._mic = []; ws._recording = true; console.log('[voice] start'); break;
+      case 'voice_start': ws._mic = []; ws._recording = true; ws._voiceId = m.id; console.log('[voice] start'); break;
       case 'voice_end': finishVoice(ws); break;
+      case 'voice_commit': {
+        const pv = ws._pendingVoice;
+        if (pv && pv.id === m.id) {
+          ws._pendingVoice = null;
+          const s = sessions.get(pv.sid);
+          if (s) setSessionStatus(s, 'working', 'voice: ' + pv.text.slice(0, 32));
+          injectToCC(pv.text, VOICE_AUTOSUBMIT, pv.tmux);
+          console.log(`[voice] committed: "${pv.text}"`);
+        }
+        break;
+      }
+      case 'voice_cancel': {
+        const pv = ws._pendingVoice;
+        if (pv && pv.id === m.id) ws._pendingVoice = null;
+        console.log('[voice] cancelled');
+        break;
+      }
       case 'focus': if (m.sid && sessions.has(m.sid)) setFocus(m.sid); break;
       case 'answer': {
         const p = pendingAsks.get(m.id);
@@ -443,6 +493,7 @@ wss.on('connection', (ws, req) => {
   });
   ws.on('close', () => {
     clients.delete(ws);
+    ws._pendingVoice = null;
     console.log(`[ws] disconnected (${clients.size} left)`);
     if (clients.size === 0) {  // no deck left to answer -> unblock pending asks so Claude falls back to its TUI picker
       for (const [id, p] of pendingAsks) {

@@ -30,6 +30,38 @@ Serial port on this Mac: `/dev/cu.usbmodem8341101`. MAC `a4:cb:8f:da:ce:70`.
   - `buff[1]` = #points (valid 1..4).
   - X = `((buff[2]&0x0F)<<8)|buff[3]` (12-bit). Y = `((buff[4]&0x0F)<<8)|buff[5]`.
 
+## Battery / system voltage
+- **BAT_ADC = GPIO4 = ADC1 channel 3**, behind an on-board **3:1 divider** → `V_sys = adc_mV * 3`. Read with
+  `adc_oneshot` @ 12-bit / `ADC_ATTEN_DB_12`, curve-fitting calibration (raw 3.3V/4096 fallback if cali fails).
+  Uses **ADC1** so it coexists with WiFi (ADC2 would not). See `main/battery.cpp`.
+- The reading is effectively **VBAT** (the 1S Li-ion), not the input rail: it sits ~4.14V on battery and only
+  ~4.16–4.18V when charging/near-full, with **no usable jump when USB-C is plugged in** (hardware-confirmed). So
+  **charging is NOT detectable** by voltage; GPIO16 (SYS_OUT) is also constant. A charging indicator would need
+  the charger's STAT pin wired to a spare GPIO (hardware mod). Percentage is an approximate resting-voltage curve
+  saturating to 100% at ~4.15V (no BQ27220 fuel gauge is populated).
+- Status-bar gauge is **drawn with LVGL rects** (body + nub + fill), NOT a font glyph — the merged deck font
+  lacks the FontAwesome battery icons (`LV_SYMBOL_BATTERY_*` would tofu). Green >35% / amber ≤35% / red ≤15%.
+  Polled every 10s by the power task.
+
+## Buttons (three side buttons, "KEY&POWER" block on the schematic)
+| Button | Wiring | Firmware use |
+|---|---|---|
+| **RESET** | ESP32-S3 EN/reset line | Hardware chip reset — reboots the deck; NOT reprogrammable. |
+| **PWR** (middle) | Power-latch circuit (SYS_EN = TCA9554 bit6 latch; SYS_OUT = GPIO16 sense) | Long-press power-off is the latch hardware. Short-press sense on GPIO16 is possible but unused. |
+| **BOOT** | **GPIO0** (active-low, external pull-up; strapping pin, safe to read at runtime) | Repurposed: short = cycle backlight brightness, long (≥1.2s) = toggle screen standby. |
+
+## Standby / screen power (companion firmware)
+- "Standby" = **screen off only** — WiFi + the WebSocket stay associated so the deck stays pingable and wakes on
+  events. Blanked with the **backlight only** (BL_EN bit1 low + PWM duty 255); `flush_cb` skips the SPI redraw
+  while off. We do NOT send the panel DISPOFF — on this board it woke to a black screen (see gotcha below), and
+  the backlight is the dominant draw anyway.
+- Owned entirely by the power task (`example_backlight_loop_task` in `main.cpp`): it polls BOOT, runs the idle
+  auto-off timer (`STANDBY_IDLE_MS`, Settings "Auto sleep" toggle), and services wake/sleep request flags. Every
+  panel transition runs under the LVGL lock, so it can't race `flush_cb`. Other threads only post flags
+  (`app_note_user_activity` from touch, `app_wake_for_event` from ask/alert/reply) — never touch the panel.
+- Wake events = a question (`ask`), an `alert`, or a `reply`/`done`/`notify` feed line. Routine tool-use activity
+  does NOT wake the screen. `esp_wifi_set_ps(WIFI_PS_MIN_MODEM)` is set for standing modem power-save.
+
 ## System I2C (I2C_NUM_0): SDA=GPIO47, SCL=GPIO48, 300 kHz
 | Device | 7-bit addr |
 |---|---|
@@ -76,3 +108,4 @@ QSPI/touch/audio pins identical across V1/V2.
 - **ES8311 is a MONO codec.** Configure I2S + esp_codec_dev as mono (`channel=1`, `I2S_SLOT_MODE_MONO`). A stereo config double-speeds playback (pitched-up, harsh "bop"). Keep the speaker amp (NS_MODE bit7) ON during playback so tones aren't chopped.
 - Alert sounds are **streamed PCM clips** from the bridge (binary WS frames), not synth — see `bridge/sounds/` + `audio_play_pcm`.
 - ES8311 (speaker out) + ES7210 (mic in) share **one I2S** (BCLK15/WS46/MCLK7; out=DOUT45, in=DIN6) → mic capture needs full-duplex or play/record switching.
+- **Avoid `esp_lcd_panel_disp_on_off()` for standby on this board.** The AXS15231B driver's `panel_axs15231b_disp_off` sends DISPOFF/DISPON, but in practice the panel woke to a **black screen** (backlight on, no image) after a DISPOFF/DISPON cycle regardless of the bool passed — a plain DISPON didn't restore it. Blank with the **backlight** (BL_EN + PWM) instead; a panel that never gets DISPOFF always has a valid image the instant the backlight returns.

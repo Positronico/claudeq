@@ -34,6 +34,7 @@ static int16_t *s_buf = NULL;                        // synth tone buffer
 #define MAX_FRAMES 16000
 static volatile bool s_recording = false;
 static TaskHandle_t s_rec_task = NULL;
+static volatile bool s_muted = false;                // Settings "Sounds" off -> drop all alert/reply playback
 
 // ---------- synth tones (fallback) ----------
 static int gen_tone(int frame_off, float freq, int ms, float amp) {
@@ -76,7 +77,10 @@ static void audio_task(void *arg) {
     }
 }
 
+extern "C" void audio_set_muted(bool muted) { s_muted = muted; }
+
 extern "C" void audio_play_pcm(const void *data, size_t bytes) {
+    if (s_muted) return;
     if (!s_dev || !data || bytes == 0 || bytes > 1024 * 1024) return;
     void *copy = heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM);
     if (!copy) { ESP_LOGW(TAG, "pcm alloc failed (%u)", (unsigned)bytes); return; }
@@ -85,6 +89,7 @@ extern "C" void audio_play_pcm(const void *data, size_t bytes) {
     if (!s_q || xQueueSend(s_q, &r, 0) != pdTRUE) heap_caps_free(copy);
 }
 extern "C" void audio_play_alert(const char *sound) {
+    if (s_muted) return;
     play_req_t r = { 0, SND_BEEP, NULL, 0 };
     if (sound) {
         if (!strcmp(sound, "chirp")) r.tone = SND_CHIRP;

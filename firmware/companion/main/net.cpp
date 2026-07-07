@@ -56,18 +56,23 @@ static int s_focus_bridge = 0;       // where net_send_text/binary (macros/voice
 static TaskHandle_t s_disc_task = NULL;   // discovery_task handle; the tailnet toggle command rides its
                                           // notification value (1 enable, 2 disable) so it's read atomically
 
-// WiFi icon = "at least one bridge connected", derived by scanning so there's no shared-counter race.
+// Push the top-bar network state (online + distinct-bridge count + tailscale), derived by scanning so there's
+// no shared-counter race. Bridge count = connected PRIMARY slots (a machine reachable via both LAN + tailnet
+// keeps one primary, so it isn't double-counted).
 static void update_conn_icon(void) {
-    bool any = false;
-    for (int i = 0; i < MAX_BRIDGES; i++) if (s_br[i].used && s_br[i].connected) { any = true; break; }
-    ui_set_connection(any);
+    bool any = false; int bridges = 0;
+    for (int i = 0; i < MAX_BRIDGES; i++) {
+        if (s_br[i].used && s_br[i].connected) { any = true; if (s_br[i].primary) bridges++; }
+    }
+    bool ts_configured = (g_cfg.tailscale_authkey[0] != 0 && g_cfg.tailscale_enabled != 0);
+    ui_set_net_status(any, bridges, ts_configured, s_ml != NULL);
 }
 
 static void wifi_evt(void *arg, esp_event_base_t base, int32_t id, void *data) {
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
         esp_wifi_connect();
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
-        ui_set_connection(false);
+        ui_set_net_status(false, 0, (g_cfg.tailscale_authkey[0] != 0 && g_cfg.tailscale_enabled != 0), s_ml != NULL);
         if (!s_provisioning) { vTaskDelay(pdMS_TO_TICKS(1000)); esp_wifi_connect(); }
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *e = (ip_event_got_ip_t *)data;
@@ -330,6 +335,7 @@ static void discovery_task(void *arg) {
         xTaskNotifyWait(0, 0xFFFFFFFF, &cmd, pdMS_TO_TICKS(8000));
         if (cmd == 1) tailnet_start();
         else if (cmd == 2) tailnet_stop();
+        update_conn_icon();   // keep the top-bar tailscale badge / bridge count fresh even without a WS event
     }
 }
 
@@ -357,6 +363,11 @@ extern "C" void net_get_flags(bool *wifi_en, bool *ts_en, bool *ts_has_key) {
     if (wifi_en)    *wifi_en    = g_cfg.wifi_enabled != 0;
     if (ts_en)      *ts_en      = g_cfg.tailscale_enabled != 0;
     if (ts_has_key) *ts_has_key = g_cfg.tailscale_authkey[0] != 0;
+}
+
+extern "C" void net_get_prefs(bool *auto_standby, bool *sound_en) {
+    if (auto_standby) *auto_standby = g_cfg.auto_standby != 0;
+    if (sound_en)     *sound_en     = g_cfg.sound_enabled != 0;
 }
 
 extern "C" void net_send_to(int bridge, const char *json) {
@@ -408,7 +419,7 @@ extern "C" void net_start(void) {
     }
     if (!g_cfg.wifi_enabled) {               // user turned WiFi off in Settings -> stay offline (UI still runs)
         ESP_LOGW(TAG, "WiFi disabled in Settings; staying offline (re-enable on the deck)");
-        ui_set_connection(false);
+        ui_set_net_status(false, 0, (g_cfg.tailscale_authkey[0] != 0 && g_cfg.tailscale_enabled != 0), s_ml != NULL);
         return;
     }
     wifi_config_t wc = {};
@@ -418,6 +429,9 @@ extern "C" void net_start(void) {
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wc));
     ESP_ERROR_CHECK(esp_wifi_start());
+    // Modem power-save: the radio naps between DTIM beacons but stays associated, so the WebSocket stays
+    // up and incoming frames still wake us. Cheap standing win; the screen backlight is the bigger draw.
+    esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
     xTaskCreate(discovery_task, "net", 8192, NULL, 5, NULL);
     ESP_LOGI(TAG, "wifi starting, ssid=%s; discovering bridges via mDNS", g_cfg.ssid);
 }

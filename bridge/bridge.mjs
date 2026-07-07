@@ -155,6 +155,24 @@ function describeTool(name, ti = {}) {
     default: return '';
   }
 }
+// Short readable model name from a raw id, e.g. "claude-opus-4-20250514" -> "opus-4", "" if unknown.
+function modelName(m) {
+  if (!m) return '';
+  return String(m).replace(/^claude-/, '').replace(/-\d{6,}$/, '');
+}
+// The model of the last assistant turn in the transcript ('' if none yet — e.g. a brand-new session).
+function transcriptModel(transcriptPath) {
+  try {
+    const lines = fs.readFileSync(transcriptPath, 'utf8').split('\n');
+    for (let i = lines.length - 1; i >= 0; i--) {
+      if (!lines[i].trim()) continue;
+      let o; try { o = JSON.parse(lines[i]); } catch { continue; }
+      const m = o.message;
+      if ((o.type === 'assistant' || m?.role === 'assistant') && m?.model) return m.model;
+    }
+  } catch {}
+  return '';
+}
 // Pull Claude's last text response out of the session transcript (read on Stop) so the deck can show
 // what Claude actually said, not just the tool activity. Returns '' if unavailable.
 function lastReply(transcriptPath) {
@@ -167,7 +185,7 @@ function lastReply(transcriptPath) {
       if (o.type !== 'assistant' && m?.role !== 'assistant') continue;
       if (!Array.isArray(m?.content)) continue;
       const text = m.content.filter((b) => b?.type === 'text').map((b) => b.text).join(' ').trim();
-      if (text) return { text, id: o.uuid || m.id || String(i) };  // id = this turn's message identity
+      if (text) return { text, id: o.uuid || m.id || String(i), model: m.model || '' };  // id = turn identity
     }
   } catch {}
   return null;
@@ -180,7 +198,7 @@ function pushReplyWhenReady(sid, transcriptPath, tries, prevId) {
   const r = lastReply(transcriptPath);
   if (r && r.id !== prevId) {
     const s = sessions.get(sid);
-    if (s) { s.lastReplyId = r.id; pushFeed(s, 'reply', '', clip(r.text, 120), r.text); console.log(`[reply] ${r.text.length} chars -> ${s.title}`); }
+    if (s) { s.lastReplyId = r.id; if (r.model) s.hud.model = r.model; pushFeed(s, 'reply', '', clip(r.text, 120), r.text); console.log(`[reply] ${r.text.length} chars -> ${s.title}`); }
   } else if (tries > 0) {
     setTimeout(() => pushReplyWhenReady(sid, transcriptPath, tries - 1, prevId), 200);
   }
@@ -365,10 +383,13 @@ function handleEvent(kind, ev, meta) {
   const s = touchSession(meta);
   if (!s) return;                       // no session id -> can't attribute; ignore
   switch (kind) {
-    case 'SessionStart':
-      if (ev.model) s.hud.model = ev.model;
+    case 'SessionStart': {
+      const model = ev.model || (ev.transcript_path && transcriptModel(ev.transcript_path));
+      if (model) s.hud.model = model;
       s.attn = false; setSessionStatus(s, 'idle', 'ready');
-      pushFeed(s, 'start', 'session', shortFile(s.cwd)); break;
+      // show the model on the start row (falls back to the project folder when it's not known yet)
+      pushFeed(s, 'start', 'session', s.hud.model ? modelName(s.hud.model) : shortFile(s.cwd)); break;
+    }
     case 'UserPromptSubmit':
       s.promptStartedAt = Date.now(); s.hud.elapsedMs = 0; s.attn = false;
       setSessionStatus(s, 'thinking', 'thinking');

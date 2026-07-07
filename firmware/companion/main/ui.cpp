@@ -32,11 +32,18 @@ LV_FONT_DECLARE(font_back_32);       // big back-chevron (U+F053) for the reader
 #define COL_OK      0x46c46a
 #define COL_WARN    0xe8b84b
 #define COL_ERR     0xef5a5a
+#define COL_TSOFF   0x333a4a   // dim "off" dots of the Tailscale logo (much darker than the green lit dots)
+#define COL_CLAUDE  0xcb8b6a   // Claude mascot clay/terracotta
 
 #define SCR_W 172
 
 // status bar
 static lv_obj_t *s_dot, *s_state, *s_conn;
+static lv_obj_t *s_ts_cell = NULL, *s_bridges = NULL;     // top-bar Tailscale cell (hide/show) + bridge count
+static lv_obj_t *s_ts_dots[4] = {0};                     // the 4 "lit" dots of the Tailscale logo (recolored by state)
+static lv_obj_t *s_botbar = NULL;                         // bottom status strip (dot + state text) above the nav
+static lv_obj_t *s_bat_body = NULL, *s_bat_fill = NULL;   // drawn battery gauge
+#define BAT_FILL_MAX 18                                   // inner fill width at 100% (px) — spans the body inner width
 // sessions (chip strip) — aggregated across every connected bridge
 static lv_obj_t *s_sessbar;
 #define MAX_SESS 24      // headroom for several bridges (MAX_BRIDGES) x several sessions each
@@ -686,6 +693,7 @@ void ui_handle_message(cJSON *root, int bridge) {
         if (cJSON_IsString(sid))             // a question pulls focus to its session, on whichever bridge
             set_local_focus(sid->valuestring, bridge);   // clears stale feed; bridge resends snapshot after the ask
         show_ask(root); set_state("waiting", "tap to choose"); render_chips();
+        app_wake_for_event();                // a question needs you -> wake the screen from standby
     } else if (!strcmp(t, "ask_cancel")) {
         if (concerns_focus(root, bridge)) clear_ask();
     } else if (!strcmp(t, "hud")) {
@@ -707,10 +715,15 @@ void ui_handle_message(cJSON *root, int bridge) {
                 cJSON *l = cJSON_GetObjectItem(line, "label");
                 cJSON *d = cJSON_GetObjectItem(line, "detail");
                 cJSON *fu = cJSON_GetObjectItem(line, "full");
-                feed_add_row(cJSON_IsString(k) ? k->valuestring : NULL,
+                const char *kind = cJSON_IsString(k) ? k->valuestring : NULL;
+                feed_add_row(kind,
                              cJSON_IsString(l) ? l->valuestring : "",
                              cJSON_IsString(d) ? d->valuestring : "",
                              cJSON_IsString(fu) ? fu->valuestring : NULL, true);
+                // Wake on the "something new" lines (Claude replied / finished / is calling for you); stay
+                // dark through routine tool-use churn (tool/prompt/start) so standby actually saves power.
+                if (kind && (!strcmp(kind, "reply") || !strcmp(kind, "done") || !strcmp(kind, "notify")))
+                    app_wake_for_event();
             }
             if (!s_ask) show_idle_view();
         }
@@ -720,20 +733,54 @@ void ui_handle_message(cJSON *root, int bridge) {
         cJSON *lvl = cJSON_GetObjectItem(root, "level");
         const char *lv = cJSON_IsString(lvl) ? lvl->valuestring : "info";
         lv_obj_set_style_bg_color(lv_scr_act(), lv_color_hex(!strcmp(lv, "error") ? 0x3a1414 : 0x10161f), 0);
+        app_wake_for_event();                // an alert wants your attention -> wake the screen
     }
     ui_unlock();
 }
 
-void ui_set_connection(bool connected) {
+// True while a question overlay is up: the power task keeps the screen awake so the ask can't be missed.
+bool ui_has_pending_ask(void) { return s_ask != NULL; }
+
+void ui_set_net_status(bool online, int bridges, bool ts_configured, bool ts_up) {
     if (!s_conn) return;
     if (!ui_lock(1000)) return;
-    lv_label_set_text(s_conn, connected ? LV_SYMBOL_WIFI : LV_SYMBOL_CLOSE);
-    lv_obj_set_style_text_color(s_conn, lv_color_hex(connected ? COL_OK : COL_ERR), 0);
-    // With no session in focus there's no per-session status to show, so the strip would keep its stale
-    // "connecting..." init text even while online — reflect the actual link state instead.
+    lv_label_set_text(s_conn, online ? LV_SYMBOL_WIFI : LV_SYMBOL_CLOSE);
+    lv_obj_set_style_text_color(s_conn, lv_color_hex(online ? COL_OK : COL_ERR), 0);
+    if (s_ts_cell) {                                // Tailscale logo: shown only when configured
+        if (ts_configured) lv_obj_clear_flag(s_ts_cell, LV_OBJ_FLAG_HIDDEN);
+        else               lv_obj_add_flag(s_ts_cell, LV_OBJ_FLAG_HIDDEN);
+    }
+    for (int i = 0; i < 4; i++)                     // light the logo's lit dots green when the tailnet is up
+        if (s_ts_dots[i]) lv_obj_set_style_bg_color(s_ts_dots[i], lv_color_hex(ts_up ? COL_OK : COL_TSOFF), 0);
+    if (s_bridges) {                                // bridge count: always shown; dim when none connected
+        char b[12]; snprintf(b, sizeof(b), "%d", online ? bridges : 0);
+        lv_label_set_text(s_bridges, b);
+        lv_obj_set_style_text_color(s_bridges, lv_color_hex((online && bridges > 0) ? COL_INK : COL_DIM), 0);
+    }
+    // With no session in focus there's no per-session status, so the strip would keep its stale "connecting..."
+    // init text even while online — reflect the actual link state instead.
     if (s_state && !focus_sid[0])
-        lv_label_set_text(s_state, connected ? "ready - no session" : "connecting...");
+        lv_label_set_text(s_state, online ? "ready - no session" : "connecting...");
     ui_unlock();
+}
+
+bool ui_set_battery(int pct, bool charging, bool present) {
+    if (!s_bat_body || !s_bat_fill) return false;    // UI not built yet -> caller retries
+    if (!ui_lock(1000)) return false;
+    if (!present) {                       // no reading yet -> keep the gauge hidden
+        lv_obj_add_flag(s_bat_body, LV_OBJ_FLAG_HIDDEN);
+        ui_unlock();
+        return true;
+    }
+    lv_obj_clear_flag(s_bat_body, LV_OBJ_FLAG_HIDDEN);
+    if (pct < 0) pct = 0; else if (pct > 100) pct = 100;
+    int w = 1 + (BAT_FILL_MAX - 1) * pct / 100;      // keep a sliver visible even near 0%
+    lv_obj_set_width(s_bat_fill, w);
+    uint32_t col = pct <= 15 ? COL_ERR : (pct <= 35 ? COL_WARN : COL_OK);
+    lv_obj_set_style_bg_color(s_bat_fill, lv_color_hex(col), 0);
+    (void)charging;   // no reliable USB/charge signal on this board (VBAT barely moves; SYS_OUT is constant)
+    ui_unlock();
+    return true;
 }
 
 // Full-screen overlay shown while the SoftAP setup portal is up.
@@ -811,11 +858,21 @@ static void tailscale_sw_cb(lv_event_t *e) {
     lv_obj_t *sw = lv_event_get_target(e);
     net_tailnet_set_enabled(lv_obj_has_state(sw, LV_STATE_CHECKED));   // live, no reboot
 }
+static void standby_sw_cb(lv_event_t *e) {
+    bool on = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
+    cfg_set_auto_standby(on ? 1 : 0);
+    app_set_auto_standby(on);                                         // live, no reboot
+}
+static void sounds_sw_cb(lv_event_t *e) {
+    bool on = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);   // ON = sounds play
+    cfg_set_sound_enabled(on ? 1 : 0);
+    audio_set_muted(!on);                                            // live, no reboot
+}
 
-// A full-screen content page in the area between the chip strip and the bottom nav.
+// A full-screen content page in the area between the chip strip and the bottom status strip.
 static lv_obj_t *make_page(lv_obj_t *parent) {
     lv_obj_t *p = lv_obj_create(parent);
-    lv_obj_set_size(p, SCR_W, 434);
+    lv_obj_set_size(p, SCR_W, 406);   // chip strip ends at 74; bottom status strip starts at 480
     lv_obj_align(p, LV_ALIGN_TOP_MID, 0, 74);
     lv_obj_set_style_bg_color(p, lv_color_hex(COL_BG), 0);
     lv_obj_set_style_border_width(p, 0, 0);
@@ -825,32 +882,135 @@ static lv_obj_t *make_page(lv_obj_t *parent) {
     return p;
 }
 
+// A transparent, borderless, non-scrollable container — used as an evenly-spaced top-bar cell.
+static lv_obj_t *mkcell(lv_obj_t *parent, int w, int h) {
+    lv_obj_t *c = lv_obj_create(parent);
+    lv_obj_set_size(c, w, h);
+    lv_obj_set_style_bg_opa(c, LV_OPA_0, 0);
+    lv_obj_set_style_border_width(c, 0, 0);
+    lv_obj_set_style_radius(c, 0, 0);
+    lv_obj_set_style_pad_all(c, 0, 0);
+    lv_obj_clear_flag(c, LV_OBJ_FLAG_SCROLLABLE);
+    return c;
+}
+
+// A small solid rectangle (icon primitive).
+static lv_obj_t *mkrect(lv_obj_t *parent, int w, int h, uint32_t color) {
+    lv_obj_t *r = lv_obj_create(parent);
+    lv_obj_set_size(r, w, h);
+    lv_obj_set_style_radius(r, 0, 0);
+    lv_obj_set_style_bg_color(r, lv_color_hex(color), 0);
+    lv_obj_set_style_border_width(r, 0, 0);
+    lv_obj_set_style_pad_all(r, 0, 0);
+    lv_obj_clear_flag(r, LV_OBJ_FLAG_SCROLLABLE);
+    return r;
+}
+
+// A filled dot (icon primitive).
+static lv_obj_t *mkdot(lv_obj_t *parent, int d, uint32_t color) {
+    lv_obj_t *o = mkrect(parent, d, d, color);
+    lv_obj_set_style_radius(o, LV_RADIUS_CIRCLE, 0);
+    return o;
+}
+
+
+// Draw the simplified Claude mascot (clay body, two eyes, side ears, little legs) into an 18x15 canvas cell.
+static void draw_mascot(lv_obj_t *canvas) {
+    lv_obj_t *body = mkrect(canvas, 14, 11, COL_CLAUDE);   // rounded body, centred; ears poke out the sides
+    lv_obj_set_style_radius(body, 2, 0);
+    lv_obj_align(body, LV_ALIGN_TOP_MID, 0, 0);
+    lv_obj_align(mkrect(canvas, 2, 4, COL_CLAUDE), LV_ALIGN_TOP_LEFT, 0, 4);    // left ear
+    lv_obj_align(mkrect(canvas, 2, 4, COL_CLAUDE), LV_ALIGN_TOP_RIGHT, 0, 4);   // right ear
+    lv_obj_align(mkrect(canvas, 2, 4, 0x000000), LV_ALIGN_TOP_LEFT, 5, 3);      // left eye
+    lv_obj_align(mkrect(canvas, 2, 4, 0x000000), LV_ALIGN_TOP_LEFT, 11, 3);     // right eye
+    for (int i = 0; i < 4; i++)                                                 // four little legs
+        lv_obj_align(mkrect(canvas, 2, 3, COL_CLAUDE), LV_ALIGN_TOP_LEFT, 3 + i * 4, 11);
+}
+
 void ui_init(void) {
     lv_obj_t *scr = lv_scr_act();
     lv_obj_set_style_bg_color(scr, lv_color_hex(COL_BG), 0);
     lv_obj_clear_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
 
-    // --- status bar ---
+    // --- top bar: four icons evenly spaced, left->right: bridge count, Tailscale (tunnel), WiFi, battery ---
     lv_obj_t *bar = lv_obj_create(scr);
     lv_obj_set_size(bar, SCR_W, 30);
     lv_obj_align(bar, LV_ALIGN_TOP_MID, 0, 0);
     lv_obj_set_style_bg_color(bar, lv_color_hex(COL_PANEL), 0);
     lv_obj_set_style_border_width(bar, 0, 0);
     lv_obj_set_style_radius(bar, 0, 0);
-    lv_obj_set_style_pad_hor(bar, 6, 0);
+    lv_obj_set_style_pad_hor(bar, 8, 0);
+    lv_obj_set_style_pad_ver(bar, 0, 0);
     lv_obj_clear_flag(bar, LV_OBJ_FLAG_SCROLLABLE);
-    s_dot = lv_obj_create(bar);
-    lv_obj_set_size(s_dot, 11, 11);
-    lv_obj_set_style_radius(s_dot, 6, 0);
+    lv_obj_set_flex_flow(bar, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(bar, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    // (1) bridge count — the Claude mascot followed by the number of connected bridges
+    lv_obj_t *br_cell = mkcell(bar, 36, 26);
+    lv_obj_set_flex_flow(br_cell, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(br_cell, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(br_cell, 3, 0);
+    draw_mascot(mkcell(br_cell, 18, 15));
+    s_bridges = mklabel(br_cell, "0", &lv_font_montserrat_16, COL_DIM);
+
+    // (2) Tailscale — its 3x3 dot logo; the 4 "lit" dots (middle row + bottom-centre) turn green when up,
+    // dim when configured-but-down. Whole cell hidden when Tailscale isn't configured.
+    s_ts_cell = mkcell(bar, 18, 26);
+    lv_obj_t *grid = mkcell(s_ts_cell, 16, 16);
+    lv_obj_align(grid, LV_ALIGN_CENTER, 0, 0);
+    int di = 0;
+    for (int r = 0; r < 3; r++)
+        for (int c = 0; c < 3; c++) {
+            lv_obj_t *dot = mkdot(grid, 4, COL_TSOFF);
+            lv_obj_align(dot, LV_ALIGN_TOP_LEFT, c * 6, r * 6);
+            if ((r == 1 || (r == 2 && c == 1)) && di < 4) s_ts_dots[di++] = dot;      // the lit pattern
+        }
+    lv_obj_add_flag(s_ts_cell, LV_OBJ_FLAG_HIDDEN);
+
+    // (3) WiFi link
+    lv_obj_t *wifi_cell = mkcell(bar, 18, 26);
+    s_conn = mklabel(wifi_cell, LV_SYMBOL_CLOSE, &lv_font_montserrat_16, COL_ERR);
+    lv_obj_center(s_conn);
+
+    // (4) battery gauge (drawn with rects; the deck font lacks the FontAwesome battery glyphs) — body outline
+    // + terminal nub + an inner fill whose width/colour reflect charge. Hidden until the first reading.
+    lv_obj_t *bat_cell = mkcell(bar, 26, 26);
+    s_bat_body = lv_obj_create(bat_cell);
+    lv_obj_set_size(s_bat_body, 22, 12);
+    lv_obj_set_style_radius(s_bat_body, 2, 0);
+    lv_obj_set_style_bg_opa(s_bat_body, LV_OPA_0, 0);
+    lv_obj_set_style_border_color(s_bat_body, lv_color_hex(COL_DIM), 0);
+    lv_obj_set_style_border_width(s_bat_body, 1, 0);
+    lv_obj_set_style_pad_all(s_bat_body, 0, 0);
+    lv_obj_clear_flag(s_bat_body, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_align(s_bat_body, LV_ALIGN_LEFT_MID, 0, 0);
+    lv_obj_add_flag(s_bat_body, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_align_to(mkrect(bat_cell, 2, 6, COL_DIM), s_bat_body, LV_ALIGN_OUT_RIGHT_MID, 0, 0);   // + terminal
+    s_bat_fill = mkrect(s_bat_body, BAT_FILL_MAX, 8, COL_OK);
+    lv_obj_set_style_radius(s_bat_fill, 1, 0);
+    lv_obj_align(s_bat_fill, LV_ALIGN_LEFT_MID, 1, 0);
+
+    // --- bottom status strip: session state dot + text, sitting directly on top of the nav ---
+    s_botbar = lv_obj_create(scr);
+    lv_obj_set_size(s_botbar, SCR_W, 28);
+    lv_obj_align(s_botbar, LV_ALIGN_BOTTOM_MID, 0, -132);   // nav is the bottom 132px
+    lv_obj_set_style_bg_color(s_botbar, lv_color_hex(COL_PANEL), 0);
+    lv_obj_set_style_border_color(s_botbar, lv_color_hex(COL_LINE), 0);
+    lv_obj_set_style_border_width(s_botbar, 1, 0);
+    lv_obj_set_style_border_side(s_botbar, LV_BORDER_SIDE_TOP, 0);
+    lv_obj_set_style_radius(s_botbar, 0, 0);
+    lv_obj_set_style_pad_hor(s_botbar, 8, 0);
+    lv_obj_clear_flag(s_botbar, LV_OBJ_FLAG_SCROLLABLE);
+    s_dot = lv_obj_create(s_botbar);
+    lv_obj_set_size(s_dot, 10, 10);
+    lv_obj_set_style_radius(s_dot, 5, 0);
     lv_obj_set_style_bg_color(s_dot, lv_color_hex(COL_DIM), 0);
     lv_obj_set_style_border_width(s_dot, 0, 0);
     lv_obj_align(s_dot, LV_ALIGN_LEFT_MID, 0, 0);
-    s_state = mklabel(bar, "connecting...", &lv_font_montserrat_16, COL_INK);
-    lv_obj_set_width(s_state, 116);
+    s_state = mklabel(s_botbar, "connecting...", &lv_font_montserrat_16, COL_INK);
+    lv_obj_set_width(s_state, 140);
     lv_label_set_long_mode(s_state, LV_LABEL_LONG_DOT);
-    lv_obj_align(s_state, LV_ALIGN_LEFT_MID, 18, 0);
-    s_conn = mklabel(bar, LV_SYMBOL_CLOSE, &lv_font_montserrat_16, COL_ERR);
-    lv_obj_align(s_conn, LV_ALIGN_RIGHT_MID, 0, 0);
+    lv_obj_align(s_state, LV_ALIGN_LEFT_MID, 16, 0);
 
     // --- session chip strip (bigger, horizontally scrollable) ---
     s_sessbar = lv_obj_create(scr);
@@ -915,7 +1075,7 @@ void ui_init(void) {
     lv_obj_align(s_question, LV_ALIGN_TOP_LEFT, 0, 16);
     lv_obj_add_flag(s_question, LV_OBJ_FLAG_HIDDEN);
     s_opts = lv_obj_create(t_decide);
-    lv_obj_set_size(s_opts, 158, 340);
+    lv_obj_set_size(s_opts, 158, 330);
     lv_obj_align(s_opts, LV_ALIGN_TOP_LEFT, 0, 74);
     lv_obj_set_style_bg_opa(s_opts, LV_OPA_0, 0);
     lv_obj_set_style_border_width(s_opts, 0, 0);
@@ -928,7 +1088,7 @@ void ui_init(void) {
     lv_obj_center(s_placeholder);
     // live activity feed — fills the Session page; shown when idle (no question) and has rows
     s_feed = lv_obj_create(t_decide);
-    lv_obj_set_size(s_feed, 160, 404);
+    lv_obj_set_size(s_feed, 160, 400);
     lv_obj_align(s_feed, LV_ALIGN_TOP_LEFT, 0, 0);
     lv_obj_set_style_bg_opa(s_feed, LV_OPA_0, 0);
     lv_obj_set_style_border_width(s_feed, 0, 0);
@@ -936,15 +1096,12 @@ void ui_init(void) {
     lv_obj_set_style_pad_row(s_feed, 1, 0);
     lv_obj_set_flex_flow(s_feed, LV_FLEX_FLOW_COLUMN);
     lv_obj_add_flag(s_feed, LV_OBJ_FLAG_HIDDEN);
-    // compact telemetry strip pinned to the bottom (model / elapsed / last tool / todos)
-    hud_line = mklabel(t_decide, "", &lv_font_montserrat_12, COL_DIM);
-    lv_label_set_long_mode(hud_line, LV_LABEL_LONG_DOT);
-    lv_obj_set_width(hud_line, 160);
-    lv_obj_align(hud_line, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+    // (model/elapsed/tool telemetry strip removed — the session state now lives in the bottom status strip;
+    // hud_line stays NULL so show_hud() is a no-op.)
 
     // --- Macros page ---
     s_macros_cont = lv_obj_create(t_macros);
-    lv_obj_set_size(s_macros_cont, 158, 410);
+    lv_obj_set_size(s_macros_cont, 158, 400);
     lv_obj_align(s_macros_cont, LV_ALIGN_TOP_MID, 0, 0);
     lv_obj_set_style_bg_opa(s_macros_cont, LV_OPA_0, 0);
     lv_obj_set_style_border_width(s_macros_cont, 0, 0);
@@ -976,14 +1133,33 @@ void ui_init(void) {
         lv_obj_add_state(tsw, LV_STATE_DISABLED);
         lv_obj_t *th = mklabel(t_settings, "add an auth key in WiFi setup", &lv_font_montserrat_12, COL_DIM);
         lv_label_set_long_mode(th, LV_LABEL_LONG_WRAP); lv_obj_set_width(th, 156);
-        lv_obj_align(th, LV_ALIGN_TOP_LEFT, 0, 84);
+        lv_obj_align(th, LV_ALIGN_TOP_LEFT, 0, 82);
     }
     lv_obj_add_event_cb(tsw, tailscale_sw_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+    // Auto screen-off + Sounds toggles (both live, no reboot)
+    bool auto_standby = true, sound_en = true;
+    net_get_prefs(&auto_standby, &sound_en);
+    lv_obj_t *stl = mklabel(t_settings, "Auto sleep", &lv_font_montserrat_16, COL_INK);
+    lv_obj_align(stl, LV_ALIGN_TOP_LEFT, 0, 118);
+    lv_obj_t *stsw = lv_switch_create(t_settings);
+    style_switch(stsw);
+    lv_obj_align(stsw, LV_ALIGN_TOP_RIGHT, 0, 112);
+    if (auto_standby) lv_obj_add_state(stsw, LV_STATE_CHECKED);
+    lv_obj_add_event_cb(stsw, standby_sw_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+    lv_obj_t *sndl = mklabel(t_settings, "Sounds", &lv_font_montserrat_16, COL_INK);
+    lv_obj_align(sndl, LV_ALIGN_TOP_LEFT, 0, 162);
+    lv_obj_t *sndsw = lv_switch_create(t_settings);
+    style_switch(sndsw);
+    lv_obj_align(sndsw, LV_ALIGN_TOP_RIGHT, 0, 156);
+    if (sound_en) lv_obj_add_state(sndsw, LV_STATE_CHECKED);
+    lv_obj_add_event_cb(sndsw, sounds_sw_cb, LV_EVENT_VALUE_CHANGED, NULL);
 
     lv_obj_t *setup_btn = lv_obj_create(t_settings);
     lv_obj_set_size(setup_btn, 152, 46);
     style_card(setup_btn);
-    lv_obj_align(setup_btn, LV_ALIGN_TOP_LEFT, 0, 120);
+    lv_obj_align(setup_btn, LV_ALIGN_TOP_LEFT, 0, 208);
     lv_obj_add_flag(setup_btn, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(setup_btn, setup_btn_cb, LV_EVENT_LONG_PRESSED, NULL);
     lv_obj_center(mklabel(setup_btn, LV_SYMBOL_WIFI "  hold: WiFi portal", &lv_font_montserrat_12, COL_DIM));

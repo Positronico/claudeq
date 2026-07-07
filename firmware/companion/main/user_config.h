@@ -23,6 +23,7 @@
 #define EXAMPLE_PIN_NUM_LCD_RST    (-1)
 #define EXAMPLE_PIN_NUM_BK_LIGHT   (GPIO_NUM_42)
 #define EXAMPLE_PIN_NUM_EXIO_INT   (GPIO_NUM_8)
+#define EXAMPLE_PIN_NUM_BOOT0      (GPIO_NUM_0)   // the "BOOT" side button (active-low, external pull-up)
 
 // TCA9554 I/O expander pins
 #define EXAMPLE_EXIO_PIN_TOUCH_INT (1ULL << 0)

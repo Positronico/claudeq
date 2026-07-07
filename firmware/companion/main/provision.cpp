@@ -32,6 +32,8 @@ bool cfg_load(claudeq_cfg_t *out) {
     out->tailscale_authkey[0] = 0;
     out->wifi_enabled = 1;         // Settings toggles default ON; only NVS turns them off
     out->tailscale_enabled = 1;
+    out->auto_standby = 1;
+    out->sound_enabled = 1;
 
     bool forced = false, have_nvs = false;
     nvs_handle_t h;
@@ -45,6 +47,8 @@ bool cfg_load(claudeq_cfg_t *out) {
         n = sizeof(out->tailscale_authkey); nvs_get_str(h, "authkey", out->tailscale_authkey, &n);
         uint8_t en; if (nvs_get_u8(h, "wifi_en", &en) == ESP_OK) out->wifi_enabled = en;
         if (nvs_get_u8(h, "ts_en", &en) == ESP_OK) out->tailscale_enabled = en;
+        if (nvs_get_u8(h, "standby", &en) == ESP_OK) out->auto_standby = en;
+        if (nvs_get_u8(h, "sound", &en) == ESP_OK) out->sound_enabled = en;
         nvs_close(h);
     }
     if (forced) return false;                 // user asked to re-run setup
@@ -75,6 +79,18 @@ void cfg_set_tailscale_enabled(uint8_t v) {
     nvs_handle_t h;
     if (nvs_open(NVS_NS, NVS_READWRITE, &h) != ESP_OK) return;
     nvs_set_u8(h, "ts_en", v ? 1 : 0); nvs_commit(h); nvs_close(h);
+}
+
+void cfg_set_auto_standby(uint8_t v) {
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS, NVS_READWRITE, &h) != ESP_OK) return;
+    nvs_set_u8(h, "standby", v ? 1 : 0); nvs_commit(h); nvs_close(h);
+}
+
+void cfg_set_sound_enabled(uint8_t v) {
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS, NVS_READWRITE, &h) != ESP_OK) return;
+    nvs_set_u8(h, "sound", v ? 1 : 0); nvs_commit(h); nvs_close(h);
 }
 
 void cfg_clear(void) {

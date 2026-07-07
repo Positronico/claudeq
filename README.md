@@ -71,7 +71,17 @@ after the project (so it shows up as a chip), and enables the deck. Plain `claud
 | **Tap a session chip** (top) | Switch which session the deck controls. Chips glow when a session needs you. |
 | **Macros** tab | Tap a saved prompt/slash-command → sent to the focused session. |
 | **Voice** (mic) | **Tap** the mic and speak, then **Stop** → review the transcript and tap **Send** (or Cancel). |
-| **Settings** tab | Toggle **WiFi** / **Tailscale**, or hold **WiFi portal** to reconfigure. (Live model/elapsed/tool/todos now shows at the bottom of the **Session** tab.) |
+| **BOOT button** (side) | **Short press** cycles screen brightness; **hold** (~1.5s) toggles standby (screen off). Touch or a new event wakes it. |
+| **Top bar** (icons only) | Four evenly-spaced indicators: the Claude mascot + **count of connected bridges**, the **Tailscale** logo (green when the tailnet is up, shown only if configured), **WiFi**, and the **battery** gauge (green → amber → red as it drains). |
+| **Bottom strip** (above the buttons) | The focused session's live **status** (dot + text) — moved here so it has room to breathe. |
+| **Settings** tab | Toggle **WiFi** / **Tailscale** / **Auto sleep** / **Sounds**, or hold **WiFi portal** to reconfigure. |
+
+**Standby / low power:** the deck's biggest draw is the backlight, so standby just turns the **screen** off
+(backlight + panel) while WiFi and the WebSocket stay up — so it's still reachable and lights back up the
+moment Claude **asks a question, raises an alert, or replies/finishes** (not on routine tool-use churn). With
+**Auto sleep** on it dims out after ~60s of no touch; press BOOT or touch it to wake. Of the three side
+buttons, **RESET** reboots the deck and **PWR** (middle) is the hardware power button (hold to power off) —
+only **BOOT** is software-controlled.
 
 **Multiple sessions — even across computers:** run `claudeq` in more terminals or projects, on this Mac
 *or any other machine on the same network*. The deck auto-discovers every bridge (mDNS) and merges all

@@ -34,6 +34,26 @@ static esp_io_expander_handle_t io_expander = NULL;
 uint16_t* rotat_ptr = NULL;
 static volatile bool g_landscape = false;
 
+// --- Standby / power ---------------------------------------------------------------------------
+// "Standby" keeps WiFi + the WebSocket alive (so the deck stays pingable and wakes on events) and only
+// puts the SCREEN to sleep: backlight off + panel display-off + flush_cb skips the SPI redraw. The idle
+// timer + BOOT-button reader live in the power task (below). All hardware transitions run there under the
+// LVGL lock, so any thread just posts a request flag (never touches the panel itself -> no SPI race, no
+// re-entrant lock).
+static volatile bool g_display_off   = false;     // true while the screen is asleep (read by flush_cb)
+static volatile bool s_wake_req      = false;     // any thread -> power task: wake the screen now
+static volatile bool s_sleep_req     = false;     // any thread -> power task: sleep the screen now
+static volatile bool s_auto_standby  = true;      // idle timer enabled? (Settings toggle, live)
+static volatile int64_t s_last_activity_us = 0;   // esp_timer time of the last touch / waking event
+#define STANDBY_IDLE_MS   60000                    // auto screen-off after this much no-touch / no-event time
+#define BOOT_LONGPRESS_MS 1200                     // BOOT held this long = standby toggle (else brightness cycle)
+// Backlight brightness cycle (BOOT short-press): duties from brightest to dim. PWM is active-low, so
+// LCD_PWM_MODE_255 -> duty 0 -> brightest; larger MODE_n -> higher duty -> dimmer.
+static const uint16_t s_bright_levels[] = { LCD_PWM_MODE_255, LCD_PWM_MODE_200, LCD_PWM_MODE_150, LCD_PWM_MODE_100 };
+static int      s_bright_idx = 0;
+static uint16_t s_cur_duty   = LCD_PWM_MODE_255;   // restored on wake
+static bool     s_eat_touch  = false;              // swallow the touch gesture that woke the screen
+
 
 #define LCD_BIT_PER_PIXEL (16)
    
@@ -161,7 +181,7 @@ extern "C" void app_main(void)
     
     ESP_LOGI(TAG, "Install panel driver");
     ESP_ERROR_CHECK(esp_lcd_new_panel_axs15231b(panel_io, &panel_config, &panel));
-    
+
 	example_lcd_reset();
     ESP_ERROR_CHECK(esp_lcd_panel_init(panel));
     lcd_bl_pwm_bsp_init(LCD_PWM_MODE_255);
@@ -204,6 +224,7 @@ extern "C" void app_main(void)
   	assert(lvgl_mux);
   	xTaskCreatePinnedToCore(example_lvgl_port_task, "LVGL", 4000, NULL, 4, NULL,0); //运行于内核_0
   	xTaskCreatePinnedToCore(example_backlight_loop_task, "example_backlight_loop_task", 4 * 1024, NULL, 2, NULL,0); 
+    battery_init();         // ADC1 for the battery gauge (independent of LVGL/WiFi; safe to init early)
     net_preload_config();   // load saved config so the Settings switches reflect real state at build time
     if (example_lvgl_lock(-1))
   	{
@@ -212,6 +233,11 @@ extern "C" void app_main(void)
   	  	audio_init();
   	  	example_lvgl_unlock();
   	}
+    // apply saved standby/sound prefs (config already loaded by net_preload_config)
+    bool auto_standby = true, sound_en = true;
+    net_get_prefs(&auto_standby, &sound_en);
+    app_set_auto_standby(auto_standby);
+    audio_set_muted(!sound_en);
 }
 static void example_lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *color_map)
 {
@@ -220,6 +246,9 @@ static void example_lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_
     // with sw_rotate=0 + ROT_90): rotate it into the 172x640 physical panel. Uses the FIXED panel dims
     // (LCD_NOROT_*), so the transform is correct regardless of the compile-time `Rotated` default and the
     // portrait path stays byte-identical to before.
+    // Screen asleep: don't push pixels over QSPI (saves the redraw traffic + backlight is already off).
+    // LVGL still ran its layout; we just ack the flush so it doesn't stall. A wake re-invalidates the screen.
+    if (g_display_off) { lv_disp_flush_ready(drv); return; }
     uint16_t *map;
     if (g_landscape) {
         uint16_t *src = (uint16_t *)color_map;
@@ -301,6 +330,11 @@ static void example_lvgl_touch_cb(lv_indev_drv_t *drv, lv_indev_data_t *data)
     //ESP_LOGI("Touch","%d,%d",buff[0],buff[1]);
     if (buff[1]>0 && buff[1]<5)
     {
+        // A touch is a user interaction: keep the screen awake / wake it. The gesture that wakes the deck
+        // is swallowed (reported as released) until the finger lifts, so it can't also land on a button.
+        if (g_display_off) { app_note_user_activity(); s_eat_touch = true; data->state = LV_INDEV_STATE_REL; return; }
+        app_note_user_activity();
+        if (s_eat_touch) { data->state = LV_INDEV_STATE_REL; return; }
         data->state = LV_INDEV_STATE_PR;
         // Native touch coords: long axis (0..640) in pointX, short axis (0..172) in pointY. Map to LVGL
         // logical coords for the CURRENT rotation (fixed panel dims; matches the reference portrait/landscape).
@@ -314,29 +348,127 @@ static void example_lvgl_touch_cb(lv_indev_drv_t *drv, lv_indev_data_t *data)
             data->point.y = (LCD_NOROT_HRES - pointY);
         }
     }
-    else 
+    else
     {
+        s_eat_touch = false;   // finger lifted: the next press is a real tap again
         data->state = LV_INDEV_STATE_REL;
     }
 }
 
+// Put the screen to sleep / wake it. We blank with the BACKLIGHT ONLY (BL_EN + PWM duty) — the LED backlight
+// is the dominant draw, and this is the proven path (same as brightness control). We deliberately do NOT send
+// the panel a DISPOFF: this AXS15231B driver's disp_on_off() polarity left the panel dark on wake, and a panel
+// that never gets DISPOFF always has a valid image to show the instant the backlight returns. The flush_cb
+// skip still saves the SPI redraw traffic while off. MUST run under the LVGL lock (mutually exclusive with
+// flush_cb) — the power task holds it around every call.
+static void display_set_off(bool off)
+{
+    if (off == g_display_off) return;
+    if (off) {
+        setUpduty(LCD_PWM_MODE_0);                     // duty 255 -> backlight dark
+        example_lcd_backlight_set(false);              // BL_EN low
+        g_display_off = true;
+        ESP_LOGI(TAG, "screen -> standby");
+    } else {
+        g_display_off = false;                         // let flush_cb draw again before we invalidate
+        example_lcd_backlight_set(true);               // BL_EN high
+        setUpduty(s_cur_duty);                         // restore last brightness
+        lv_obj_invalidate(lv_scr_act());               // force a full repaint (in case UI changed while off)
+        ESP_LOGI(TAG, "screen -> awake");
+    }
+}
+
+// BOOT short-press while awake: step to the next backlight level (wraps).
+static void cycle_brightness(void)
+{
+    s_bright_idx = (s_bright_idx + 1) % (int)(sizeof(s_bright_levels) / sizeof(s_bright_levels[0]));
+    s_cur_duty = s_bright_levels[s_bright_idx];
+    setUpduty(s_cur_duty);
+}
+
+// Poll the BOOT button (GPIO0, active-low). Short press = cycle brightness (or just wake if asleep);
+// long press = toggle standby. Also runs the idle-timeout auto screen-off and services wake/sleep
+// requests posted by other threads. This one task owns every screen power transition.
 static void example_backlight_loop_task(void *arg)
 {
-    for(;;)
+    gpio_config_t io = {};
+    io.mode = GPIO_MODE_INPUT;
+    io.pull_up_en = GPIO_PULLUP_ENABLE;
+    io.pin_bit_mask = (1ULL << EXAMPLE_PIN_NUM_BOOT0);
+    gpio_config(&io);
+
+    bool pressed = false, fired_long = false;
+    int64_t press_us = 0;
+    s_last_activity_us = esp_timer_get_time();
+    int64_t next_bat_us = 0;   // read the battery immediately on the first pass, then every 10s
+
+    for (;;)
     {
-#if  (Backlight_Testing == true)
-        vTaskDelay(pdMS_TO_TICKS(1500));
-        setUpduty(LCD_PWM_MODE_255);
-        vTaskDelay(pdMS_TO_TICKS(1500));
-        setUpduty(LCD_PWM_MODE_175);
-        vTaskDelay(pdMS_TO_TICKS(1500));
-        setUpduty(LCD_PWM_MODE_125);
-        vTaskDelay(pdMS_TO_TICKS(1500));
-        setUpduty(LCD_PWM_MODE_0);
-#else
-        vTaskDelay(pdMS_TO_TICKS(2000));
-#endif
+        // --- battery gauge (cheap ADC read every ~10s; keeps updating while asleep, flush is skipped) ---
+        {
+            int64_t t = esp_timer_get_time();
+            if (t >= next_bat_us) {
+                float v; int pct; bool chg;
+                bool ok = battery_read(&v, &pct, &chg) && ui_set_battery(pct, chg, true);
+                next_bat_us = t + (ok ? 10 * 1000 * 1000 : 500 * 1000);  // retry soon until ADC+UI are both up
+            }
+        }
+
+        // --- BOOT button (debounced by the 30ms poll cadence) ---
+        bool down = (gpio_get_level(EXAMPLE_PIN_NUM_BOOT0) == 0);
+        int64_t now = esp_timer_get_time();
+        if (down && !pressed) {                        // edge: press begins
+            pressed = true; fired_long = false; press_us = now;
+        } else if (down && pressed) {                  // held
+            if (!fired_long && (now - press_us) >= BOOT_LONGPRESS_MS * 1000) {
+                fired_long = true;                     // long press: toggle standby (fires once mid-hold)
+                if (g_display_off) s_wake_req = true; else s_sleep_req = true;
+                s_last_activity_us = now;
+            }
+        } else if (!down && pressed) {                 // edge: release
+            pressed = false;
+            if (!fired_long) {                         // short press
+                if (g_display_off) s_wake_req = true;  // asleep -> just wake
+                else { cycle_brightness(); s_last_activity_us = now; }   // awake -> next brightness
+            }
+        }
+
+        // --- service wake/sleep requests + idle auto-standby (all panel work under the LVGL lock) ---
+        // Consume the flags atomically: a concurrent app_wake_for_event() set right here (e.g. an incoming
+        // question) must never be silently dropped, or the screen would stay dark with an ask pending.
+        bool want_wake  = __atomic_exchange_n(&s_wake_req, false, __ATOMIC_SEQ_CST);
+        bool want_sleep = __atomic_exchange_n(&s_sleep_req, false, __ATOMIC_SEQ_CST);
+        if (want_wake) want_sleep = false;             // wake wins over a same-tick sleep
+        if (!want_wake && !want_sleep && s_auto_standby && !g_display_off &&
+            !ui_has_pending_ask() && (now - s_last_activity_us) >= (int64_t)STANDBY_IDLE_MS * 1000) {
+            want_sleep = true;
+        }
+        if (want_wake || want_sleep) {
+            if (ui_lock(1000)) {
+                if (want_wake) { display_set_off(false); s_last_activity_us = now; }
+                else           { display_set_off(true); }
+                ui_unlock();
+            } else if (want_wake) {
+                s_wake_req = true;                     // couldn't lock now; retry next tick
+            }
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(30));
     }
+}
+
+// --- activity / standby hooks (callable from any task; only post flags, never touch the panel) ---
+extern "C" void app_note_user_activity(void) {
+    s_last_activity_us = esp_timer_get_time();
+    if (g_display_off) s_wake_req = true;
+}
+extern "C" void app_wake_for_event(void) {
+    s_last_activity_us = esp_timer_get_time();
+    if (g_display_off) s_wake_req = true;
+}
+extern "C" void app_set_auto_standby(bool enabled) {
+    s_auto_standby = enabled;
+    s_last_activity_us = esp_timer_get_time();         // fresh grace period when (re)enabling
 }
 
 // Bridge between net/ui modules and the LVGL mutex owned by this translation unit.

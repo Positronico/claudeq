@@ -88,6 +88,12 @@ only **BOOT** is software-controlled.
 their sessions into one chip strip. Whichever chip is focused is the one your taps, macros, and voice
 drive; a question auto-focuses the session that asked, wherever it's running.
 
+> ⚠️ **Security — no authentication yet.** The device↔bridge link (WebSocket + HTTP on port `8787`) is
+> **unauthenticated and unencrypted**. Anyone who can reach the bridge on your network — LAN or tailnet —
+> can connect to it and drive the focused Claude session: answer its questions, inject macros, and type
+> text into its terminal. **Only run Claudeq on networks you trust**, and don't expose the bridge port to
+> untrusted networks or the public internet. Authentication is planned for a future update.
+
 ---
 
 # Customize

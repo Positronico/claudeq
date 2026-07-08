@@ -3,6 +3,11 @@
 JSON messages over a WebSocket. Bridge listens on `ws://<mac-ip>:8787`. The device
 (or the browser mock) is the client. Binary frames are reserved for audio.
 
+> ⚠️ **No authentication (yet).** The WebSocket and the `POST /event` HTTP endpoint are open and
+> unencrypted — the bridge accepts any client that can reach port `8787`, and inbound `answer`/`focus`/
+> `macro`/`voice_commit` messages inject directly into the focused session's terminal. Treat the bridge as
+> trusted-LAN-only; do not expose the port to untrusted networks. Auth/encryption is planned for a future update.
+
 ## Discovery & multiple bridges
 Each bridge advertises itself on the LAN over **mDNS** as `_claudeq._tcp` (port 8787 by default).
 The deck browses for that service and opens a WebSocket to **every** bridge it finds — so bridges

@@ -884,8 +884,10 @@ static void ota_tick(lv_timer_t *t) {
     if (show_btn) { lv_obj_clear_flag(s_ota_btn, LV_OBJ_FLAG_HIDDEN); lv_label_set_text(s_ota_btnlbl, btntxt); }
     else lv_obj_add_flag(s_ota_btn, LV_OBJ_FLAG_HIDDEN);
 }
+// Invoked from the Settings "Check for update" click callback, which already runs under the LVGL
+// lock (lv_timer_handler holds it) — so DO NOT take ui_lock here (the mutex is non-recursive; taking
+// it would deadlock-timeout and the overlay would never appear). Same convention as show_modal().
 void ui_show_ota(void) {
-    if (!ui_lock(2000)) return;
     ota_close();
     lv_obj_t *ov = lv_obj_create(lv_layer_top());
     s_ota_ov = ov;
@@ -925,7 +927,6 @@ void ui_show_ota(void) {
     lv_obj_add_flag(s_ota_btn, LV_OBJ_FLAG_HIDDEN);
 
     s_ota_timer = lv_timer_create(ota_tick, 250, NULL);
-    ui_unlock();
     ota_check_async();   // kick the version check; the timer reflects its progress
 }
 static void checkupd_btn_cb(lv_event_t *e) { (void)e; ui_show_ota(); }

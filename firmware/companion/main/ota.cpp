@@ -65,8 +65,10 @@ static int ver_cmp(const char *a, const char *b) {
     return 0;
 }
 
-// Blocking HTTPS GET of a small text resource into buf. Returns bytes read, or -1 on error.
-static int https_get_text(const char *url, char *buf, int buflen) {
+// Blocking HTTPS GET of a small text resource into buf. Returns bytes read on HTTP 200; 0 on any
+// other HTTP status (server reached, *http_status set); -1 if the connection/TLS never succeeded.
+static int https_get_text(const char *url, char *buf, int buflen, int *http_status) {
+    *http_status = 0;
     esp_http_client_config_t cfg = {};
     cfg.url = url;
     cfg.crt_bundle_attach = esp_crt_bundle_attach;
@@ -78,6 +80,7 @@ static int https_get_text(const char *url, char *buf, int buflen) {
     if (err == ESP_OK) {
         esp_http_client_fetch_headers(c);
         int status = esp_http_client_get_status_code(c);
+        *http_status = status;
         if (status == 200) {
             int n = 0;
             while (n < buflen - 1) {
@@ -89,6 +92,7 @@ static int https_get_text(const char *url, char *buf, int buflen) {
             total = n;
         } else {
             ESP_LOGW(TAG, "check: HTTP %d", status);
+            total = 0;   // reached the server, but no image manifest there
         }
     } else {
         ESP_LOGW(TAG, "check: open failed: %s", esp_err_to_name(err));
@@ -103,9 +107,12 @@ static void check_task(void *arg) {
     s_state = OTA_CHECKING;
     s_pct = 0;
     char body[512];
-    int n = https_get_text(OTA_JSON_URL, body, sizeof(body));
+    int status = 0;
+    int n = https_get_text(OTA_JSON_URL, body, sizeof(body), &status);
     if (n <= 0) {
-        set_error("can't reach update server");
+        if (status == 404)     set_error("no update published yet");
+        else if (status > 0) { snprintf(s_err, sizeof(s_err), "server error %d", status); s_state = OTA_ERROR; }
+        else                   set_error("can't reach update server");
         s_busy = false; vTaskDelete(NULL); return;
     }
     cJSON *root = cJSON_Parse(body);

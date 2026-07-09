@@ -19,6 +19,26 @@ void ui_set_net_status(bool online, int bridges, bool ts_configured, bool ts_up)
 bool ui_set_battery(int pct, bool charging, bool present); // update status-bar battery gauge; false if UI not ready
 void ui_show_setup(const char *ap_ssid, const char *ap_ip); // overlay shown while provisioning
 void ui_show_lock_notice(bool show);     // brief "Locked" flash before the screen blanks (BOOT long-press)
+void ui_show_ota(void);                  // open the OTA overlay (Check for update -> download -> reboot)
+
+// --- OTA firmware update (ota.cpp) ---
+typedef enum {
+    OTA_IDLE = 0,     // nothing happening
+    OTA_CHECKING,     // fetching ota.json
+    OTA_UPTODATE,     // checked: already newest
+    OTA_AVAILABLE,    // checked: a newer version exists (ota_get_avail_version())
+    OTA_DOWNLOADING,  // streaming + writing the image (ota_get_pct())
+    OTA_REBOOTING,    // image written + boot partition set; about to restart
+    OTA_ERROR,        // failed (ota_get_error()); current image untouched
+} ota_state_t;
+void ota_check_async(void);              // fetch ota.json, compare vs DEVICE_FW; updates ota_get_state()
+void ota_start(void);                    // download + flash the available image, then reboot
+ota_state_t ota_get_state(void);         // current OTA state (polled by the UI overlay)
+int  ota_get_pct(void);                  // 0..100 download progress while OTA_DOWNLOADING
+const char *ota_get_avail_version(void); // version from ota.json (valid when OTA_AVAILABLE)
+const char *ota_get_error(void);         // short message when OTA_ERROR
+bool ota_in_progress(void);              // true while checking/downloading -> suppress auto-standby
+void ota_confirm_valid(void);            // cancel pending rollback once the running image is healthy
 
 // --- Provisioning / config (provision.cpp) ---
 typedef struct {

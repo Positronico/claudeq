@@ -34,11 +34,17 @@ CONFIG_HTTPD_MAX_URI_LEN=1024
 CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY=y
 CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096
 CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=32768
-# TLS + cert bundle for the Tailscale control plane and DERP
+# TLS + cert bundle for the Tailscale control plane/DERP and OTA (GitHub Pages HTTPS).
+# Full bundle (not just common) so any GitHub Pages / Fastly cert chain verifies for OTA.
 CONFIG_ESP_TLS_USING_MBEDTLS=y
 CONFIG_MBEDTLS_SSL_PROTO_TLS1_2=y
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
-CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_CMN=y
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL=y
+
+# --- OTA (over-the-air firmware update) ---
+# Rollback: a freshly-OTA'd image boots in PENDING_VERIFY and must call
+# esp_ota_mark_app_valid_cancel_rollback() once healthy; a boot-loop before that auto-reverts.
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
 # ChaCha20-Poly1305 for microlink's Noise/ts2021 control channel
 CONFIG_MBEDTLS_CHACHA20_C=y
 CONFIG_MBEDTLS_POLY1305_C=y

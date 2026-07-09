@@ -89,10 +89,25 @@ cat > "$DIST_DIR/manifest.json" <<JSON
 }
 JSON
 
-# Make the web flasher self-contained.
+# OTA manifest — what the running deck fetches from GitHub Pages to decide whether to update.
+# `app` is the app-partition image (claudeq-app.bin, flashed into the inactive OTA slot), NOT the
+# merged full-flash image. sha256 is advisory (esp_https_ota validates the image header itself).
+APP_SHA="$(shasum -a 256 "$DIST_DIR/claudeq-app.bin" | awk '{print $1}')"
+cat > "$DIST_DIR/ota.json" <<JSON
+{
+  "version": "$VERSION",
+  "app": "claudeq-app.bin",
+  "sha256": "$APP_SHA"
+}
+JSON
+
+# Make the web flasher self-contained, and colocate the OTA artifacts so the publish step can copy
+# the whole set into the GitHub Pages claudeq/ folder (the deck pulls ota.json + claudeq-app.bin there).
 mkdir -p "$FLASHER_DIR"
 cp "$DIST_DIR/claudeq-firmware.bin" "$FLASHER_DIR/claudeq-firmware.bin"
 cp "$DIST_DIR/manifest.json"        "$FLASHER_DIR/manifest.json"
+cp "$DIST_DIR/claudeq-app.bin"      "$FLASHER_DIR/claudeq-app.bin"
+cp "$DIST_DIR/ota.json"             "$FLASHER_DIR/ota.json"
 
 echo "ok: dist written to $DIST_DIR (v$VERSION); flasher/ updated"
-ls -la "$DIST_DIR"/*.bin "$DIST_DIR"/manifest.json
+ls -la "$DIST_DIR"/*.bin "$DIST_DIR"/manifest.json "$DIST_DIR"/ota.json

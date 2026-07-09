@@ -50,6 +50,28 @@ Serial port on this Mac: `/dev/cu.usbmodem8341101`. MAC `a4:cb:8f:da:ce:70`.
 | **PWR** (middle) | Power-latch circuit (SYS_EN = TCA9554 bit6 latch; SYS_OUT = GPIO16 sense) | Long-press power-off is the latch hardware. Short-press sense on GPIO16 is possible but unused. |
 | **BOOT** | **GPIO0** (active-low, external pull-up; strapping pin, safe to read at runtime) | Repurposed: short = cycle backlight brightness, long (≥1.2s) = toggle **lock** (pocket mode). |
 
+## Flash partitions / OTA (companion firmware)
+16 MB flash, **dual-OTA** layout (`partitions.csv`) so the deck can update over-the-air:
+
+| Name | Type | Offset | Size |
+|---|---|---|---|
+| `nvs` | data/nvs | 0x9000 | 16 KB |
+| `otadata` | data/ota | 0xd000 | 8 KB |
+| `phy_init` | data/phy | 0xf000 | 4 KB |
+| `ota_0` | app/ota_0 | 0x10000 | 4 MB |
+| `ota_1` | app/ota_1 | 0x410000 | 4 MB |
+
+- `ota_0` deliberately stays at **0x10000** so `build-dist.sh`'s `flash_files["0x10000"]` app capture keeps
+  working and `claudeq-app.bin` is exactly the OTA image. App is ~1.6 MB → ~60% of a slot free; ~7 MB of flash
+  is unused (room for a future data partition).
+- Empty `otadata` (the `ota_data_initial.bin` seed, merged into `claudeq-firmware.bin`) boots `ota_0` on a fresh
+  full flash. `esp_https_ota` writes the *other* slot each update and flips `otadata`.
+- **Rollback** is on (`CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE`): a freshly-OTA'd image boots `PENDING_VERIFY`;
+  `ota_confirm_valid()` (called from `app_main` once init completes) marks it valid, else a boot-loop reverts.
+- **Migration:** the partition table itself can't be changed OTA — a pre-OTA (single-`factory`) deck needs one
+  USB/web full-flash to reach the first OTA-capable build. The web flasher already erases + writes the whole
+  image, so it is the migration path.
+
 ## Standby / screen power (companion firmware)
 - "Standby" = **screen off only** — WiFi + the WebSocket stay associated so the deck stays pingable and wakes on
   events. Blanked with the **backlight only** (BL_EN bit1 low + PWM duty 255); `flush_cb` skips the SPI redraw

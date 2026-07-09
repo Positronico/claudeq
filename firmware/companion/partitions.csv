@@ -1,5 +1,10 @@
-# ESP-IDF Partition Table
-# Name, Type, SubType, Offset, Size, Flags
-nvs,      data, nvs,     ,         0x6000,
-phy_init, data, phy,     ,         0x1000,
-factory,  app,  factory, ,         8M,
+# ESP-IDF Partition Table — dual-OTA layout (16 MB flash)
+# ota_0 stays at 0x10000 so build-dist.sh's flash_files["0x10000"] app capture keeps working
+# and claudeq-app.bin is exactly the OTA image. ota_0/ota_1 are 4 MB each (app ~1.5 MB → headroom);
+# empty otadata boots ota_0 on a fresh full flash. Changing this table needs a one-time cable/web reflash.
+# Name,    Type, SubType, Offset,   Size,     Flags
+nvs,       data, nvs,     0x9000,   0x4000,
+otadata,   data, ota,     0xd000,   0x2000,
+phy_init,  data, phy,     0xf000,   0x1000,
+ota_0,     app,  ota_0,   0x10000,  0x400000,
+ota_1,     app,  ota_1,   0x410000, 0x400000,

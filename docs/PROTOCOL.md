@@ -8,6 +8,14 @@ JSON messages over a WebSocket. Bridge listens on `ws://<mac-ip>:8787`. The devi
 > `macro`/`voice_commit` messages inject directly into the focused session's terminal. Treat the bridge as
 > trusted-LAN-only; do not expose the port to untrusted networks. Auth/encryption is planned for a future update.
 
+## Firmware updates (OTA) — out of band
+Firmware updates do **not** use this WebSocket protocol or the bridge at all. The deck pulls directly
+from GitHub Pages over HTTPS: it fetches `https://positronico.github.io/claudeq/ota.json`
+(`{version, app, sha256}`), compares `version` to its own `DEVICE_FW`, and — on the user's tap in
+Settings — streams `claudeq-app.bin` into the inactive OTA slot via `esp_https_ota`, then reboots. The
+device already reports its running version to the bridge in the `hello` handshake (`fw`), but that is
+informational only; the update path is device→GitHub. See the README "Updating (over-the-air)" section.
+
 ## Discovery & multiple bridges
 Each bridge advertises itself on the LAN over **mDNS** as `_claudeq._tcp` (port 8787 by default).
 The deck browses for that service and opens a WebSocket to **every** bridge it finds — so bridges

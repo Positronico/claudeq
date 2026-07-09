@@ -74,7 +74,7 @@ after the project (so it shows up as a chip), and enables the deck. Plain `claud
 | **BOOT button** (side) | **Short press** cycles screen brightness; **hold** (~1.5s) **locks** the deck (screen dark, touch ignored — safe to pocket). Another **hold** unlocks and restores the brightness. |
 | **Top bar** (icons only) | Four evenly-spaced indicators: the Claude mascot + **count of connected bridges**, the **Tailscale** logo (green when the tailnet is up, shown only if configured), **WiFi**, and the **battery** gauge (green → amber → red as it drains). |
 | **Bottom strip** (above the buttons) | The focused session's live **status** (dot + text) — moved here so it has room to breathe. |
-| **Settings** tab | Toggle **WiFi** / **Tailscale** / **Auto sleep** / **Sounds**, or hold **WiFi portal** to reconfigure. |
+| **Settings** tab | Toggle **WiFi** / **Tailscale** / **Auto sleep** / **Sounds**, hold **WiFi portal** to reconfigure, or tap **Check for update** to update the firmware over-the-air. |
 
 **Standby / low power:** the deck's biggest draw is the backlight, so standby just turns the **screen** off
 (backlight + panel) while WiFi and the WebSocket stay up — so it's still reachable and lights back up the
@@ -88,6 +88,18 @@ incoming events are ignored**, so a stray touch in your pocket can't drive the f
 Unlike auto-sleep, a locked deck stays dark and won't wake on a question or a tap; **only another
 long-press** unlocks it, restoring the previous brightness and re-enabling touch. Sounds still play while
 locked (if not muted), so you're still notified — you just can't act until you unlock.
+
+**Updating (over-the-air):** open the **Settings** tab and tap **Check for update**. The deck asks GitHub
+whether a newer firmware exists and, if so, offers **Update** — it then downloads the new image over HTTPS
+straight from GitHub (no cable, no computer), shows a progress bar, and reboots into it. If anything goes
+wrong mid-update the deck keeps running its current firmware, and a bad image that won't boot is
+automatically rolled back. The deck needs internet on its WiFi for this (a tailnet-only path can reach your
+bridges but not GitHub).
+
+> **One-time catch for existing decks:** OTA needs a new flash-partition layout, and the partition layout
+> itself can't be changed over-the-air. A deck flashed with a **pre-OTA** build (v1.0.0 or earlier) must be
+> updated **once** over USB — via the [browser flasher](https://positronico.github.io/claudeq/) or
+> `claudeq flash` — to the first OTA-capable release. **After that, every update is over-the-air.**
 
 **Multiple sessions — even across computers:** run `claudeq` in more terminals or projects, on this Mac
 *or any other machine on the same network*. The deck auto-discovers every bridge (mDNS) and merges all

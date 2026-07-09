@@ -34,4 +34,5 @@ jobs:
             firmware/dist/partition-table.bin
             firmware/dist/claudeq-app.bin
             firmware/dist/manifest.json
+            firmware/dist/ota.json
           generate_release_notes: true

@@ -27,9 +27,12 @@ No compiler, no ESP-IDF, no Python.
 1. Build + repackage locally (or let CI do it): `cd firmware/companion && idf.py build && ../dist/build-dist.sh`
    (bump `firmware/dist/VERSION` first). Commit the updated `firmware/dist/claudeq-firmware.bin`.
 2. Tag and push: `git tag vX.Y.Z && git push --tags` → `release.yml` publishes the binaries.
-3. **Web flasher:** copy `firmware/dist/{claudeq-firmware.bin,manifest.json}` and `flasher/index.html`
-   into the `claudeq/` folder of the `positronico.github.io` repo and push. (It serves the merged
-   image next to the page; the manifest points at it relatively.)
+3. **Web flasher + OTA host:** copy `firmware/dist/{claudeq-firmware.bin,manifest.json,claudeq-app.bin,ota.json}`
+   and `flasher/index.html` into the `claudeq/` folder of the `positronico.github.io` repo and push. This
+   serves BOTH the full-flash web installer (`claudeq-firmware.bin` + `manifest.json`) AND the OTA payload the
+   running deck pulls (`ota.json` → `claudeq-app.bin`). **The OTA path only works once these are live on
+   Pages** — the deck fetches `https://positronico.github.io/claudeq/ota.json` and compares its `version` to
+   the deck's `DEVICE_FW`, so the `ota.json` version MUST match this release.
 4. **Homebrew:** in `homebrew-tap`, update `Formula/claudeq.rb` `url` to the new tag and refresh the
    `sha256`:
    ```bash

@@ -18,6 +18,7 @@ void ui_bridge_gone(int bridge);         // a bridge disconnected -> drop its se
 void ui_set_net_status(bool online, int bridges, bool ts_configured, bool ts_up); // top-bar net icons; takes the lock
 bool ui_set_battery(int pct, bool charging, bool present); // update status-bar battery gauge; false if UI not ready
 void ui_show_setup(const char *ap_ssid, const char *ap_ip); // overlay shown while provisioning
+void ui_show_lock_notice(bool show);     // brief "Locked" flash before the screen blanks (BOOT long-press)
 
 // --- Provisioning / config (provision.cpp) ---
 typedef struct {

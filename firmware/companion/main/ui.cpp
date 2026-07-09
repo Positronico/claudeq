@@ -913,6 +913,50 @@ static lv_obj_t *mkdot(lv_obj_t *parent, int d, uint32_t color) {
     return o;
 }
 
+// Brief "Locked" flash shown right before the screen blanks on a BOOT long-press (pocket mode). The deck
+// font has no padlock glyph, so the lock is drawn from primitives (a ring shackle behind a rounded body).
+// The power task shows it, lets it render, then blanks; ui_show_lock_notice(false) tears it down on unlock.
+static lv_obj_t *s_lock_ov = NULL;
+void ui_show_lock_notice(bool show) {
+    if (!ui_lock(1000)) return;
+    if (s_lock_ov) { lv_obj_del(s_lock_ov); s_lock_ov = NULL; }
+    if (show) {
+        lv_obj_t *ov = lv_obj_create(lv_layer_top());
+        s_lock_ov = ov;
+        lv_obj_set_size(ov, SCR_W, 640);
+        lv_obj_align(ov, LV_ALIGN_CENTER, 0, 0);
+        lv_obj_set_style_bg_color(ov, lv_color_hex(COL_BG), 0);
+        lv_obj_set_style_border_width(ov, 0, 0);
+        lv_obj_set_style_radius(ov, 0, 0);
+        lv_obj_clear_flag(ov, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_flag(ov, LV_OBJ_FLAG_CLICKABLE);   // eat any stray tap during the flash
+
+        // padlock shackle: a ring (border only) whose lower arc the body covers
+        lv_obj_t *sh = lv_obj_create(ov);
+        lv_obj_set_size(sh, 30, 30);
+        lv_obj_set_style_radius(sh, LV_RADIUS_CIRCLE, 0);
+        lv_obj_set_style_bg_opa(sh, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(sh, 5, 0);
+        lv_obj_set_style_border_color(sh, lv_color_hex(COL_WARN), 0);
+        lv_obj_set_style_pad_all(sh, 0, 0);
+        lv_obj_clear_flag(sh, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_align(sh, LV_ALIGN_CENTER, 0, -34);
+
+        // padlock body (drawn after the shackle so it sits on top of the ring's lower half)
+        lv_obj_t *body = mkrect(ov, 46, 36, COL_WARN);
+        lv_obj_set_style_radius(body, 7, 0);
+        lv_obj_align(body, LV_ALIGN_CENTER, 0, -12);
+        lv_obj_t *kh = mkdot(body, 8, COL_BG);        // keyhole
+        lv_obj_align(kh, LV_ALIGN_CENTER, 0, -1);
+
+        lv_obj_t *t = mklabel(ov, "Locked", &lv_font_montserrat_16, COL_INK);
+        lv_obj_align(t, LV_ALIGN_CENTER, 0, 24);
+        lv_obj_t *h = mklabel(ov, "hold to unlock", &lv_font_montserrat_12, COL_DIM);
+        lv_obj_align(h, LV_ALIGN_CENTER, 0, 48);
+    }
+    ui_unlock();
+}
+
 
 // Draw the simplified Claude mascot (clay body, two eyes, side ears, little legs) into an 18x15 canvas cell.
 static void draw_mascot(lv_obj_t *canvas) {

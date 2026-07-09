@@ -48,7 +48,7 @@ Serial port on this Mac: `/dev/cu.usbmodem8341101`. MAC `a4:cb:8f:da:ce:70`.
 |---|---|---|
 | **RESET** | ESP32-S3 EN/reset line | Hardware chip reset — reboots the deck; NOT reprogrammable. |
 | **PWR** (middle) | Power-latch circuit (SYS_EN = TCA9554 bit6 latch; SYS_OUT = GPIO16 sense) | Long-press power-off is the latch hardware. Short-press sense on GPIO16 is possible but unused. |
-| **BOOT** | **GPIO0** (active-low, external pull-up; strapping pin, safe to read at runtime) | Repurposed: short = cycle backlight brightness, long (≥1.2s) = toggle screen standby. |
+| **BOOT** | **GPIO0** (active-low, external pull-up; strapping pin, safe to read at runtime) | Repurposed: short = cycle backlight brightness, long (≥1.2s) = toggle **lock** (pocket mode). |
 
 ## Standby / screen power (companion firmware)
 - "Standby" = **screen off only** — WiFi + the WebSocket stay associated so the deck stays pingable and wakes on
@@ -56,11 +56,17 @@ Serial port on this Mac: `/dev/cu.usbmodem8341101`. MAC `a4:cb:8f:da:ce:70`.
   while off. We do NOT send the panel DISPOFF — on this board it woke to a black screen (see gotcha below), and
   the backlight is the dominant draw anyway.
 - Owned entirely by the power task (`example_backlight_loop_task` in `main.cpp`): it polls BOOT, runs the idle
-  auto-off timer (`STANDBY_IDLE_MS`, Settings "Auto sleep" toggle), and services wake/sleep request flags. Every
+  auto-off timer (`STANDBY_IDLE_MS`, Settings "Auto sleep" toggle), and services wake/lock request flags. Every
   panel transition runs under the LVGL lock, so it can't race `flush_cb`. Other threads only post flags
   (`app_note_user_activity` from touch, `app_wake_for_event` from ask/alert/reply) — never touch the panel.
 - Wake events = a question (`ask`), an `alert`, or a `reply`/`done`/`notify` feed line. Routine tool-use activity
   does NOT wake the screen. `esp_wifi_set_ps(WIFI_PS_MIN_MODEM)` is set for standing modem power-save.
+- **Lock (pocket mode)** = a BOOT **long-press** sets `g_locked` and blanks the screen (same backlight-off path as
+  standby). While locked the deck is deliberately deaf: `example_lvgl_touch_cb` drops every touch, and both wake
+  hooks early-return, so neither a pocket touch nor an incoming event wakes it. The ONLY exit is another
+  long-press (`s_lock_toggle_req` → toggle), which wakes the screen and restores `s_cur_duty` (prior brightness)
+  and re-enables touch. Auto-standby is suppressed while locked. Sounds are unaffected (audio ≠ display), so
+  alerts still chirp. Lock is transient — a reboot clears `g_locked`.
 
 ## System I2C (I2C_NUM_0): SDA=GPIO47, SCL=GPIO48, 300 kHz
 | Device | 7-bit addr |

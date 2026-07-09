@@ -40,13 +40,20 @@ static volatile bool g_landscape = false;
 // timer + BOOT-button reader live in the power task (below). All hardware transitions run there under the
 // LVGL lock, so any thread just posts a request flag (never touches the panel itself -> no SPI race, no
 // re-entrant lock).
+//
+// "Lock" (BOOT long-press) is a deliberate pocket mode: the screen goes dark like standby, but touch AND
+// incoming events are IGNORED — the ONLY way out is another long-press. This keeps stray pocket touches
+// from driving the focused Claude session. Sounds still play (audio is independent of the display).
 static volatile bool g_display_off   = false;     // true while the screen is asleep (read by flush_cb)
+static volatile bool g_locked        = false;     // true while touch-LOCKED (screen dark, touch + events ignored)
 static volatile bool s_wake_req      = false;     // any thread -> power task: wake the screen now
-static volatile bool s_sleep_req     = false;     // any thread -> power task: sleep the screen now
+static volatile bool s_lock_toggle_req = false;   // BOOT long-press -> power task: toggle the lock
 static volatile bool s_auto_standby  = true;      // idle timer enabled? (Settings toggle, live)
 static volatile int64_t s_last_activity_us = 0;   // esp_timer time of the last touch / waking event
 #define STANDBY_IDLE_MS   60000                    // auto screen-off after this much no-touch / no-event time
-#define BOOT_LONGPRESS_MS 1200                     // BOOT held this long = standby toggle (else brightness cycle)
+#define BOOT_LONGPRESS_MS 1200                     // BOOT held this long = lock toggle (else brightness cycle)
+#define LOCK_FLASH_MS     3000                     // after locking, keep the "Locked" notice on-screen this long
+static volatile int64_t s_lock_blank_at = 0;       // esp_timer deadline to blank the just-locked screen (0 = none)
 // Backlight brightness cycle (BOOT short-press): duties from brightest to dim. PWM is active-low, so
 // LCD_PWM_MODE_255 -> duty 0 -> brightest; larger MODE_n -> higher duty -> dimmer.
 static const uint16_t s_bright_levels[] = { LCD_PWM_MODE_255, LCD_PWM_MODE_200, LCD_PWM_MODE_150, LCD_PWM_MODE_100 };
@@ -330,6 +337,8 @@ static void example_lvgl_touch_cb(lv_indev_drv_t *drv, lv_indev_data_t *data)
     //ESP_LOGI("Touch","%d,%d",buff[0],buff[1]);
     if (buff[1]>0 && buff[1]<5)
     {
+        // Locked: ignore touch entirely — no wake, no tap. Only a BOOT long-press unlocks.
+        if (g_locked) { data->state = LV_INDEV_STATE_REL; return; }
         // A touch is a user interaction: keep the screen awake / wake it. The gesture that wakes the deck
         // is swallowed (reported as released) until the finger lifts, so it can't also land on a button.
         if (g_display_off) { app_note_user_activity(); s_eat_touch = true; data->state = LV_INDEV_STATE_REL; return; }
@@ -421,15 +430,16 @@ static void example_backlight_loop_task(void *arg)
             pressed = true; fired_long = false; press_us = now;
         } else if (down && pressed) {                  // held
             if (!fired_long && (now - press_us) >= BOOT_LONGPRESS_MS * 1000) {
-                fired_long = true;                     // long press: toggle standby (fires once mid-hold)
-                if (g_display_off) s_wake_req = true; else s_sleep_req = true;
+                fired_long = true;                     // long press: toggle lock (fires once mid-hold)
+                s_lock_toggle_req = true;
                 s_last_activity_us = now;
             }
         } else if (!down && pressed) {                 // edge: release
             pressed = false;
             if (!fired_long) {                         // short press
-                if (g_display_off) s_wake_req = true;  // asleep -> just wake
-                else { cycle_brightness(); s_last_activity_us = now; }   // awake -> next brightness
+                if (g_locked) { /* locked: ignore — only a long-press unlocks */ }
+                else if (g_display_off) s_wake_req = true;                 // asleep -> just wake
+                else { cycle_brightness(); s_last_activity_us = now; }     // awake -> next brightness
             }
         }
 
@@ -437,19 +447,50 @@ static void example_backlight_loop_task(void *arg)
         // Consume the flags atomically: a concurrent app_wake_for_event() set right here (e.g. an incoming
         // question) must never be silently dropped, or the screen would stay dark with an ask pending.
         bool want_wake  = __atomic_exchange_n(&s_wake_req, false, __ATOMIC_SEQ_CST);
-        bool want_sleep = __atomic_exchange_n(&s_sleep_req, false, __ATOMIC_SEQ_CST);
-        if (want_wake) want_sleep = false;             // wake wins over a same-tick sleep
-        if (!want_wake && !want_sleep && s_auto_standby && !g_display_off &&
-            !ui_has_pending_ask() && (now - s_last_activity_us) >= (int64_t)STANDBY_IDLE_MS * 1000) {
-            want_sleep = true;
+        bool want_lock  = __atomic_exchange_n(&s_lock_toggle_req, false, __ATOMIC_SEQ_CST);
+        bool want_sleep = false;                       // set only by the auto-standby idle timer below
+
+        // Lock toggle (BOOT long-press). Locking shows the "Locked" notice over the current screen and arms a
+        // deadline to blank it (non-blocking, so the button keeps polling). Unlocking drops the notice and
+        // wakes below. ui_show_lock_notice takes the LVGL lock itself, so it's called WITHOUT the lock held.
+        if (want_lock) {
+            if (!g_locked) {                               // -> lock
+                g_locked = true;
+                ui_show_lock_notice(true);                 // "Locked" flash over the current (still-lit) screen
+                s_lock_blank_at = now + (int64_t)LOCK_FLASH_MS * 1000;   // keep it visible, then blank
+                want_wake = false;
+            } else {                                       // -> unlock
+                g_locked = false;                          // stop dropping touch / ignoring events immediately
+                s_lock_blank_at = 0;
+                ui_show_lock_notice(false);                // drop the notice
+                want_wake = true;                          // wake the (now unlocked) screen below
+            }
         }
-        if (want_wake || want_sleep) {
-            if (ui_lock(1000)) {
-                if (want_wake) { display_set_off(false); s_last_activity_us = now; }
-                else           { display_set_off(true); }
-                ui_unlock();
-            } else if (want_wake) {
-                s_wake_req = true;                     // couldn't lock now; retry next tick
+
+        if (g_locked) {
+            // Locked: screen is dark EXCEPT (a) for LOCK_FLASH_MS right after locking, and (b) while BOOT is
+            // held — so pressing to unlock lights the screen immediately (feedback while the long-press
+            // completes). Touch + events stay ignored throughout. Level-driven: recompute the wanted state
+            // each tick and only transition on a mismatch.
+            if (s_lock_blank_at && now >= s_lock_blank_at) s_lock_blank_at = 0;
+            bool lit = pressed || (s_lock_blank_at != 0);
+            if (lit == g_display_off) {                    // current state disagrees with the wanted one
+                if (ui_lock(1000)) { display_set_off(!lit); ui_unlock(); }
+            }
+        } else {
+            // Unlocked: normal wake-on-request + idle auto-standby.
+            if (!want_wake && s_auto_standby && !g_display_off &&
+                !ui_has_pending_ask() && (now - s_last_activity_us) >= (int64_t)STANDBY_IDLE_MS * 1000) {
+                want_sleep = true;
+            }
+            if (want_wake || want_sleep) {
+                if (ui_lock(1000)) {
+                    if (want_wake) { display_set_off(false); s_last_activity_us = now; }
+                    else           { display_set_off(true); }
+                    ui_unlock();
+                } else if (want_wake) {
+                    s_wake_req = true;                     // couldn't lock now; retry next tick
+                }
             }
         }
 
@@ -459,10 +500,12 @@ static void example_backlight_loop_task(void *arg)
 
 // --- activity / standby hooks (callable from any task; only post flags, never touch the panel) ---
 extern "C" void app_note_user_activity(void) {
+    if (g_locked) return;                              // locked: ignore all activity until unlocked
     s_last_activity_us = esp_timer_get_time();
     if (g_display_off) s_wake_req = true;
 }
 extern "C" void app_wake_for_event(void) {
+    if (g_locked) return;                              // locked: events don't wake the screen
     s_last_activity_us = esp_timer_get_time();
     if (g_display_off) s_wake_req = true;
 }

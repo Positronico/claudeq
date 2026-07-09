@@ -852,6 +852,8 @@ static void show_modal(const char *title, const char *body, const char *yes, voi
 // and is hidden while checking/downloading/rebooting so a flash can't be interrupted from the screen.
 static lv_obj_t *s_ota_ov = NULL, *s_ota_msg = NULL, *s_ota_bar = NULL, *s_ota_btn = NULL, *s_ota_btnlbl = NULL;
 static lv_timer_t *s_ota_timer = NULL;
+static uint32_t s_ota_elapsed_ms = 0;   // watchdog: surface a timeout if the check never returns (e.g. DNS hang)
+#define OTA_CHECK_TIMEOUT_MS 15000
 static void ota_close(void) {
     if (s_ota_timer) { lv_timer_del(s_ota_timer); s_ota_timer = NULL; }
     if (s_ota_ov) { lv_obj_del(s_ota_ov); s_ota_ov = NULL; }
@@ -869,6 +871,16 @@ static void ota_tick(lv_timer_t *t) {
     ota_state_t st = ota_get_state();
     bool show_bar = false, show_btn = false;
     const char *btntxt = "Close";
+    // Watchdog: the network task can stall on DNS (not bounded by the HTTP timeout). If we're still
+    // checking after OTA_CHECK_TIMEOUT_MS, tell the user instead of spinning forever.
+    s_ota_elapsed_ms += 250;
+    if ((st == OTA_CHECKING || st == OTA_IDLE) && s_ota_elapsed_ms >= OTA_CHECK_TIMEOUT_MS) {
+        lv_label_set_text(s_ota_msg, "Check timed out.\nNo internet?");
+        lv_obj_add_flag(s_ota_bar, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_flag(s_ota_btn, LV_OBJ_FLAG_HIDDEN);
+        lv_label_set_text(s_ota_btnlbl, "Close");
+        return;
+    }
     switch (st) {
         case OTA_CHECKING:    strlcpy(buf, "Checking for\nupdates\xE2\x80\xA6", sizeof(buf)); break;
         case OTA_UPTODATE:    snprintf(buf, sizeof(buf), "Up to date\nv%s", DEVICE_FW); show_btn = true; break;
@@ -889,6 +901,7 @@ static void ota_tick(lv_timer_t *t) {
 // it would deadlock-timeout and the overlay would never appear). Same convention as show_modal().
 void ui_show_ota(void) {
     ota_close();
+    s_ota_elapsed_ms = 0;
     lv_obj_t *ov = lv_obj_create(lv_layer_top());
     s_ota_ov = ov;
     lv_obj_set_size(ov, SCR_W, 640);

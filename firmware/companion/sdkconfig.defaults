@@ -45,6 +45,14 @@ CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL=y
 # Rollback: a freshly-OTA'd image boots in PENDING_VERIFY and must call
 # esp_ota_mark_app_valid_cancel_rollback() once healthy; a boot-loop before that auto-reverts.
 CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+# mbedtls allocates from PSRAM, not internal DRAM: with LVGL+WiFi+Tailscale+audio up, the largest free
+# internal block is ~5 KB — far too small for the ~20 KB TLS handshake buffers, which otherwise fails with
+# MBEDTLS_ERR_SSL_ALLOC_FAILED (-0x7F00). PSRAM has ample contiguous space.
+CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
+# Move WiFi/LWIP buffers to PSRAM too, freeing internal DRAM. The OTA download task's stack must be
+# internal (it writes flash, which faults on a PSRAM-cached stack), and ~8 KB contiguous internal isn't
+# otherwise available on this RAM-tight board.
+CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
 # ChaCha20-Poly1305 for microlink's Noise/ts2021 control channel
 CONFIG_MBEDTLS_CHACHA20_C=y
 CONFIG_MBEDTLS_POLY1305_C=y

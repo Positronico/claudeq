@@ -8,6 +8,7 @@
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_netif.h"
+#include "esp_netif_sntp.h"
 #include "esp_heap_caps.h"
 #include "nvs_flash.h"
 #include "esp_websocket_client.h"
@@ -304,6 +305,12 @@ static void discovery_task(void *arg) {
         vTaskDelete(NULL);
         return;
     }
+    // Sync the wall clock via SNTP. HTTPS OTA (TLS to GitHub) rejects certs as "not yet valid" if the
+    // clock is at 1970, surfacing as ESP_ERR_HTTP_CONNECT. WireGuard/Tailscale doesn't need real time,
+    // so this gap only bites TLS. Non-blocking: time lands within a few seconds of getting an IP.
+    esp_sntp_config_t sntp_cfg = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
+    esp_netif_sntp_init(&sntp_cfg);
+
     mdns_init();
     tailnet_start();                       // join the tailnet if an auth key is configured
     for (;;) {

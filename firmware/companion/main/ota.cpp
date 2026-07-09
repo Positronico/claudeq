@@ -16,6 +16,8 @@
 #include <stdlib.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/idf_additions.h"   // xTaskCreateWithCaps / vTaskDeleteWithCaps
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_ota_ops.h"
 #include "esp_app_desc.h"
@@ -38,6 +40,7 @@ static char                 s_avail[24] = {0};   // version string from ota.json
 static char                 s_err[64]   = {0};   // short error message
 static volatile bool        s_busy      = false; // a check/download task is running
 static bool                 s_confirmed = false; // rollback already cancelled this boot
+static esp_err_t            s_last_err  = ESP_OK; // last esp_http_client_open() failure (for the on-screen reason)
 
 ota_state_t ota_get_state(void)        { return s_state; }
 int         ota_get_pct(void)          { return s_pct; }
@@ -72,11 +75,12 @@ static int https_get_text(const char *url, char *buf, int buflen, int *http_stat
     esp_http_client_config_t cfg = {};
     cfg.url = url;
     cfg.crt_bundle_attach = esp_crt_bundle_attach;
-    cfg.timeout_ms = 10000;
+    cfg.timeout_ms = 8000;   // bounds connect + TLS + socket reads (NOT DNS — the UI watchdog covers that)
     esp_http_client_handle_t c = esp_http_client_init(&cfg);
     if (!c) return -1;
     int total = -1;
     esp_err_t err = esp_http_client_open(c, 0);
+    s_last_err = err;
     if (err == ESP_OK) {
         esp_http_client_fetch_headers(c);
         int status = esp_http_client_get_status_code(c);
@@ -102,6 +106,9 @@ static int https_get_text(const char *url, char *buf, int buflen, int *http_stat
     return total;
 }
 
+// Runs on a PSRAM stack (see ota_check_async) — internal DRAM is too tight for another 8 KB stack while
+// LVGL+WiFi+Tailscale+audio are up. Safe: it only does TLS + JSON, no flash writes. MUST self-delete
+// with vTaskDeleteWithCaps() so the PSRAM stack is freed.
 static void check_task(void *arg) {
     (void)arg;
     s_state = OTA_CHECKING;
@@ -109,30 +116,32 @@ static void check_task(void *arg) {
     char body[512];
     int status = 0;
     int n = https_get_text(OTA_JSON_URL, body, sizeof(body), &status);
-    if (n <= 0) {
-        if (status == 404)     set_error("no update published yet");
-        else if (status > 0) { snprintf(s_err, sizeof(s_err), "server error %d", status); s_state = OTA_ERROR; }
-        else                   set_error("can't reach update server");
-        s_busy = false; vTaskDelete(NULL); return;
-    }
-    cJSON *root = cJSON_Parse(body);
-    cJSON *ver = root ? cJSON_GetObjectItem(root, "version") : NULL;
-    if (!ver || !cJSON_IsString(ver)) {
-        if (root) cJSON_Delete(root);
-        set_error("bad update manifest");
-        s_busy = false; vTaskDelete(NULL); return;
-    }
-    strlcpy(s_avail, ver->valuestring, sizeof(s_avail));
-    cJSON_Delete(root);
-    if (ver_cmp(s_avail, DEVICE_FW) > 0) {
-        ESP_LOGI(TAG, "update available: %s (running %s)", s_avail, DEVICE_FW);
-        s_state = OTA_AVAILABLE;
+    if (n < 0) {   // never reached the server (DNS/connect/TLS)
+        ESP_LOGW(TAG, "check: connect failed (%s)", esp_err_to_name(s_last_err));
+        set_error("can't reach update server");
+        s_busy = false; vTaskDeleteWithCaps(NULL); return;
+    } else if (n == 0) {  // reached the server but no manifest there
+        if (status == 404) set_error("no update published yet");
+        else { snprintf(s_err, sizeof(s_err), "server error %d", status); s_state = OTA_ERROR; }
     } else {
-        ESP_LOGI(TAG, "up to date (%s, latest %s)", DEVICE_FW, s_avail);
-        s_state = OTA_UPTODATE;
+        cJSON *root = cJSON_Parse(body);
+        cJSON *ver = root ? cJSON_GetObjectItem(root, "version") : NULL;
+        if (!ver || !cJSON_IsString(ver)) {
+            set_error("bad update manifest");
+        } else {
+            strlcpy(s_avail, ver->valuestring, sizeof(s_avail));
+            if (ver_cmp(s_avail, DEVICE_FW) > 0) {
+                ESP_LOGI(TAG, "update available: %s (running %s)", s_avail, DEVICE_FW);
+                s_state = OTA_AVAILABLE;
+            } else {
+                ESP_LOGI(TAG, "up to date (%s, latest %s)", DEVICE_FW, s_avail);
+                s_state = OTA_UPTODATE;
+            }
+        }
+        if (root) cJSON_Delete(root);
     }
     s_busy = false;
-    vTaskDelete(NULL);
+    vTaskDeleteWithCaps(NULL);
 }
 
 static void download_task(void *arg) {
@@ -185,14 +194,25 @@ void ota_check_async(void) {
     if (s_busy) return;
     s_busy = true;
     s_err[0] = 0;
-    xTaskCreate(check_task, "ota_chk", 8192, NULL, 5, NULL);
+    s_state = OTA_CHECKING;   // reflect immediately, even before the task is scheduled
+    // Stack in PSRAM (internal DRAM can't spare 8 KB here); TLS+JSON only, so PSRAM stack is safe.
+    if (xTaskCreateWithCaps(check_task, "ota_chk", 8192, NULL, 5, NULL,
+                            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) {
+        set_error("out of memory");
+        s_busy = false;
+    }
 }
 
 void ota_start(void) {
     if (s_busy) return;
     s_busy = true;
     s_err[0] = 0;
-    xTaskCreate(download_task, "ota", 8192, NULL, 5, NULL);
+    s_pct = 0;
+    s_state = OTA_DOWNLOADING;
+    if (xTaskCreate(download_task, "ota", 8192, NULL, 5, NULL) != pdPASS) {
+        set_error("out of memory");
+        s_busy = false;
+    }
 }
 
 // Called once the running image is proven healthy (UI up + network reachable). If we booted a

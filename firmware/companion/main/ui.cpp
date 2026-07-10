@@ -846,6 +846,104 @@ static void show_modal(const char *title, const char *body, const char *yes, voi
     lv_obj_align(no, LV_ALIGN_BOTTOM_MID, 0, -8);
     lv_obj_center(mklabel(no, "Cancel", &lv_font_montserrat_16, COL_INK));
 }
+// ---------- OTA overlay ----------
+// Opened from Settings "Check for update". A polling lv_timer reflects the ota.cpp state machine
+// onto the widgets; the single action button is "Update" (available) or "Close" (up-to-date/error),
+// and is hidden while checking/downloading/rebooting so a flash can't be interrupted from the screen.
+static lv_obj_t *s_ota_ov = NULL, *s_ota_msg = NULL, *s_ota_bar = NULL, *s_ota_btn = NULL, *s_ota_btnlbl = NULL;
+static lv_timer_t *s_ota_timer = NULL;
+static uint32_t s_ota_elapsed_ms = 0;   // watchdog: surface a timeout if the check never returns (e.g. DNS hang)
+#define OTA_CHECK_TIMEOUT_MS 15000
+static void ota_close(void) {
+    if (s_ota_timer) { lv_timer_del(s_ota_timer); s_ota_timer = NULL; }
+    if (s_ota_ov) { lv_obj_del(s_ota_ov); s_ota_ov = NULL; }
+    s_ota_msg = s_ota_bar = s_ota_btn = s_ota_btnlbl = NULL;
+}
+static void ota_action_cb(lv_event_t *e) {
+    (void)e;
+    if (ota_get_state() == OTA_AVAILABLE) ota_start();   // begin download+flash (overlay stays, polls progress)
+    else ota_close();                                    // up-to-date / error -> dismiss
+}
+static void ota_tick(lv_timer_t *t) {
+    (void)t;
+    if (!s_ota_ov) return;
+    char buf[96];
+    ota_state_t st = ota_get_state();
+    bool show_bar = false, show_btn = false;
+    const char *btntxt = "Close";
+    // Watchdog: the network task can stall on DNS (not bounded by the HTTP timeout). If we're still
+    // checking after OTA_CHECK_TIMEOUT_MS, tell the user instead of spinning forever.
+    s_ota_elapsed_ms += 250;
+    if ((st == OTA_CHECKING || st == OTA_IDLE) && s_ota_elapsed_ms >= OTA_CHECK_TIMEOUT_MS) {
+        lv_label_set_text(s_ota_msg, "Check timed out.\nNo internet?");
+        lv_obj_add_flag(s_ota_bar, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_flag(s_ota_btn, LV_OBJ_FLAG_HIDDEN);
+        lv_label_set_text(s_ota_btnlbl, "Close");
+        return;
+    }
+    switch (st) {
+        case OTA_CHECKING:    strlcpy(buf, "Checking for\nupdates\xE2\x80\xA6", sizeof(buf)); break;
+        case OTA_UPTODATE:    snprintf(buf, sizeof(buf), "Up to date\nv%s", DEVICE_FW); show_btn = true; break;
+        case OTA_AVAILABLE:   snprintf(buf, sizeof(buf), "Update available\nv%s " LV_SYMBOL_RIGHT " v%s", DEVICE_FW, ota_get_avail_version()); show_btn = true; btntxt = "Update"; break;
+        case OTA_DOWNLOADING: snprintf(buf, sizeof(buf), "Downloading\xE2\x80\xA6\n%d%%", ota_get_pct()); show_bar = true; break;
+        case OTA_REBOOTING:   strlcpy(buf, "Installed.\nRebooting\xE2\x80\xA6", sizeof(buf)); show_bar = true; break;
+        case OTA_ERROR:       snprintf(buf, sizeof(buf), "Update failed:\n%s", ota_get_error()); show_btn = true; break;
+        default:              return;
+    }
+    lv_label_set_text(s_ota_msg, buf);
+    if (show_bar) { lv_obj_clear_flag(s_ota_bar, LV_OBJ_FLAG_HIDDEN); lv_bar_set_value(s_ota_bar, ota_get_pct(), LV_ANIM_OFF); }
+    else lv_obj_add_flag(s_ota_bar, LV_OBJ_FLAG_HIDDEN);
+    if (show_btn) { lv_obj_clear_flag(s_ota_btn, LV_OBJ_FLAG_HIDDEN); lv_label_set_text(s_ota_btnlbl, btntxt); }
+    else lv_obj_add_flag(s_ota_btn, LV_OBJ_FLAG_HIDDEN);
+}
+// Invoked from the Settings "Check for update" click callback, which already runs under the LVGL
+// lock (lv_timer_handler holds it) — so DO NOT take ui_lock here (the mutex is non-recursive; taking
+// it would deadlock-timeout and the overlay would never appear). Same convention as show_modal().
+void ui_show_ota(void) {
+    ota_close();
+    s_ota_elapsed_ms = 0;
+    lv_obj_t *ov = lv_obj_create(lv_layer_top());
+    s_ota_ov = ov;
+    lv_obj_set_size(ov, SCR_W, 640);
+    lv_obj_align(ov, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_bg_color(ov, lv_color_hex(COL_BG), 0);
+    lv_obj_set_style_border_width(ov, 0, 0);
+    lv_obj_set_style_radius(ov, 0, 0);
+    lv_obj_set_style_pad_all(ov, 12, 0);
+    lv_obj_clear_flag(ov, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(ov, LV_OBJ_FLAG_CLICKABLE);   // eat taps so they don't fall through to the nav
+
+    lv_obj_t *tl = mklabel(ov, "Firmware", &lv_font_montserrat_16, COL_ACCENT);
+    lv_obj_align(tl, LV_ALIGN_TOP_MID, 0, 6);
+
+    s_ota_msg = mklabel(ov, "Checking\xE2\x80\xA6", &lv_font_montserrat_16, COL_INK);
+    lv_obj_set_style_text_align(s_ota_msg, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_width(s_ota_msg, 148);
+    lv_label_set_long_mode(s_ota_msg, LV_LABEL_LONG_WRAP);
+    lv_obj_align(s_ota_msg, LV_ALIGN_CENTER, 0, -30);
+
+    s_ota_bar = lv_bar_create(ov);
+    lv_obj_set_size(s_ota_bar, 140, 14);
+    lv_obj_align(s_ota_bar, LV_ALIGN_CENTER, 0, 24);
+    lv_bar_set_range(s_ota_bar, 0, 100);
+    lv_obj_set_style_bg_color(s_ota_bar, lv_color_hex(COL_LINE), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(s_ota_bar, lv_color_hex(COL_OK), LV_PART_INDICATOR);
+    lv_obj_add_flag(s_ota_bar, LV_OBJ_FLAG_HIDDEN);
+
+    s_ota_btn = lv_obj_create(ov);
+    lv_obj_set_size(s_ota_btn, 148, 52); style_card(s_ota_btn);
+    lv_obj_add_flag(s_ota_btn, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(s_ota_btn, ota_action_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_align(s_ota_btn, LV_ALIGN_BOTTOM_MID, 0, -8);
+    s_ota_btnlbl = mklabel(s_ota_btn, "Close", &lv_font_montserrat_16, COL_INK);
+    lv_obj_center(s_ota_btnlbl);
+    lv_obj_add_flag(s_ota_btn, LV_OBJ_FLAG_HIDDEN);
+
+    s_ota_timer = lv_timer_create(ota_tick, 250, NULL);
+    ota_check_async();   // kick the version check; the timer reflects its progress
+}
+static void checkupd_btn_cb(lv_event_t *e) { (void)e; ui_show_ota(); }
+
 static void do_wifi_off(void) { net_wifi_set_enabled(false); }
 static void wifi_sw_cb(lv_event_t *e) {
     lv_obj_t *sw = lv_event_get_target(e);
@@ -1207,6 +1305,14 @@ void ui_init(void) {
     lv_obj_add_flag(setup_btn, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(setup_btn, setup_btn_cb, LV_EVENT_LONG_PRESSED, NULL);
     lv_obj_center(mklabel(setup_btn, LV_SYMBOL_WIFI "  hold: WiFi portal", &lv_font_montserrat_12, COL_DIM));
+
+    lv_obj_t *upd_btn = lv_obj_create(t_settings);
+    lv_obj_set_size(upd_btn, 152, 46);
+    style_card(upd_btn);
+    lv_obj_align(upd_btn, LV_ALIGN_TOP_LEFT, 0, 262);
+    lv_obj_add_flag(upd_btn, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(upd_btn, checkupd_btn_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_center(mklabel(upd_btn, "Check for update", &lv_font_montserrat_12, COL_INK));
 
     lv_obj_t *fw = mklabel(t_settings, "claudeq  v" DEVICE_FW, &lv_font_montserrat_12, COL_DIM);
     lv_obj_align(fw, LV_ALIGN_BOTTOM_MID, 0, -2);

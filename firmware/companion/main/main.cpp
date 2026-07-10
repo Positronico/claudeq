@@ -245,6 +245,10 @@ extern "C" void app_main(void)
     net_get_prefs(&auto_standby, &sound_en);
     app_set_auto_standby(auto_standby);
     audio_set_muted(!sound_en);
+
+    // Reached full init without a boot-loop: if we just OTA'd, mark the new image valid so the
+    // bootloader keeps it (no-op on a normal boot). Rollback still covers a crash before this point.
+    ota_confirm_valid();
 }
 static void example_lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *color_map)
 {
@@ -480,7 +484,8 @@ static void example_backlight_loop_task(void *arg)
         } else {
             // Unlocked: normal wake-on-request + idle auto-standby.
             if (!want_wake && s_auto_standby && !g_display_off &&
-                !ui_has_pending_ask() && (now - s_last_activity_us) >= (int64_t)STANDBY_IDLE_MS * 1000) {
+                !ui_has_pending_ask() && !ota_in_progress() &&
+                (now - s_last_activity_us) >= (int64_t)STANDBY_IDLE_MS * 1000) {
                 want_sleep = true;
             }
             if (want_wake || want_sleep) {

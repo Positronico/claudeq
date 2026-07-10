@@ -5,9 +5,22 @@ A Waveshare **ESP32-S3-Touch-LCD-3.49** turned into a physical control surface f
 When Claude asks you something, the options pop up on the little touchscreen and you **tap to answer**.
 The screen shows what Claude is doing, chirps when it needs you, and has a macro deck and tap-to-talk
 voice — with an on-screen **Send/Cancel** so nothing reaches Claude until you approve it. Run it across
-**as many Claude sessions as you like** — each becomes a tappable chip.
+**as many Claude sessions as you like** — each becomes a tappable chip. It even **updates itself over
+the air**.
 
 <p align="center"><i>Tap to answer · glance at status · fire macros · talk to Claude — for every session, from one little screen.</i></p>
+
+## What it does
+- **Tap to answer** — Claude's `AskUserQuestion` options appear on-screen; tap one. Multi-question prompts step through each.
+- **Live activity feed** — a running view of what Claude is doing (reading, editing, running, thinking), and its replies.
+- **Every session on one screen** — each Claude session is a tappable chip; the one that needs you glows, and a question auto-focuses whoever asked.
+- **Across computers** — decks auto-discover every bridge on the LAN (mDNS) and over your **Tailscale** tailnet, merging all their sessions.
+- **Macro deck** — one tap fires a saved prompt or slash-command into the focused session.
+- **Tap-to-talk voice** — speak, review the local transcription (no API key), then **Send** — nothing reaches Claude until you approve.
+- **Speaker alerts** — it chirps when Claude needs you (mutable).
+- **Physical controls + low power** — BOOT-button brightness, **lock** (pocket mode), auto-sleep, wake-on-event, and a battery gauge.
+- **On-device setup** — WiFi and Tailscale are entered on the device via a captive-portal; no rebuild to change networks.
+- **Over-the-air updates** — check for and install new firmware straight from the Settings tab, downloaded from GitHub over HTTPS. No cable.
 
 ---
 

@@ -977,6 +977,10 @@ static lv_obj_t *make_page(lv_obj_t *parent) {
     lv_obj_set_style_radius(p, 0, 0);
     lv_obj_set_style_pad_all(p, 6, 0);
     lv_obj_set_style_pad_gap(p, 0, 0);
+    // The page is a static frame — only its inner content containers (feed / macros / options) scroll.
+    // Leaving it scrollable made its AUTO scrollbar show permanently (inner containers overflow the
+    // 394 px content box by a few px), and doubled up with the inner bar once content overflowed.
+    lv_obj_clear_flag(p, LV_OBJ_FLAG_SCROLLABLE);
     return p;
 }
 
@@ -1217,7 +1221,7 @@ void ui_init(void) {
     lv_obj_align(s_question, LV_ALIGN_TOP_LEFT, 0, 16);
     lv_obj_add_flag(s_question, LV_OBJ_FLAG_HIDDEN);
     s_opts = lv_obj_create(t_decide);
-    lv_obj_set_size(s_opts, 158, 330);
+    lv_obj_set_size(s_opts, 158, 320);   // fits the page content box (394) below the question (y=74)
     lv_obj_align(s_opts, LV_ALIGN_TOP_LEFT, 0, 74);
     lv_obj_set_style_bg_opa(s_opts, LV_OPA_0, 0);
     lv_obj_set_style_border_width(s_opts, 0, 0);
@@ -1230,7 +1234,7 @@ void ui_init(void) {
     lv_obj_center(s_placeholder);
     // live activity feed — fills the Session page; shown when idle (no question) and has rows
     s_feed = lv_obj_create(t_decide);
-    lv_obj_set_size(s_feed, 160, 400);
+    lv_obj_set_size(s_feed, 160, 394);   // fills the page content box; scrolls internally
     lv_obj_align(s_feed, LV_ALIGN_TOP_LEFT, 0, 0);
     lv_obj_set_style_bg_opa(s_feed, LV_OPA_0, 0);
     lv_obj_set_style_border_width(s_feed, 0, 0);
@@ -1243,7 +1247,7 @@ void ui_init(void) {
 
     // --- Macros page ---
     s_macros_cont = lv_obj_create(t_macros);
-    lv_obj_set_size(s_macros_cont, 158, 400);
+    lv_obj_set_size(s_macros_cont, 158, 394);   // fills the page content box; scrolls internally
     lv_obj_align(s_macros_cont, LV_ALIGN_TOP_MID, 0, 0);
     lv_obj_set_style_bg_opa(s_macros_cont, LV_OPA_0, 0);
     lv_obj_set_style_border_width(s_macros_cont, 0, 0);

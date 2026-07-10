@@ -885,7 +885,7 @@ static void ota_tick(lv_timer_t *t) {
         case OTA_CHECKING:    strlcpy(buf, "Checking for\nupdates\xE2\x80\xA6", sizeof(buf)); break;
         case OTA_UPTODATE:    snprintf(buf, sizeof(buf), "Up to date\nv%s", DEVICE_FW); show_btn = true; break;
         case OTA_AVAILABLE:   snprintf(buf, sizeof(buf), "Update available\nv%s " LV_SYMBOL_RIGHT " v%s", DEVICE_FW, ota_get_avail_version()); show_btn = true; btntxt = "Update"; break;
-        case OTA_DOWNLOADING: snprintf(buf, sizeof(buf), "Downloading\xE2\x80\xA6 %d%%", ota_get_pct()); show_bar = true; break;
+        case OTA_DOWNLOADING: snprintf(buf, sizeof(buf), "Downloading\xE2\x80\xA6\n%d%%", ota_get_pct()); show_bar = true; break;
         case OTA_REBOOTING:   strlcpy(buf, "Installed.\nRebooting\xE2\x80\xA6", sizeof(buf)); show_bar = true; break;
         case OTA_ERROR:       snprintf(buf, sizeof(buf), "Update failed:\n%s", ota_get_error()); show_btn = true; break;
         default:              return;

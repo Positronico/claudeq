@@ -42,6 +42,14 @@ static volatile bool        s_busy      = false; // a check/download task is run
 static bool                 s_confirmed = false; // rollback already cancelled this boot
 static esp_err_t            s_last_err  = ESP_OK; // last esp_http_client_open() failure (for the on-screen reason)
 
+// The download task writes flash (esp_ota_write), so its stack MUST be internal DRAM — a PSRAM-cached
+// stack would fault when the cache is disabled during a flash write. But at OTA time the internal heap is
+// too fragmented to allocate 8 KB. Reserve the stack statically (internal .bss) so the download can ALWAYS
+// run regardless of runtime fragmentation. StackType_t is uint8_t on ESP-IDF Xtensa (depth is in bytes).
+#define OTA_DL_STACK_BYTES 8192
+static StackType_t  s_dl_stack[OTA_DL_STACK_BYTES];
+static StaticTask_t s_dl_tcb;
+
 ota_state_t ota_get_state(void)        { return s_state; }
 int         ota_get_pct(void)          { return s_pct; }
 const char *ota_get_avail_version(void){ return s_avail; }
@@ -209,7 +217,8 @@ void ota_start(void) {
     s_err[0] = 0;
     s_pct = 0;
     s_state = OTA_DOWNLOADING;
-    if (xTaskCreate(download_task, "ota", 8192, NULL, 5, NULL) != pdPASS) {
+    // Static internal stack (see s_dl_stack) — never fails for lack of contiguous heap.
+    if (xTaskCreateStatic(download_task, "ota", OTA_DL_STACK_BYTES, NULL, 5, s_dl_stack, &s_dl_tcb) == NULL) {
         set_error("out of memory");
         s_busy = false;
     }

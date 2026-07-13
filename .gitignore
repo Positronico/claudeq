@@ -82,3 +82,6 @@ yarn-error.log*
 
 # Claude Code local state (settings, scheduled tasks) — never commit
 .claude/
+
+# Personal promotion drafts — not part of the project
+promotion/

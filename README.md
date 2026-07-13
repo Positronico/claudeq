@@ -10,6 +10,8 @@ the air**.
 
 <p align="center"><i>Tap to answer · glance at status · fire macros · talk to Claude — for every session, from one little screen.</i></p>
 
+<p align="center"><img src="photos/claudeq-demo.gif" alt="Claudeq demo: a session's activity feed filling in, a second session's chip appearing, an AskUserQuestion prompt appearing, and a real tap answering it" width="360"></p>
+
 ## What it does
 - **Tap to answer** — Claude's `AskUserQuestion` options appear on-screen; tap one. Multi-question prompts step through each.
 - **Live activity feed** — a running view of what Claude is doing (reading, editing, running, thinking), and its replies.

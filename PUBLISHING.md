@@ -41,8 +41,14 @@ No compiler, no ESP-IDF, no Python.
    then `brew install --build-from-source Positronico/tap/claudeq` to smoke-test.
 
 ## Secrets / hygiene
-Real WiFi credentials live only in `firmware/companion/main/wifi_secret.h`, which is **gitignored**
-(the committed `app_config.h` has placeholders). The top-level `.gitignore` also keeps the 141 MB
-whisper model, `firmware/*/build`, `firmware/*/managed_components` (~200 MB, re-fetched on build),
-`vendor/` reference SDKs, and logs out of the repo. `bridge/node_modules` **is** committed on purpose
-so `brew install` works offline (Homebrew sandboxes network during install).
+`app_config.h` only ever compiles in placeholder WiFi credentials (`YOUR_WIFI_SSID`/`YOUR_WIFI_PASSWORD`)
+— **never** a real SSID/password. A prior version of this project supported a local-only
+`wifi_secret.h` build-time override for developer convenience; that meant a locally built binary with
+real credentials baked in was exactly what got committed to `firmware/dist/` and published (git
+history, GitHub Releases, the web flasher, Homebrew) — a real secret leak. That mechanism was removed;
+WiFi is provisioned on-device only (the SoftAP setup portal), never at compile time. **Before cutting
+any release, confirm `firmware/companion/main/app_config.h` still only has the placeholder strings.**
+The top-level `.gitignore` also keeps the 141 MB whisper model, `firmware/*/build`,
+`firmware/*/managed_components` (~200 MB, re-fetched on build), `vendor/` reference SDKs, and logs out
+of the repo. `bridge/node_modules` **is** committed on purpose so `brew install` works offline
+(Homebrew sandboxes network during install).

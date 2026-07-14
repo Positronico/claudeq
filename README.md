@@ -187,9 +187,11 @@ idf.py -p "$(ls /dev/cu.usbmodem* | head -1)" flash     # or: ../dist/build-dist
 `../dist/build-dist.sh` repackages a fresh build into `firmware/dist/` + `flasher/` (merged image +
 ESP Web Tools manifest). Bump `firmware/dist/VERSION` for releases. See `firmware/dist/README.md`.
 
-> _Optional:_ to pre-seed WiFi at build time and skip the on-device portal, create
-> `firmware/companion/main/wifi_secret.h` (`#define WIFI_SSID …` / `WIFI_PASSWORD …`) and set
-> `BRIDGE_HOST` in `app_config.h`. The on-device setup always overrides these.
+> WiFi is **never** set at build/compile time — only via the on-device SoftAP setup portal (first
+> boot, a failed connection, or Settings → hold: WiFi portal). A prior version of this doc suggested a
+> local `wifi_secret.h` build-time fallback; that meant a locally built binary baked the real SSID/
+> password into the compiled image as plaintext, and that image is what ends up committed to
+> `firmware/dist/` and published. Don't do that — always provision WiFi on-device.
 
 **Bridge, without brew:** run it straight from the repo — put `bridge/` on your `PATH` and use
 `claudeq` directly (it resolves its own siblings). `npm install` in `bridge/` first.

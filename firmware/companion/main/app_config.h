@@ -1,24 +1,18 @@
 #pragma once
 // ---- Claude Deck device config ----
-// WiFi credentials (2.4 GHz only — the ESP32-S3 has no 5 GHz radio).
-// Put real creds in a local-only "wifi_secret.h" next to this file; it just needs
-//   #define WIFI_SSID "..."  and  #define WIFI_PASSWORD "..."
-// That file is picked up automatically and never has to be shared in chat.
-#if defined(__has_include)
-#  if __has_include("wifi_secret.h")
-#    include "wifi_secret.h"
-#  endif
-#endif
-#ifndef WIFI_SSID
+// WiFi credentials are NEVER compiled in. A prior version of this file supported a local-only
+// wifi_secret.h fallback (#define WIFI_SSID/WIFI_PASSWORD) for developer convenience — but a locally
+// built binary with that file present silently bakes the real SSID/password into the compiled image
+// as plaintext strings, and that image is exactly what gets committed to firmware/dist/ and published
+// (git history, GitHub Releases, the web flasher, Homebrew). That happened. WiFi must always be
+// configured on-device, via the SoftAP setup portal (first boot / STA connect-fail / Settings ->
+// hold: WiFi portal) or re-entered the same way after a factory reset — never baked into a binary.
 #define WIFI_SSID      "YOUR_WIFI_SSID"
-#endif
-#ifndef WIFI_PASSWORD
 #define WIFI_PASSWORD  "YOUR_WIFI_PASSWORD"
-#endif
 
-// Bridge (the Mac running bridge.mjs) — LAN IP + port.
+// Bridge (the Mac running bridge.mjs) — LAN IP + port. Not a secret (a LAN address), unlike WiFi creds.
 // Empty (the default) = auto-discover every bridge on the LAN via mDNS (_claudeq._tcp).
-// Set this (here, in wifi_secret.h, or on the device setup screen) only to force one fixed address.
+// Set this here only to force one fixed address; can also be set on the device setup screen.
 #ifndef BRIDGE_HOST
 #define BRIDGE_HOST    ""
 #endif
@@ -28,4 +22,4 @@
 #define BRIDGE_WS_URI  "ws://" BRIDGE_HOST ":8787/"
 
 #define DEVICE_NAME    "claudeq"
-#define DEVICE_FW      "2.1.0"
+#define DEVICE_FW      "2.1.1"

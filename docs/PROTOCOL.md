@@ -1,12 +1,69 @@
 # Claudeq — device ↔ bridge WebSocket protocol
 
 JSON messages over a WebSocket. Bridge listens on `ws://<mac-ip>:8787`. The device
-(or the browser mock) is the client. Binary frames are reserved for audio.
+(or the browser mock) is the client. Binary frames carry audio (mic PCM upload, sound-clip download).
 
-> ⚠️ **No authentication (yet).** The WebSocket and the `POST /event` HTTP endpoint are open and
-> unencrypted — the bridge accepts any client that can reach port `8787`, and inbound `answer`/`focus`/
-> `macro`/`voice_commit` messages inject directly into the focused session's terminal. Treat the bridge as
-> trusted-LAN-only; do not expose the port to untrusted networks. Auth/encryption is planned for a future update.
+**Pairing required.** A connection starts able to exchange only `hello`/`hello_ack` and the pairing/auth
+handshake types below — nothing else. Once a device and a bridge have paired (see "Pairing"), every
+reconnect runs a fresh authentication handshake and all application traffic (`sessions`, `ask`, `focus`,
+`answer`, macros, voice, activity, alerts, sound clips — every row in the two tables below) travels wrapped
+in an AES-256-GCM `sec` envelope. See "Authentication & encryption" for the full model.
+
+## Pairing
+Either side can start pairing against an already-connected socket: the device from Settings → **Paired
+Bridges** → **Pair new bridge**, or the bridge operator via **`claudeq pair`**. Both derive an ephemeral
+X25519 key pair, exchange public keys, and independently compute a 6-digit code
+(`HMAC-SHA256(ecdh_shared, sorted(pub_a, pub_b))`, truncated). The device displays its code on-screen; the
+bridge CLI prints its own and asks "Codes match? [y/N]". This is a Bluetooth/Signal-style **Short
+Authentication String** — a live ECDH exchange checked by a human, not a shared secret typed anywhere. If
+an active MITM had relayed/substituted the exchange, the two independently-computed codes would differ.
+
+Only when **both** sides confirm (device taps Confirm, bridge operator answers `y`) do they derive a
+persistent PSK (`HMAC-SHA256(ecdh_shared, "claudeq-psk-v1")`) and store a trust record — device in NVS
+(bounded table, `main/trust.cpp`), bridge in `bridge/trust.json` keyed by the device's persistent
+`device_id`. Either a reject or a ~90s timeout aborts with nothing persisted. Ephemeral keys and the raw
+ECDH shared secret are discarded immediately after deriving the PSK.
+
+| type | direction | fields | meaning |
+|---|---|---|
+| `pair_request` | either | `pub` (base64 X25519 pubkey) | Starts a ceremony — sender generates a fresh ephemeral keypair for this pairing only |
+| `pair_response` | the other side | `pub` (base64 X25519 pubkey) | Completes the exchange; both sides can now compute the SAS code |
+| `pair_confirm` | either | — | This side's human confirmed the two displayed codes match |
+| `pair_reject` | either | `reason`: `user`\|`timeout`\|`busy`\|`mismatch` | Abort before persisting anything |
+| `pair_ack` | either | `ok`, `label` | Sent after this side has locally persisted the new trust record |
+
+Management: bridge — `claudeq pair` (interactive), `claudeq devices [list]`, `claudeq devices disconnect
+<id>`, `claudeq devices forget <id>`. Device — Settings → Paired Bridges: list with a live-connected dot,
+Pair new bridge, and per-entry Disconnect (drops the live connection, trust untouched, re-authenticates on
+reconnect) / Forget (revokes trust — a fresh pairing ceremony is required afterward).
+
+## Authentication & encryption
+Every reconnect between an already-paired device and bridge runs a mutual handshake **before** any
+application message is allowed, combining the stored PSK with a **fresh** ephemeral X25519 exchange (so
+each connection gets its own session key — a stolen PSK alone doesn't decrypt a past session, and doesn't
+let a passive eavesdropper decrypt any session, only lets an active attacker who steals the PSK authenticate
+future connections).
+
+| type | direction | fields | meaning |
+|---|---|---|
+| `auth_hello` | Device→Bridge | `nonce`, `pub` (fresh ephemeral X25519 pubkey) | Sent automatically once `hello_ack.paired` is true |
+| `auth_challenge` | Bridge→Device | `nonce`, `pub` (fresh ephemeral X25519 pubkey) | Sent only if the device's `device_id` is in the bridge's trust store |
+| `auth_verify` | either | `mac` | Proof of possession of the derived session key (device sends first, then the bridge) — mutual authentication completes once both are checked |
+| `auth_reject` | Bridge→Device | `reason`: `unknown_device`\|`bad_mac` | No trust record for this device, or its `auth_verify` failed |
+
+Once authenticated, every other message (in both directions) is wrapped: `{"type":"sec","n":<counter>,
+"ct":<base64 AES-256-GCM ciphertext+tag>}`. Directional keys are derived from the session key (`d2b`/`b2d`);
+`n` is a strictly-increasing per-direction counter (also the AES-GCM IV) — a non-increasing counter, or a
+ciphertext that fails to authenticate, closes the connection rather than being silently dropped. Binary
+frames get an equivalent lightweight `[8-byte counter][ciphertext][16-byte tag]` envelope instead of
+base64+JSON, sharing the same per-direction counter sequence. A socket that never completes this handshake
+may only exchange the pairing/auth message types above — every other message type is dropped.
+
+All of this uses only primitives every platform here supports natively — X25519 ECDH, HMAC-SHA256,
+AES-256-GCM — via `node:crypto` (bridge), WebCrypto `SubtleCrypto` (the browser mock), and mbedTLS +
+microlink's vendored `x25519.c` (firmware). No PAKE (e.g. EC-JPAKE): Node has no built-in support for one
+and there's no well-maintained npm package, so hand-rolling one just for the bridge side would be exactly
+the kind of custom crypto reimplementation to avoid.
 
 ## Firmware updates (OTA) — out of band
 Firmware updates do **not** use this WebSocket protocol or the bridge at all. The deck pulls directly
@@ -34,7 +91,8 @@ focused session's tmux target on its bridge. A question auto-focuses the session
 ## Bridge → Device
 | type | fields | meaning |
 |---|---|---|
-| `sessions` | `list[]` = `{sid, title, needs}`, `focus` (sid), `host`, `bridge_id` | Session chips + which is focused + the bridge's machine name + a stable per-process id. `needs` = pending question/attention. The deck shows `host` on a chip only when that title also exists on another bridge (a cross-machine clash). `bridge_id` lets the deck recognize that the same bridge reached via the LAN *and* the tailnet (two different IPs) is one machine, and show its sessions once (keeping both connections, preferring the LAN path, failing over instantly if it drops). Override with `CCDECK_HOST` / `CCDECK_BRIDGE_ID`. |
+| `hello_ack` | `bridge_id`, `host`, `fw`, `paired` | Always sent in reply to `hello`, on any connection regardless of trust — identity only, no session data. `paired` tells the device whether to automatically start the auth handshake. |
+| `sessions` | `list[]` = `{sid, title, needs}`, `focus` (sid), `host`, `bridge_id` | Session chips + which is focused + the bridge's machine name + a stable per-process id. `needs` = pending question/attention. The deck shows `host` on a chip only when that title also exists on another bridge (a cross-machine clash). `bridge_id` lets the deck recognize that the same bridge reached via the LAN *and* the tailnet (two different IPs) is one machine, and show its sessions once (keeping both connections, preferring the LAN path, failing over instantly if it drops). Override with `CCDECK_HOST` / `CCDECK_BRIDGE_ID`. Only sent post-authentication (wrapped in `sec`), but `bridge_id` is learned earlier from `hello_ack` so dedup works before any session data arrives. |
 | `status` | `sid`, `state` (`idle`/`thinking`/`working`/`waiting`/`done`/`error`), `text`, `tool` | Live state of the focused session for the status strip |
 | `ask` | `id`, `sid`, `questions[]` = `{question, header, multiSelect, options[]:{label,description}}` | A question to render; user taps to choose. Sent **after** the `sessions` message that focuses `sid` |
 | `ask_cancel` | `sid`, `id?`, `reason` | Question resolved/cancelled (or focus moved to a session with no pending question) — clear it |
@@ -47,7 +105,7 @@ focused session's tmux target on its bridge. A question auto-focuses the session
 ## Device → Bridge
 | type | fields | meaning |
 |---|---|---|
-| `hello` | `name`, `fw`, `ip`, `caps[]` | Device announces itself on connect |
+| `hello` | `name`, `fw`, `device_id`, `caps[]` | Device announces itself on connect — always allowed, no trust required. `device_id` is a persistent identifier generated once on first boot (NVS), replacing the old fixed `"claudeq"` literal every unit used to send. |
 | `focus` | `sid` | Switch the focused session (user tapped a chip) |
 | `answer` | `id`, `answers` = `{ "<question text>": "<label>" }` (multi = comma-joined) | User's selection(s) for an `ask`. Resolved by the global `id`, so it is robust even if focus changed |
 | `macro` | `id` | Fire a macro by id → injected into the focused session |

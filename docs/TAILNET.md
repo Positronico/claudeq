@@ -42,7 +42,8 @@ as a device that can be lost or stolen.**
   register, then the persistent secret is the generated **WireGuard node key**. Both live in **NVS on the
   ESP32-S3, whose flash is *unencrypted by default*.** Anyone with physical access and a USB cable can
   dump flash and extract the node key — which is a credential that can join/impersonate the deck on your
-  tailnet until revoked.
+  tailnet until revoked. The same caveat now applies to the deck's **paired-bridge PSKs** (`main/trust.cpp`)
+  — also plaintext NVS, same exposure, same mitigation (below).
 - **Mitigations (do these):**
   - **Scope the key.** Use a **tagged** auth key (e.g. `tag:claudeq`) and an **ACL** that lets that
     tag reach **only** the bridge port (`tcp:8787`) on `tag:claudeq-bridge` — never your whole tailnet.
@@ -56,15 +57,20 @@ as a device that can be lost or stolen.**
     through the local-only secret-file convention used for WiFi creds — never commit it.
 - **What's *not* exposed.** Session content (answers, prompts, voice) is end-to-end WireGuard-encrypted
   between the deck and each bridge; DERP relays and the coordination server never see payloads, only
-  metadata. The deck↔bridge protocol itself is currently unauthenticated plaintext, which is fine on a
-  trusted LAN but should gain a shared-secret/per-message token before it's trusted across the tailnet.
+  metadata. **Update:** the deck↔bridge protocol itself is no longer plaintext — see `docs/PROTOCOL.md`'s
+  "Pairing" / "Authentication & encryption" sections. Pairing is keyed by `bridge_id`, not IP, so one
+  ceremony with a dual-homed bridge covers it on both the LAN and tailnet paths; the auth handshake and
+  AES-256-GCM envelope run identically over either transport, layered on top of whichever one carried the
+  WebSocket (no tailnet-specific auth logic needed — WireGuard already encrypts that hop, and this layer
+  adds device/bridge identity plus protection against anyone else who can also reach the bridge's IP).
 
 ## Status / open items
 - Validate the microlink build on this project's **ESP-IDF 5.4.1** (microlink is tested on 5.3).
 - Measure SRAM/PSRAM headroom alongside LVGL + WiFi + the WS client on the real board.
 - microlink is young and single-maintainer and reverse-implements an evolving protocol — **Headscale**
   self-hosting (supported) removes the dependency on Tailscale's servers and protocol stability.
-- Add the deck↔bridge auth token before relying on the cross-tailnet hop.
+- ~~Add the deck↔bridge auth token before relying on the cross-tailnet hop.~~ **Done** — see
+  `docs/PROTOCOL.md`'s "Pairing" / "Authentication & encryption" sections.
 - **Upgrade bridges together.** Dedup needs the `bridge_id` field; a pre-`bridge_id` bridge reached over
   *both* the LAN and the tailnet would show twice until updated (a stable id can't be inferred safely —
   `host` isn't unique). New bridges always send it, so this only bites during a mixed-version window.

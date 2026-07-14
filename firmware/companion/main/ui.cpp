@@ -109,6 +109,9 @@ static void style_switch(lv_obj_t *sw) {
     lv_obj_set_style_bg_color(sw, lv_color_hex(COL_OK), LV_PART_INDICATOR | LV_STATE_CHECKED);
     lv_obj_set_style_bg_color(sw, lv_color_hex(COL_INK), LV_PART_KNOB);
 }
+// Forward decl: a filled-dot icon primitive, defined further down (near make_page) but also needed by
+// the Paired Bridges screen, defined earlier in the file (in the Settings-callbacks section).
+static lv_obj_t *mkdot(lv_obj_t *parent, int d, uint32_t color);
 
 // ---------- decide (supports multi-question asks) ----------
 static void opt_clicked(lv_event_t *e);
@@ -967,6 +970,240 @@ static void sounds_sw_cb(lv_event_t *e) {
     audio_set_muted(!on);                                            // live, no reboot
 }
 
+// ---------- pairing: SAS confirm overlay (auto-popup, either side can start the ceremony) ----------
+// Backed by pairing.cpp's global ceremony state machine (PAIR_IDLE..PAIR_FAILED) — this timer just
+// reflects it onto widgets, the same "state machine lives in a .cpp, UI polls it" idiom as ota_tick.
+// Runs from the moment ui_init() finishes for the device's whole lifetime (not opened/closed like the
+// OTA overlay), since a bridge-initiated pairing request (an operator running `claudeq pair`) can arrive
+// at any time, from any screen.
+static lv_obj_t *s_pair_ov = NULL, *s_pair_msg = NULL, *s_pair_code = NULL, *s_pair_confirm_btn = NULL, *s_pair_reject_btn = NULL;
+static int s_pair_done_ticks = 0;
+static void pair_confirm_cb(lv_event_t *e) { (void)e; pairing_confirm(); }
+static void pair_reject_cb(lv_event_t *e)  { (void)e; pairing_reject(); }
+static void pairing_overlay_close(void) {
+    if (s_pair_ov) { lv_obj_del(s_pair_ov); s_pair_ov = NULL; }
+    s_pair_msg = s_pair_code = s_pair_confirm_btn = s_pair_reject_btn = NULL;
+}
+static void pairing_overlay_open(void) {
+    if (s_pair_ov) return;
+    lv_obj_t *ov = lv_obj_create(lv_layer_top());
+    s_pair_ov = ov;
+    lv_obj_set_size(ov, SCR_W, 640);
+    lv_obj_align(ov, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_bg_color(ov, lv_color_hex(COL_BG), 0);
+    lv_obj_set_style_border_width(ov, 0, 0);
+    lv_obj_set_style_radius(ov, 0, 0);
+    lv_obj_set_style_pad_all(ov, 12, 0);
+    lv_obj_clear_flag(ov, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(ov, LV_OBJ_FLAG_CLICKABLE);   // eat taps so they don't fall through to the nav below
+
+    lv_obj_t *tl = mklabel(ov, "Pair bridge", &lv_font_montserrat_16, COL_ACCENT);
+    lv_obj_align(tl, LV_ALIGN_TOP_MID, 0, 6);
+
+    s_pair_msg = mklabel(ov, "", &lv_font_montserrat_16, COL_INK);
+    lv_obj_set_style_text_align(s_pair_msg, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_width(s_pair_msg, 148);
+    lv_label_set_long_mode(s_pair_msg, LV_LABEL_LONG_WRAP);
+    lv_obj_align(s_pair_msg, LV_ALIGN_CENTER, 0, -70);
+
+    s_pair_code = mklabel(ov, "", &lv_font_montserrat_16, COL_ACCENT);
+    lv_obj_align(s_pair_code, LV_ALIGN_CENTER, 0, -10);
+    lv_obj_add_flag(s_pair_code, LV_OBJ_FLAG_HIDDEN);
+
+    s_pair_confirm_btn = lv_obj_create(ov);
+    lv_obj_set_size(s_pair_confirm_btn, 148, 52); style_card(s_pair_confirm_btn);
+    lv_obj_add_flag(s_pair_confirm_btn, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(s_pair_confirm_btn, pair_confirm_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_align(s_pair_confirm_btn, LV_ALIGN_BOTTOM_MID, 0, -66);
+    lv_obj_center(mklabel(s_pair_confirm_btn, "Confirm", &lv_font_montserrat_16, COL_OK));
+    lv_obj_add_flag(s_pair_confirm_btn, LV_OBJ_FLAG_HIDDEN);
+
+    s_pair_reject_btn = lv_obj_create(ov);
+    lv_obj_set_size(s_pair_reject_btn, 148, 52); style_card(s_pair_reject_btn);
+    lv_obj_add_flag(s_pair_reject_btn, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(s_pair_reject_btn, pair_reject_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_align(s_pair_reject_btn, LV_ALIGN_BOTTOM_MID, 0, -8);
+    lv_obj_center(mklabel(s_pair_reject_btn, "Reject", &lv_font_montserrat_16, COL_ERR));
+    lv_obj_add_flag(s_pair_reject_btn, LV_OBJ_FLAG_HIDDEN);
+}
+static void pairing_watch_tick(lv_timer_t *t) {
+    (void)t;
+    pairing_state_t st = pairing_get_state();   // also lazily applies the ceremony timeout
+    if (st != PAIR_DONE && st != PAIR_FAILED) s_pair_done_ticks = 0;
+    switch (st) {
+    case PAIR_IDLE:
+        if (s_pair_ov) pairing_overlay_close();
+        break;
+    case PAIR_WAIT_RESPONSE:
+        pairing_overlay_open();
+        lv_label_set_text(s_pair_msg, "Waiting for the\nbridge to respond\xE2\x80\xA6");
+        lv_obj_add_flag(s_pair_code, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(s_pair_confirm_btn, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(s_pair_reject_btn, LV_OBJ_FLAG_HIDDEN);
+        break;
+    case PAIR_SHOW_SAS:
+        pairing_overlay_open();
+        lv_label_set_text(s_pair_msg, "Confirm this code\nmatches the bridge:");
+        lv_label_set_text(s_pair_code, pairing_get_code());
+        lv_obj_clear_flag(s_pair_code, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_flag(s_pair_confirm_btn, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_flag(s_pair_reject_btn, LV_OBJ_FLAG_HIDDEN);
+        break;
+    case PAIR_WAIT_PEER:
+        pairing_overlay_open();
+        lv_label_set_text(s_pair_msg, "Waiting for the\nbridge to confirm\xE2\x80\xA6");
+        lv_obj_add_flag(s_pair_confirm_btn, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(s_pair_reject_btn, LV_OBJ_FLAG_HIDDEN);
+        break;
+    case PAIR_DONE:
+        pairing_overlay_open();
+        lv_label_set_text(s_pair_msg, "Paired!");
+        lv_obj_add_flag(s_pair_code, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(s_pair_confirm_btn, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(s_pair_reject_btn, LV_OBJ_FLAG_HIDDEN);
+        if (++s_pair_done_ticks > 6) pairing_dismiss();   // ~1.5s at the 250ms tick rate, then back to idle
+        break;
+    case PAIR_FAILED:
+        pairing_overlay_open();
+        lv_label_set_text(s_pair_msg, "Pairing failed\nor was rejected.");
+        lv_obj_add_flag(s_pair_code, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(s_pair_confirm_btn, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(s_pair_reject_btn, LV_OBJ_FLAG_HIDDEN);
+        if (++s_pair_done_ticks > 6) pairing_dismiss();
+        break;
+    }
+}
+
+// ---------- Paired Bridges screen: list (with live-connected dot) + pair/disconnect/forget ----------
+static lv_obj_t *s_pb_ov = NULL;
+static void ui_show_paired_bridges(void);
+static void pb_close(void) { if (s_pb_ov) { lv_obj_del(s_pb_ov); s_pb_ov = NULL; } }
+static void pb_close_cb(lv_event_t *e) { (void)e; pb_close(); }
+static int find_bridge_slot_by_id(const char *bridge_id) {
+    if (!bridge_id || !bridge_id[0]) return -1;
+    int n = net_bridge_count();
+    for (int i = 0; i < n; i++) {
+        bool used = false, connected = false; char bid[40] = {0}, host[40] = {0};
+        if (!net_bridge_info(i, &used, &connected, bid, sizeof(bid), host, sizeof(host))) continue;
+        if (used && bid[0] && !strcmp(bid, bridge_id)) return i;
+    }
+    return -1;
+}
+static void pb_disconnect_cb(lv_event_t *e) {
+    int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    if (idx >= 0) net_disconnect_bridge(idx);
+    ui_show_paired_bridges();   // rebuild to reflect the change
+}
+static void pb_forget_cb(lv_event_t *e) {
+    const char *bridge_id = (const char *)lv_event_get_user_data(e);
+    int slot = find_bridge_slot_by_id(bridge_id);
+    if (slot >= 0) net_disconnect_bridge(slot);
+    trust_forget(bridge_id);
+    ui_show_paired_bridges();   // rebuild
+}
+static void pb_pair_cb(lv_event_t *e) {
+    int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    pb_close();                // one overlay at a time -- the SAS confirm overlay takes over from here
+    pairing_start_as_device(idx);
+}
+static void ui_show_paired_bridges(void) {
+    pb_close();
+    lv_obj_t *ov = lv_obj_create(lv_layer_top());
+    s_pb_ov = ov;
+    lv_obj_set_size(ov, SCR_W, 640);
+    lv_obj_align(ov, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_bg_color(ov, lv_color_hex(COL_BG), 0);
+    lv_obj_set_style_border_width(ov, 0, 0);
+    lv_obj_set_style_radius(ov, 0, 0);
+    lv_obj_set_style_pad_all(ov, 10, 0);
+    lv_obj_clear_flag(ov, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(ov, LV_OBJ_FLAG_CLICKABLE);
+
+    lv_obj_t *tl = mklabel(ov, "Paired Bridges", &lv_font_montserrat_16, COL_ACCENT);
+    lv_obj_align(tl, LV_ALIGN_TOP_MID, 0, 4);
+
+    lv_obj_t *list = lv_obj_create(ov);
+    lv_obj_set_size(list, 150, 500);
+    lv_obj_align(list, LV_ALIGN_TOP_MID, 0, 32);
+    lv_obj_set_style_bg_opa(list, LV_OPA_0, 0);
+    lv_obj_set_style_border_width(list, 0, 0);
+    lv_obj_set_style_pad_all(list, 0, 0);
+    lv_obj_set_style_pad_gap(list, 6, 0);
+    lv_obj_set_flex_flow(list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(list, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    lv_obj_set_scroll_dir(list, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(list, LV_SCROLLBAR_MODE_AUTO);
+
+    // bridge_id strings must outlive this function for the Forget button callbacks -- a small bounded
+    // static table (MAX_TRUSTED_BRIDGES is tiny) reused across rebuilds, not a per-call heap allocation.
+    static char forget_ids[MAX_TRUSTED_BRIDGES][40];
+    for (int i = 0; i < MAX_TRUSTED_BRIDGES; i++) {
+        trust_bridge_t entry;
+        if (!trust_get(i, &entry)) continue;
+        int slot = find_bridge_slot_by_id(entry.bridge_id);
+        bool live = slot >= 0 && pairing_is_authenticated(slot);
+
+        lv_obj_t *row = lv_obj_create(list);
+        lv_obj_set_size(row, 150, 74); style_card(row);
+        lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_style_pad_all(row, 6, 0);
+
+        lv_obj_t *dot = mkdot(row, 8, live ? COL_OK : COL_DIM);
+        lv_obj_align(dot, LV_ALIGN_TOP_LEFT, 0, 3);
+        lv_obj_t *lbl = mklabel(row, entry.label, &lv_font_montserrat_12, COL_INK);
+        lv_obj_align(lbl, LV_ALIGN_TOP_LEFT, 14, 0);
+        lv_label_set_long_mode(lbl, LV_LABEL_LONG_DOT);
+        lv_obj_set_width(lbl, 120);
+
+        lv_obj_t *disc = lv_obj_create(row);
+        lv_obj_set_size(disc, 70, 28); style_card(disc);
+        lv_obj_align(disc, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+        lv_obj_add_flag(disc, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(disc, pb_disconnect_cb, LV_EVENT_CLICKED, (void *)(intptr_t)slot);
+        lv_obj_center(mklabel(disc, "Disc.", &lv_font_montserrat_12, COL_INK));
+
+        lv_obj_t *forget = lv_obj_create(row);
+        lv_obj_set_size(forget, 70, 28); style_card(forget);
+        lv_obj_align(forget, LV_ALIGN_BOTTOM_RIGHT, 0, 0);
+        lv_obj_add_flag(forget, LV_OBJ_FLAG_CLICKABLE);
+        snprintf(forget_ids[i], sizeof(forget_ids[i]), "%s", entry.bridge_id);
+        lv_obj_add_event_cb(forget, pb_forget_cb, LV_EVENT_CLICKED, forget_ids[i]);
+        lv_obj_center(mklabel(forget, "Forget", &lv_font_montserrat_12, COL_ERR));
+    }
+
+    // discovered-but-unpaired bridges -- tap to start the pairing ceremony
+    int n = net_bridge_count();
+    for (int i = 0; i < n; i++) {
+        bool used = false, connected = false; char bid[40] = {0}, host[40] = {0};
+        if (!net_bridge_info(i, &used, &connected, bid, sizeof(bid), host, sizeof(host))) continue;
+        if (!used || !connected || !bid[0] || trust_find(bid) >= 0) continue;   // already paired, or not ready yet
+        lv_obj_t *row = lv_obj_create(list);
+        lv_obj_set_size(row, 150, 54); style_card(row);
+        lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_style_pad_all(row, 6, 0);
+        lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(row, pb_pair_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+        lv_obj_t *lbl = mklabel(row, "New bridge", &lv_font_montserrat_12, COL_INK);
+        lv_obj_align(lbl, LV_ALIGN_TOP_LEFT, 0, 0);
+        lv_obj_t *tap = mklabel(row, "tap to pair \xE2\x86\x92", &lv_font_montserrat_12, COL_ACCENT);
+        lv_obj_align(tap, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+    }
+
+    if (lv_obj_get_child_cnt(list) == 0) {
+        lv_obj_t *ph = mklabel(list, "No bridges paired\nyet. Bridges you're\nconnected to will\nappear here to pair.", &lv_font_montserrat_12, COL_DIM);
+        lv_label_set_long_mode(ph, LV_LABEL_LONG_WRAP);
+        lv_obj_set_width(ph, 148);
+    }
+
+    lv_obj_t *close = lv_obj_create(ov);
+    lv_obj_set_size(close, 148, 46); style_card(close);
+    lv_obj_add_flag(close, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(close, pb_close_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_align(close, LV_ALIGN_BOTTOM_MID, 0, -6);
+    lv_obj_center(mklabel(close, "Close", &lv_font_montserrat_16, COL_INK));
+}
+static void pb_open_cb(lv_event_t *e) { (void)e; ui_show_paired_bridges(); }
+
 // A full-screen content page in the area between the chip strip and the bottom status strip.
 static lv_obj_t *make_page(lv_obj_t *parent) {
     lv_obj_t *p = lv_obj_create(parent);
@@ -1318,9 +1555,18 @@ void ui_init(void) {
     lv_obj_add_event_cb(upd_btn, checkupd_btn_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_center(mklabel(upd_btn, "Check for update", &lv_font_montserrat_12, COL_INK));
 
+    lv_obj_t *pb_btn = lv_obj_create(t_settings);
+    lv_obj_set_size(pb_btn, 152, 46);
+    style_card(pb_btn);
+    lv_obj_align(pb_btn, LV_ALIGN_TOP_LEFT, 0, 316);
+    lv_obj_add_flag(pb_btn, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(pb_btn, pb_open_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_center(mklabel(pb_btn, "Paired Bridges", &lv_font_montserrat_12, COL_INK));
+
     lv_obj_t *fw = mklabel(t_settings, "claudeq  v" DEVICE_FW, &lv_font_montserrat_12, COL_DIM);
     lv_obj_align(fw, LV_ALIGN_BOTTOM_MID, 0, -2);
 
     set_page(0);
+    lv_timer_create(pairing_watch_tick, 250, NULL);   // persistent: a bridge-initiated pairing can arrive from any screen
     ESP_LOGI(TAG, "ui ready (portrait, 2x2 nav)");
 }

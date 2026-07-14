@@ -121,16 +121,24 @@ bridges but not GitHub).
 their sessions into one chip strip. Whichever chip is focused is the one your taps, macros, and voice
 drive; a question auto-focuses the session that asked, wherever it's running.
 
-> ⚠️ **Security — no authentication yet.** The device↔bridge link (WebSocket + HTTP on port `8787`) is
-> **unauthenticated and unencrypted**. Anyone who can reach the bridge on your network — LAN or tailnet —
-> can connect to it and drive the focused Claude session: answer its questions, inject macros, and type
-> text into its terminal. **Only run Claudeq on networks you trust**, and don't expose the bridge port to
-> untrusted networks or the public internet. Authentication is planned for a future update.
+> 🔒 **Security — pairing required.** The device↔bridge link is now authenticated and encrypted: a deck
+> and a bridge must complete a one-time pairing (live numeric-comparison code, like Bluetooth/Signal
+> pairing — no password to type) before the bridge will send session data or accept commands. Pair from
+> the deck's **Settings → Paired Bridges → Pair new bridge**, or run **`claudeq pair`** on the bridge
+> machine. After pairing, every reconnect re-authenticates automatically and all traffic is AES-256-GCM
+> encrypted. Manage paired devices with `claudeq devices [list]` / `claudeq devices disconnect <id>` /
+> `claudeq devices forget <id>`. See `docs/PROTOCOL.md`'s "Pairing" section for the full model.
+>
+> **Upgrading from an older version?** Pairing wasn't there before — after upgrading both the bridge and
+> the firmware, every existing deck↔bridge relationship needs one fresh pairing (there's no way to migrate
+> "it just worked" into a trust relationship that never existed).
 
 ---
 
 # Customize
 - **Macros** — edit `bridge/macros.json` (`id` / `icon` / `label` / `prompt`), restart the bridge.
+- **Paired devices** — `bridge/trust.json` holds each paired device's persistent id and key; managed via
+  `claudeq pair`/`claudeq devices`, not by hand. Delete it (bridge restart) to forget every pairing at once.
 - **Sounds** — drop any audio file at `bridge/sounds/alert.*` or `done.*` (auto-converted via ffmpeg).
 - **Voice** — `CCDECK_VOICE_AUTOSUBMIT=0` types the transcript without pressing Enter;
   `CCDECK_WHISPER_MODEL=/path` points at the model (set during voice setup above; needed for a `brew`

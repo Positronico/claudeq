@@ -48,8 +48,9 @@ jobs:
         run: cd bridge && npm ci
       - name: Syntax-check bridge + hooks
         run: |
-          node --check bridge/bridge.mjs
-          for f in bridge/hooks/*.mjs; do node --check "$f"; done
+          for f in bridge/*.mjs bridge/hooks/*.mjs; do node --check "$f"; done
+      - name: Pairing crypto self-test
+        run: node bridge/crypto.mjs
       - name: Shellcheck launcher + flash scripts
         run: |
           sudo apt-get update && sudo apt-get install -y shellcheck

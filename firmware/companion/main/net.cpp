@@ -114,16 +114,18 @@ static void ws_evt(void *args, esp_event_base_t base, int32_t id, void *data) {
     case WEBSOCKET_EVENT_CONNECTED: {
         ESP_LOGI(TAG, "bridge %d connected (%s:%d)", bi, b->ip, b->port);
         b->connected = true; update_conn_icon();
-        char hello[160];
+        pairing_on_connect(bi);                   // fresh connection -> fresh auth/pairing state for this slot
+        char hello[220];
         int n = snprintf(hello, sizeof(hello),
-                         "{\"type\":\"hello\",\"name\":\"%s\",\"fw\":\"%s\",\"caps\":[\"session\",\"macros\",\"voice\",\"settings\",\"sessions\"]}",
-                         DEVICE_NAME, DEVICE_FW);
+                         "{\"type\":\"hello\",\"name\":\"%s\",\"fw\":\"%s\",\"device_id\":\"%s\",\"caps\":[\"session\",\"macros\",\"voice\",\"settings\",\"sessions\"]}",
+                         DEVICE_NAME, DEVICE_FW, device_get_id());
         esp_websocket_client_send_text(b->client, hello, n, portMAX_DELAY);
         break;
     }
     case WEBSOCKET_EVENT_DISCONNECTED:
     case WEBSOCKET_EVENT_CLOSED: {                // graceful/server-initiated close tears down too
         b->connected = false; update_conn_icon();
+        pairing_on_disconnect(bi);                // wipe this slot's session keys + abort any live ceremony with it
         free(b->rx); b->rx = NULL; b->rx_op = 0;  // discard any partial reassembly
         ui_bridge_gone(bi);                       // drop this bridge's sessions from the deck
         // If this was the primary path for a dual-homed bridge, promote a still-connected shadow (e.g.
@@ -158,22 +160,48 @@ static void ws_evt(void *args, esp_event_base_t base, int32_t id, void *data) {
         }
         if (b->rx && d->data_len > 0) memcpy(b->rx + d->payload_offset, d->data_ptr, d->data_len);
         if (b->rx && (d->payload_offset + d->data_len) >= d->payload_len) {
-            if (b->rx_op == 0x2) {                    // binary -> audio clip (only from the primary slot)
-                if (b->primary) audio_play_pcm(b->rx, d->payload_len);
+            if (b->rx_op == 0x2) {                    // binary -> encrypted audio clip envelope (see pairing.cpp)
+                if (b->primary) {
+                    uint8_t *pcm = NULL; size_t pcm_len = 0;
+                    if (pairing_unwrap_incoming_binary(bi, (const uint8_t *)b->rx, d->payload_len, &pcm, &pcm_len)) {
+                        audio_play_pcm(pcm, pcm_len);
+                        free(pcm);
+                    }
+                }
             } else {                                  // text -> JSON, tagged with the source bridge
                 b->rx[d->payload_len] = '\0';
                 cJSON *root = cJSON_Parse(b->rx);
                 if (root) {
                     cJSON *type = cJSON_GetObjectItem(root, "type");
-                    if (cJSON_IsString(type) && strcmp(type->valuestring, "sessions") == 0) {
-                        // identity + dedup: stamp this slot's bridge_id, cache the chips for failover replay,
-                        // and (re-)elect which path is primary for this machine.
+                    const char *t = cJSON_IsString(type) ? type->valuestring : "";
+                    if (!strcmp(t, "hello_ack")) {
+                        // identity + dedup: stamp this slot's bridge_id (now known ~1 RTT after connect,
+                        // in the clear, rather than waiting for the encrypted 'sessions' message) and
+                        // (re-)elect which path is primary for this machine.
                         cJSON *bid = cJSON_GetObjectItem(root, "bridge_id");
                         if (cJSON_IsString(bid)) snprintf(b->bridge_id, sizeof(b->bridge_id), "%s", bid->valuestring);
-                        ls_lock(); free(b->last_sessions); b->last_sessions = strdup(b->rx); ls_unlock();
                         elect_primary(b->bridge_id);
+                        pairing_on_message(root, bi);   // may auto-start the per-connection auth handshake
+                    } else if (!strncmp(t, "pair_", 5) || !strncmp(t, "auth_", 5)) {
+                        pairing_on_message(root, bi);
+                    } else if (!strcmp(t, "sec")) {
+                        cJSON *inner = pairing_unwrap_incoming(root, bi);
+                        if (inner) {
+                            cJSON *itype = cJSON_GetObjectItem(inner, "type");
+                            if (cJSON_IsString(itype) && strcmp(itype->valuestring, "sessions") == 0) {
+                                cJSON *bid2 = cJSON_GetObjectItem(inner, "bridge_id");
+                                if (cJSON_IsString(bid2)) snprintf(b->bridge_id, sizeof(b->bridge_id), "%s", bid2->valuestring);
+                                // cache the DECRYPTED inner text (not the outer 'sec' envelope) so a later
+                                // failover replay hands ui_handle_message real session data, not ciphertext.
+                                char *inner_txt = cJSON_PrintUnformatted(inner);
+                                if (inner_txt) { ls_lock(); free(b->last_sessions); b->last_sessions = inner_txt; ls_unlock(); }
+                                elect_primary(b->bridge_id);
+                            }
+                            if (b->primary) ui_handle_message(inner, bi);   // shadow connections forward nothing
+                            cJSON_Delete(inner);
+                        }
                     }
-                    if (b->primary) ui_handle_message(root, bi);   // shadow connections forward nothing
+                    // else: unauthenticated socket sent a non-handshake plaintext type -> dropped silently
                     cJSON_Delete(root);
                 }
             }
@@ -293,6 +321,25 @@ static void tailnet_discover_bridges(void) {
     }
 }
 
+// UI "Disconnect" on a paired bridge: tear the slot down explicitly (same shape as the stale-slot-reclaim
+// block below) rather than relying on esp_websocket_client_stop() to fire WEBSOCKET_EVENT_DISCONNECTED on
+// its own. Runs ONLY inside discovery_task, so it's safe to block on esp_websocket_client_stop() here —
+// this is exactly why net_disconnect_bridge() hands off via a notification instead of doing this directly
+// from the (LVGL-lock-holding) UI task.
+static void disconnect_bridge_slot(int idx) {
+    if (idx < 0 || idx >= MAX_BRIDGES || !s_br[idx].used) return;
+    bridge_t *b = &s_br[idx];
+    ESP_LOGI(TAG, "disconnecting bridge slot %d (%s:%d) on user request", idx, b->ip, b->port);
+    pairing_on_disconnect(idx);
+    if (b->client) { esp_websocket_client_stop(b->client); esp_websocket_client_destroy(b->client); }
+    free(b->rx); b->rx = NULL; b->rx_op = 0;
+    ls_lock(); free(b->last_sessions); b->last_sessions = NULL; ls_unlock();
+    b->client = NULL; b->used = false; b->connected = false;
+    b->bridge_id[0] = 0; b->primary = false;
+    ui_bridge_gone(idx);
+    update_conn_icon();
+}
+
 static void discovery_task(void *arg) {
     s_disc_task = xTaskGetCurrentTaskHandle();   // Settings toggles notify this task to apply tailnet changes
     // give STA up to 20s to get an IP; if it can't, the saved network is wrong/out of range -> portal
@@ -336,12 +383,15 @@ static void discovery_task(void *arg) {
                 b->client = NULL; b->rx = NULL; b->used = false; b->connected = false;
             }
         }
-        // re-discover every ~8s, but wake early on a Settings toggle. The command rides the notification
-        // value (atomically read + cleared here), so a toggle posted from the LVGL task is never lost.
+        // re-discover every ~8s, but wake early on a Settings toggle or a UI "Disconnect" tap. The command
+        // rides the notification value (atomically read + cleared here), so nothing posted from the LVGL
+        // task is ever lost. Disconnect-slot commands are encoded as 100+slot (slot < MAX_BRIDGES <= 8,
+        // so this never collides with the tailnet on/off values 1/2).
         uint32_t cmd = 0;
         xTaskNotifyWait(0, 0xFFFFFFFF, &cmd, pdMS_TO_TICKS(8000));
         if (cmd == 1) tailnet_start();
         else if (cmd == 2) tailnet_stop();
+        else if (cmd >= 100 && cmd < 100 + MAX_BRIDGES) disconnect_bridge_slot((int)(cmd - 100));
         update_conn_icon();   // keep the top-bar tailscale badge / bridge count fresh even without a WS event
     }
 }
@@ -377,17 +427,59 @@ extern "C" void net_get_prefs(bool *auto_standby, bool *sound_en) {
     if (sound_en)     *sound_en     = g_cfg.sound_enabled != 0;
 }
 
-extern "C" void net_send_to(int bridge, const char *json) {
+// UNWRAPPED send -- used only by pairing.cpp for the handshake messages that must travel in the clear
+// (hello/pair_*/auth_*), and internally above for `hello` itself.
+extern "C" void net_send_raw(int bridge, const char *json) {
     if (bridge < 0 || bridge >= MAX_BRIDGES) return;
     bridge_t *b = &s_br[bridge];
     if (b->client && b->connected) esp_websocket_client_send_text(b->client, json, strlen(json), pdMS_TO_TICKS(1000));
 }
 
+// Auth-gated + AES-256-GCM-encrypted send: every real app message (focus/answer/macro/voice/...) goes
+// through here. An unauthenticated bridge slot carries no app traffic in either direction -- the message
+// is simply dropped, not queued, matching the receive side's equivalent gate in ws_evt.
+extern "C" void net_send_to(int bridge, const char *json) {
+    if (!pairing_is_authenticated(bridge)) return;
+    char *wrapped = NULL; size_t wrapped_len = 0;
+    if (pairing_wrap_outgoing(bridge, json, &wrapped, &wrapped_len)) {
+        net_send_raw(bridge, wrapped);
+        free(wrapped);
+    }
+}
+
 extern "C" void net_send_text(const char *json) { net_send_to(s_focus_bridge, json); }
 
 extern "C" void net_send_binary(const void *data, size_t len) {
+    if (!pairing_is_authenticated(s_focus_bridge)) return;
     bridge_t *b = &s_br[s_focus_bridge];
-    if (b->client && b->connected) esp_websocket_client_send_bin(b->client, (const char *)data, len, pdMS_TO_TICKS(200));
+    if (!b->client || !b->connected) return;
+    uint8_t *wrapped = NULL; size_t wrapped_len = 0;
+    if (pairing_wrap_outgoing_binary(s_focus_bridge, (const uint8_t *)data, len, &wrapped, &wrapped_len)) {
+        esp_websocket_client_send_bin(b->client, (const char *)wrapped, wrapped_len, pdMS_TO_TICKS(200));
+        free(wrapped);
+    }
+}
+
+// For the "Paired Bridges" / "Pair new bridge" Settings screens (ui.cpp), which need to enumerate live
+// bridge slots but can't see s_br[] directly (private to this file).
+extern "C" int net_bridge_count(void) { return MAX_BRIDGES; }
+
+extern "C" bool net_bridge_info(int idx, bool *used, bool *connected, char *bridge_id, size_t bridge_id_len, char *host, size_t host_len) {
+    if (idx < 0 || idx >= MAX_BRIDGES) return false;
+    bridge_t *b = &s_br[idx];
+    if (used) *used = b->used;
+    if (connected) *connected = b->connected;
+    if (bridge_id && bridge_id_len) snprintf(bridge_id, bridge_id_len, "%s", b->bridge_id);
+    if (host && host_len) snprintf(host, host_len, "%s", b->ip);   // no separate machine-name field on this slot; IP is always available
+    return true;
+}
+
+// Hands off to discovery_task (see disconnect_bridge_slot) rather than tearing the slot down here directly —
+// esp_websocket_client_stop() can block, and this is called from the LVGL-lock-holding UI task.
+extern "C" bool net_disconnect_bridge(int idx) {
+    if (idx < 0 || idx >= MAX_BRIDGES || !s_br[idx].used) return false;
+    if (s_disc_task) xTaskNotify(s_disc_task, 100 + idx, eSetValueWithOverwrite);
+    return true;
 }
 
 // Load saved config into g_cfg EARLY — before ui_init() builds the Settings page and reads it via

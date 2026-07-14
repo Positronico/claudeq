@@ -21,6 +21,10 @@ credentials.json
 secrets.json
 *.secret
 
+# Bridge pairing identity + paired-device PSKs (generated at runtime, machine-specific — see
+# docs/PROTOCOL.md "Pairing"). Losing this file just means re-pairing, but it must never be committed.
+bridge/trust.json
+
 # =====================================================================
 # macOS / editors
 # =====================================================================
@@ -43,6 +47,7 @@ bridge/bridge.log
 # ESP-IDF build output — machine-specific (embeds absolute build paths)
 # =====================================================================
 firmware/*/build/
+firmware/*/.cache/
 firmware/*/sdkconfig.old
 firmware/*/sdkconfig.ci
 firmware/*/sdkconfig.defaults.old

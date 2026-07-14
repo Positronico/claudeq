@@ -58,18 +58,61 @@ void cfg_clear(void);                    // wipe saved config
 void provision_start(void);              // bring up the SoftAP captive portal
 void net_enter_setup(void);              // flag setup + reboot into the portal (called from the UI)
 
+// --- Trust store / device identity (trust.cpp) ---
+// Bounded paired-bridge table, stored as a single blob in the "claudeq" NVS namespace (cfg_clear() wipes
+// it too, for free). See docs/PROTOCOL.md's "Pairing" section.
+#define MAX_TRUSTED_BRIDGES 8
+typedef struct {
+    bool     used;
+    char     bridge_id[40];    // matches bridge_t.bridge_id's size in net.cpp
+    char     label[24];        // display label (the bridge's host name at pairing time)
+    uint8_t  psk[32];          // persistent PSK = HMAC-SHA256(pairing shared secret, "claudeq-psk-v1")
+    uint32_t paired_at;        // uptime-seconds at pairing time; display/audit only, no RTC battery
+} trust_bridge_t;
+const char *device_get_id(void);                            // this unit's persistent device_id (generated once, first boot)
+int  trust_find(const char *bridge_id);                       // -1 if untrusted, else index
+bool trust_get(int idx, trust_bridge_t *out);
+int  trust_count(void);
+bool trust_add(const char *bridge_id, const char *label, const uint8_t psk[32]);
+void trust_forget(const char *bridge_id);
+void trust_forget_by_index(int idx);
+
+// --- Pairing + per-connection auth + envelope crypto (pairing.cpp) ---
+// Live numeric-comparison (SAS) pairing ceremony over the existing WebSocket, then a PSK + fresh-ephemeral-
+// ECDH auth handshake on every reconnect, then AES-256-GCM envelope encryption for every app message.
+typedef enum { PAIR_IDLE, PAIR_WAIT_RESPONSE, PAIR_SHOW_SAS, PAIR_WAIT_PEER, PAIR_DONE, PAIR_FAILED } pairing_state_t;
+void pairing_start_as_device(int bridge_slot);              // UI: user tapped "Pair" on a discovered-but-untrusted bridge
+void pairing_confirm(void);                                 // UI: Confirm tapped on the SAS screen
+void pairing_reject(void);                                  // UI: Reject tapped
+void pairing_dismiss(void);                                 // UI: acknowledge a PAIR_DONE/PAIR_FAILED toast -> back to idle
+pairing_state_t pairing_get_state(void);                     // also lazily applies the ceremony timeout
+const char *pairing_get_code(void);                          // valid once state has reached PAIR_SHOW_SAS
+int  pairing_get_bridge(void);                                // bridge slot the current ceremony is with, else -1
+void pairing_on_connect(int bridge_slot);                    // fresh WS connection on this slot -> reset auth state
+void pairing_on_disconnect(int bridge_slot);                 // slot dropped -> wipe session keys, abort any ceremony with it
+void pairing_on_message(cJSON *root, int bridge_slot);        // net.cpp forwards hello_ack/auth_*/pair_* here
+bool pairing_is_authenticated(int bridge_slot);
+bool pairing_wrap_outgoing(int bridge_slot, const char *json, char **out_json, size_t *out_len);              // heap-allocates *out_json
+bool pairing_wrap_outgoing_binary(int bridge_slot, const uint8_t *data, size_t len, uint8_t **out, size_t *out_len);
+cJSON *pairing_unwrap_incoming(cJSON *sec_root, int bridge_slot);                    // NULL on failure; caller cJSON_Delete()s the result
+bool pairing_unwrap_incoming_binary(int bridge_slot, const uint8_t *data, size_t len, uint8_t **out, size_t *out_len);
+
 // --- Net (net.cpp) ---
 #define MAX_BRIDGES 8                    // max simultaneous bridge connections (LAN mDNS + tailnet); shared by net.cpp + ui.cpp
 void net_preload_config(void);           // load saved config into g_cfg before ui_init reads it (Settings switches)
 void net_start(void);                    // start wifi + multi-bridge discovery/websockets
-void net_send_to(int bridge, const char *json);     // send text to a specific bridge connection
-void net_send_text(const char *json);    // send text to the currently focused bridge
-void net_send_binary(const void *data, size_t len); // send a binary frame (mic PCM) to the focused bridge
+void net_send_to(int bridge, const char *json);     // send text to a specific bridge connection (auth-gated + encrypted)
+void net_send_text(const char *json);    // send text to the currently focused bridge (auth-gated + encrypted)
+void net_send_binary(const void *data, size_t len); // send a binary frame (mic PCM) to the focused bridge (auth-gated + encrypted)
+void net_send_raw(int bridge, const char *json);    // UNWRAPPED send -- pairing/auth handshake messages only (pairing.cpp)
 void net_set_focus_bridge(int bridge);   // route net_send_text/binary to this bridge (UI sets on focus change)
 void net_wifi_set_enabled(bool on);      // persist WiFi flag + reboot to apply (Settings toggle)
 void net_tailnet_set_enabled(bool on);   // join/leave the tailnet live, no reboot (Settings toggle)
 void net_get_flags(bool *wifi_en, bool *ts_en, bool *ts_has_key); // current toggle state for the Settings UI
 void net_get_prefs(bool *auto_standby, bool *sound_en);          // standby/sound toggle state for the Settings UI
+int  net_bridge_count(void);                                     // total known bridge slots (used + unused loop bound for the UI)
+bool net_bridge_info(int idx, bool *used, bool *connected, char *bridge_id, size_t bridge_id_len, char *host, size_t host_len);
+bool net_disconnect_bridge(int idx);      // UI "Disconnect": tear down this slot's live connection (trust untouched, reconnects later)
 
 // --- Battery (battery.cpp) ---
 void battery_init(void);                  // set up ADC1 + calibration for the BAT_ADC divider (GPIO4)

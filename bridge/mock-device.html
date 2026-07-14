@@ -90,6 +90,12 @@
   .console h2{ font-size:13px; color:var(--dim); font-weight:600; margin:0 0 8px; }
   .conn{ font-size:12px; margin-bottom:8px; }
   .conn b.up{color:var(--ok)} .conn b.down{color:var(--err)}
+  .pairbox{ background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:10px; margin-bottom:10px; font-size:12px; }
+  .pairbox .code{ font-size:22px; font-weight:700; letter-spacing:.08em; color:var(--accent); margin:6px 0; }
+  .pairbox button{ background:var(--accent); color:#1a1206; font-weight:700; border:0; border-radius:6px; padding:6px 12px; margin:4px 6px 0 0; cursor:pointer; }
+  .pairbox button.reject{ background:var(--err); color:#fff; }
+  .trustrow{ display:flex; justify-content:space-between; align-items:center; font-size:11px; padding:4px 0; border-bottom:1px solid var(--line); }
+  .trustrow button{ font-size:10px; padding:3px 7px; margin-left:4px; background:var(--bg); border:1px solid var(--line); color:var(--ink); border-radius:5px; cursor:pointer; }
   #log{ background:#0b0d13; border:1px solid var(--line); border-radius:8px; height:560px; overflow-y:auto;
         padding:8px; font:11px/1.5 ui-monospace,Menlo,monospace; color:#aeb6c6; white-space:pre-wrap; }
   .log-tx{ color:var(--accent2); } .log-rx{ color:var(--accent); } .log-sys{ color:var(--dim); }
@@ -112,6 +118,8 @@
   <div class="console">
     <h2>mock console</h2>
     <div class="conn">WebSocket: <b id="connstate" class="down">disconnected</b> &nbsp;→ <code id="wsurl"></code></div>
+    <div id="pairing-panel"></div>
+    <div id="trust-panel"></div>
     <div id="log"></div>
   </div>
 
@@ -125,7 +133,7 @@ let mode='decide', ask=null, sel={}, hud={}, macros=[], state={state:'idle',text
 let sessions=[], focus=null, qIdx=0, answersAcc={}, hosts={};   // focus = {sid, bridge} | null; hosts[bridge]=machine
 let feed=[];                                                     // activity lines for the focused session
 let voiceState='idle', voiceId=0, voiceText='';                  // mic action + on-device confirm (mirrors firmware)
-let conns=[];   // per-bridge connection: {idx, ws, up}
+let conns=[];   // per-bridge connection: {idx, ws, up, authenticated, sessionKeys, counters, pairing, authPending}
 // dedup: a machine reachable via the LAN and the tailnet sends the same bridge_id from two connections.
 // Keep both; only the "primary" (lowest connected index here; the firmware prefers the LAN path) shows.
 let bidByBridge={}, lastListByBridge={}, primaryByBridge={};
@@ -134,25 +142,281 @@ function log(msg, cls='log-sys'){ const el=document.getElementById('log');
   const t=new Date().toLocaleTimeString();
   el.innerHTML += `<span class="${cls}">[${t}] ${msg}</span>\n`; el.scrollTop=el.scrollHeight; }
 
+// ---------- pairing/auth crypto: WebCrypto SubtleCrypto (X25519 ECDH, HMAC-SHA256, AES-256-GCM) ----------
+// Must derive byte-identical values to bridge/crypto.mjs (node:crypto) and the firmware's vendored
+// x25519.c + mbedtls — three independent implementations of the same wire protocol (docs/PROTOCOL.md).
+if (!window.isSecureContext || !window.crypto || !crypto.subtle) {
+  log('WARNING: crypto.subtle unavailable — open this page via http://localhost:PORT/, not a bare LAN IP. Pairing/encryption will fail.');
+}
+async function genKeyPair(){
+  try {
+    const kp = await crypto.subtle.generateKey({ name:'X25519' }, true, ['deriveBits']);
+    const rawPublic = new Uint8Array(await crypto.subtle.exportKey('raw', kp.publicKey));
+    return { privateKey: kp.privateKey, rawPublic };
+  } catch(e) { log('X25519 unsupported by this browser (need a recent Chrome): '+e.message); throw e; }
+}
+async function ecdh(privateKey, peerRawPub){
+  const peerKey = await crypto.subtle.importKey('raw', peerRawPub, { name:'X25519' }, false, []);
+  return new Uint8Array(await crypto.subtle.deriveBits({ name:'X25519', public: peerKey }, privateKey, 256));
+}
+function concatBytes(...arrs){ let len=0; arrs.forEach(a=>len+=a.length); const out=new Uint8Array(len); let o=0; arrs.forEach(a=>{ out.set(a,o); o+=a.length; }); return out; }
+function cmpBytes(a,b){ const n=Math.min(a.length,b.length); for(let i=0;i<n;i++){ if(a[i]!==b[i]) return a[i]-b[i]; } return a.length-b.length; }
+function sortPubs(a,b){ return cmpBytes(a,b)<=0 ? [a,b] : [b,a]; }   // byte-lexicographic — matches C memcmp / Buffer.compare
+async function hmac(keyBytes, ...parts){
+  const key = await crypto.subtle.importKey('raw', keyBytes, { name:'HMAC', hash:'SHA-256' }, false, ['sign']);
+  return new Uint8Array(await crypto.subtle.sign('HMAC', key, concatBytes(...parts)));
+}
+const utf8 = (s)=> new TextEncoder().encode(s);
+async function sas6(shared, pubA, pubB){
+  const [x,y] = sortPubs(pubA,pubB);
+  const mac = await hmac(shared, x, y);
+  const n = ((mac[0]<<16) | (mac[1]<<8) | mac[2]) >>> 0;
+  return String(n % 1000000).padStart(6,'0');
+}
+async function derivePsk(shared){ return hmac(shared, utf8('claudeq-psk-v1')); }
+async function authTranscript(nonceDevice, nonceBridge, pubDeviceEph, pubBridgeEph){
+  const [x,y] = sortPubs(pubDeviceEph, pubBridgeEph);
+  return concatBytes(nonceDevice, nonceBridge, x, y);
+}
+async function deriveSessionKey(psk, ecdhShared, transcript){ return hmac(psk, ecdhShared, transcript, utf8('claudeq-session-v1')); }
+async function directionalKeys(sessionKey){ return { d2b: await hmac(sessionKey, utf8('d2b')), b2d: await hmac(sessionKey, utf8('b2d')) }; }
+async function authTag(sessionKey, role, transcript){ return hmac(sessionKey, utf8(role), transcript); }
+function counterIv(counter){ const iv=new Uint8Array(12); new DataView(iv.buffer).setBigUint64(4, BigInt(counter)); return iv; }
+async function gcmEncrypt(keyBytes, counter, ptBytes){
+  const key = await crypto.subtle.importKey('raw', keyBytes, { name:'AES-GCM' }, false, ['encrypt']);
+  return new Uint8Array(await crypto.subtle.encrypt({ name:'AES-GCM', iv: counterIv(counter), tagLength:128 }, key, ptBytes));   // ciphertext || tag
+}
+async function gcmDecrypt(keyBytes, counter, ctBytes){   // throws (rejects) on tag mismatch
+  const key = await crypto.subtle.importKey('raw', keyBytes, { name:'AES-GCM' }, false, ['decrypt']);
+  return new Uint8Array(await crypto.subtle.decrypt({ name:'AES-GCM', iv: counterIv(counter), tagLength:128 }, key, ctBytes));
+}
+function b64(bytes){ let s=''; bytes.forEach(b=>s+=String.fromCharCode(b)); return btoa(s); }
+function unb64(str){ const bin=atob(str); const out=new Uint8Array(bin.length); for(let i=0;i<bin.length;i++) out[i]=bin.charCodeAt(i); return out; }
+function randomBytes(n){ const b=new Uint8Array(n); crypto.getRandomValues(b); return b; }
+
+// ---------- persistent device identity + paired-bridge trust store (localStorage stands in for NVS) ----------
+function getDeviceId(){ let id=localStorage.getItem('claudeq_device_id'); if(!id){ id=crypto.randomUUID(); localStorage.setItem('claudeq_device_id', id); } return id; }
+const DEVICE_ID = getDeviceId();
+function loadTrust(){ try{ return JSON.parse(localStorage.getItem('claudeq_trust')||'{}'); } catch{ return {}; } }
+function saveTrust(t){ localStorage.setItem('claudeq_trust', JSON.stringify(t)); }
+let trustStore = loadTrust();   // { [bridge_id]: { psk: base64, label, pairedAt } }
+let pairingUi = { bridge:null, code:null, status:'idle' };   // drives the Pairing panel: idle|waiting|confirm
+
 function connectBridge(idx){
   const url = `ws://${HOST}:${PORTS[idx]}`;
-  const c = { idx, ws:null, up:false }; conns[idx]=c;
+  const c = { idx, ws:null, up:false, authenticated:false, sessionKeys:null, counters:{send:0,recv:0}, pairing:null, authPending:null };
+  conns[idx]=c;
   const open=()=>{
-    const ws=new WebSocket(url); c.ws=ws;
-    ws.onopen=()=>{ c.up=true; updateConn(); sendTo(idx,{type:'hello',name:'mock-device',fw:'mock-0.2',caps:['session','macros','voice','settings']}); log(`b${idx} connected (${url})`); };
+    const ws=new WebSocket(url); ws.binaryType='arraybuffer'; c.ws=ws;
+    ws.onopen=()=>{ c.up=true; updateConn(); sendTo(idx,{type:'hello',name:'mock-device',fw:'mock-0.2',caps:['session','macros','voice','settings'],device_id:DEVICE_ID}); log(`b${idx} connected (${url})`); };
     ws.onclose=()=>{ c.up=false; updateConn(); bridgeGone(idx); setTimeout(open,1000); };
-    ws.onmessage=(e)=>{ let m; try{m=JSON.parse(e.data)}catch{return;} log(`◀b${idx} ${e.data}`,'log-rx'); handle(m, idx); };
+    ws.onmessage=async (e)=>{
+      if (e.data instanceof ArrayBuffer) {   // binary: sound clip envelope [8B counter][ciphertext+tag]
+        if (!c.authenticated) return;
+        const buf = new Uint8Array(e.data);
+        if (buf.length < 24) return;
+        const n = Number(new DataView(buf.buffer).getBigUint64(0));
+        if (n <= c.counters.recv) return;
+        try { await gcmDecrypt(c.sessionKeys.recv, n, buf.subarray(8)); c.counters.recv=n; log(`◀b${idx} [audio clip, ${buf.length-24}B]`); }
+        catch { log(`◀b${idx} [audio decrypt FAILED]`); }
+        return;
+      }
+      let m; try{ m=JSON.parse(e.data); } catch { return; }
+      if (m.type==='sec') {
+        if (!c.authenticated) return;
+        if (typeof m.n!=='number' || m.n<=c.counters.recv) return;
+        try {
+          const pt = await gcmDecrypt(c.sessionKeys.recv, m.n, unb64(m.ct));
+          c.counters.recv = m.n;
+          m = JSON.parse(new TextDecoder().decode(pt));
+        } catch { log(`◀b${idx} [decrypt FAILED — tampered or replayed]`); return; }
+      }
+      log(`◀b${idx} ${JSON.stringify(m)}`,'log-rx');
+      await handle(m, idx);
+    };
   };
   open();
 }
 function updateConn(){ const up=conns.filter(c=>c&&c.up).length;
-  const el=document.getElementById('connstate'); el.textContent=up?`connected (${up}/${PORTS.length})`:'disconnected'; el.className=up?'up':'down'; }
+  const el=document.getElementById('connstate'); el.textContent=up?`connected (${up}/${PORTS.length})`:'disconnected'; el.className=up?'up':'down';
+  renderPairing(); renderTrustList(); }
 function sendTo(bridge, o){ const c=conns[bridge]; if(c&&c.ws&&c.ws.readyState===1){ c.ws.send(JSON.stringify(o)); log(`▶b${bridge} ${JSON.stringify(o)}`,'log-tx'); } }
-function sendFocus(o){ if(focus) sendTo(focus.bridge, o); }   // macros/voice/answers -> the focused session's bridge
+async function sendSecureTo(bridge, o){
+  const c=conns[bridge]; if(!c||!c.authenticated) return;
+  try {
+    c.counters.send++;
+    const ct = await gcmEncrypt(c.sessionKeys.send, c.counters.send, utf8(JSON.stringify(o)));
+    sendTo(bridge, { type:'sec', n:c.counters.send, ct:b64(ct) });
+  } catch(e){ log('encrypt failed: '+e.message); }
+}
+async function sendFocus(o){ if(focus) await sendSecureTo(focus.bridge, o); }   // macros/voice/answers -> the focused session's bridge
 function concernsFocus(m, bridge){ return focus && focus.bridge===bridge && (m.sid==null || m.sid===focus.sid); }
 
-function handle(m, bridge){
+// ---------- pairing ceremony: ephemeral X25519 ECDH + a human-verified 6-digit code ----------
+async function startPairingWithBridge(idx){
+  const c=conns[idx]; if(!c||!c.up||c.authenticated||c.pairing) return;
+  const {privateKey, rawPublic} = await genKeyPair();
+  c.pairing = { myPriv:privateKey, myPub:rawPublic, theirPub:null, shared:null, sas:null, confirmedByMe:false, confirmedByPeer:false };
+  sendTo(idx, { type:'pair_request', pub:b64(rawPublic) });
+  pairingUi = { bridge:idx, code:null, status:'waiting' };
+  renderPairing();
+}
+async function handlePairRequest(idx, m){   // bridge-initiated (claudeq pair); we're the responder
+  const c=conns[idx]; if(!c) return;
+  if (c.pairing) { sendTo(idx, { type:'pair_reject', reason:'busy' }); return; }
+  let theirPub; try{ theirPub=unb64(m.pub); } catch{ return; }
+  if (theirPub.length!==32) return;
+  const {privateKey, rawPublic} = await genKeyPair();
+  const shared = await ecdh(privateKey, theirPub);
+  const sas = await sas6(shared, rawPublic, theirPub);
+  c.pairing = { myPriv:privateKey, myPub:rawPublic, theirPub, shared, sas, confirmedByMe:false, confirmedByPeer:false };
+  sendTo(idx, { type:'pair_response', pub:b64(rawPublic) });
+  pairingUi = { bridge:idx, code:sas, status:'confirm' };
+  renderPairing();
+}
+async function handlePairResponse(idx, m){   // we initiated; peer just replied — compute the SAS
+  const c=conns[idx]; const p=c&&c.pairing; if(!p||p.theirPub) return;
+  let theirPub; try{ theirPub=unb64(m.pub); } catch{ return; }
+  if (theirPub.length!==32) return;
+  p.theirPub = theirPub;
+  p.shared = await ecdh(p.myPriv, theirPub);
+  p.sas = await sas6(p.shared, p.myPub, theirPub);
+  pairingUi = { bridge:idx, code:p.sas, status:'confirm' };
+  renderPairing();
+}
+async function maybeFinalizePairing(idx){
+  const c=conns[idx]; const p=c&&c.pairing;
+  if(!p || !p.confirmedByMe || !p.confirmedByPeer) return;
+  const psk = await derivePsk(p.shared);
+  const bridgeId = bidByBridge[idx] || `bridge-${idx}`;
+  trustStore[bridgeId] = { psk:b64(psk), label:hosts[idx]||bridgeId, pairedAt:Date.now() };
+  saveTrust(trustStore);
+  c.pairing = null;
+  sendTo(idx, { type:'pair_ack', ok:true, label:DEVICE_ID.slice(0,8) });
+  pairingUi = { bridge:null, code:null, status:'idle' };
+  log('paired with bridge '+bridgeId);
+  renderPairing(); renderTrustList();
+  await startAuth(idx);   // immediately authenticate this now-paired connection
+}
+async function handlePairConfirm(idx, m){
+  const c=conns[idx]; const p=c&&c.pairing; if(!p||!p.sas) return;
+  p.confirmedByPeer = true;
+  await maybeFinalizePairing(idx);
+}
+function handlePairReject(idx, m){
+  const c=conns[idx]; if(c) c.pairing=null;
+  if (pairingUi.bridge===idx) pairingUi = { bridge:null, code:null, status:'idle' };
+  log('pairing rejected: '+(m.reason||'unknown'));
+  renderPairing();
+}
+function handlePairAck(idx, m){ log(`pairing ack from bridge b${idx} (ok=${!!m.ok})`); }
+async function confirmPairing(){
+  const idx=pairingUi.bridge; const c=conns[idx]; const p=c&&c.pairing;
+  if(!p||!p.sas) return;
+  p.confirmedByMe = true;
+  sendTo(idx, { type:'pair_confirm' });
+  await maybeFinalizePairing(idx);
+}
+function rejectPairing(){
+  const idx=pairingUi.bridge; const c=conns[idx];
+  if (c&&c.pairing){ sendTo(idx, { type:'pair_reject', reason:'user' }); c.pairing=null; }
+  pairingUi = { bridge:null, code:null, status:'idle' };
+  renderPairing();
+}
+function forgetBridge(bridgeId){
+  delete trustStore[bridgeId]; saveTrust(trustStore);
+  conns.forEach(c=>{ if(c && bidByBridge[c.idx]===bridgeId){ c.authenticated=false; c.sessionKeys=null; c.counters={send:0,recv:0}; } });
+  log('forgot bridge '+bridgeId);
+  renderTrustList(); renderPairing();
+}
+function disconnectBridge(bridgeId){   // close the live connection only; trust (PSK) stays, so it re-authenticates on reconnect
+  conns.forEach(c=>{ if(c && bidByBridge[c.idx]===bridgeId && c.ws) c.ws.close(); });
+}
+
+// ---------- per-connection auth handshake: runs automatically once hello_ack shows we're already paired ----------
+async function startAuth(idx){
+  const c=conns[idx]; if(!c||!c.up||c.authenticated) return;
+  const bridgeId = bidByBridge[idx];
+  const trusted = bridgeId && trustStore[bridgeId];
+  if(!trusted) { renderPairing(); return; }   // not paired (yet) with this bridge_id — offer pairing instead
+  const psk = unb64(trusted.psk);
+  const {privateKey, rawPublic} = await genKeyPair();
+  const nonceDevice = randomBytes(16);
+  c.authPending = { priv:privateKey, pub:rawPublic, nonceDevice, psk };
+  sendTo(idx, { type:'auth_hello', nonce:b64(nonceDevice), pub:b64(rawPublic) });
+  renderPairing();
+}
+async function handleAuthChallenge(idx, m){
+  const c=conns[idx]; const ap=c&&c.authPending; if(!ap) return;
+  const nonceBridge = unb64(m.nonce), pubBridgeEph = unb64(m.pub);
+  const ecdhShared = await ecdh(ap.priv, pubBridgeEph);
+  const transcript = await authTranscript(ap.nonceDevice, nonceBridge, ap.pub, pubBridgeEph);
+  const sessionKey = await deriveSessionKey(ap.psk, ecdhShared, transcript);
+  const dirs = await directionalKeys(sessionKey);
+  Object.assign(ap, { sessionKey, transcript, dirs });
+  sendTo(idx, { type:'auth_verify', mac:b64(await authTag(sessionKey,'device',transcript)) });
+}
+async function handleAuthVerify(idx, m){
+  const c=conns[idx]; const ap=c&&c.authPending; if(!ap||!ap.sessionKey) return;
+  const expected = await authTag(ap.sessionKey, 'bridge', ap.transcript);
+  let got; try{ got=unb64(m.mac); } catch{ return; }
+  if (cmpBytes(got, expected)!==0){ log(`b${idx} auth failed: bad bridge MAC`); c.authPending=null; return; }
+  c.sessionKeys = { send:ap.dirs.d2b, recv:ap.dirs.b2d };   // device sends with d2b, receives with b2d
+  c.counters = { send:0, recv:0 };
+  c.authenticated = true; c.authPending = null;
+  log(`b${idx} authenticated`);
+  updateConn();
+}
+function handleAuthReject(idx, m){ log(`b${idx} auth rejected: ${m.reason||'unknown'}`); const c=conns[idx]; if(c) c.authPending=null; renderPairing(); }
+
+function renderPairing(){
+  const el=document.getElementById('pairing-panel'); if(!el) return;
+  if (pairingUi.status==='idle'){
+    const candidates = conns.filter(c=>c && c.up && !c.authenticated && !c.pairing && !c.authPending);
+    if(!candidates.length){ el.innerHTML=''; return; }
+    el.innerHTML = '<div class="pairbox"><b>Unpaired bridges</b><br>'+
+      candidates.map(c=>`<button data-b="${c.idx}" class="pairbtn">Pair with b${c.idx} (${hosts[c.idx]||'?'})</button>`).join('')+'</div>';
+    el.querySelectorAll('.pairbtn').forEach(b=> b.onclick=()=>startPairingWithBridge(parseInt(b.dataset.b,10)));
+  } else if (pairingUi.status==='waiting'){
+    el.innerHTML = `<div class="pairbox">Waiting for bridge b${pairingUi.bridge} to respond…</div>`;
+  } else if (pairingUi.status==='confirm'){
+    el.innerHTML = `<div class="pairbox">Confirm this code matches <code>claudeq pair</code> on the bridge:
+      <div class="code">${pairingUi.code}</div>
+      <button id="pairConfirmBtn">Confirm</button><button id="pairRejectBtn" class="reject">Reject</button></div>`;
+    document.getElementById('pairConfirmBtn').onclick=confirmPairing;
+    document.getElementById('pairRejectBtn').onclick=rejectPairing;
+  }
+}
+function renderTrustList(){
+  const el=document.getElementById('trust-panel'); if(!el) return;
+  const ids=Object.keys(trustStore);
+  if(!ids.length){ el.innerHTML=''; return; }
+  el.innerHTML = '<div class="pairbox"><b>Paired bridges</b>'+
+    ids.map(id=>{
+      const live = conns.some(c=>c && bidByBridge[c.idx]===id && c.authenticated);
+      return `<div class="trustrow"><span>${trustStore[id].label||id} ${live?'🟢':'⚪'}</span>`+
+        `<span><button data-id="${id}" class="discBtn">Disconnect</button><button data-id="${id}" class="forgetBtn">Forget</button></span></div>`;
+    }).join('')+'</div>';
+  el.querySelectorAll('.discBtn').forEach(b=> b.onclick=()=>disconnectBridge(b.dataset.id));
+  el.querySelectorAll('.forgetBtn').forEach(b=> b.onclick=()=>forgetBridge(b.dataset.id));
+}
+
+async function handle(m, bridge){
   switch(m.type){
+    case 'hello_ack':
+      bidByBridge[bridge]=m.bridge_id??null; if(m.host) hosts[bridge]=m.host;
+      log(`b${bridge} hello_ack: paired=${!!m.paired}`);
+      if (m.paired) await startAuth(bridge); else renderPairing();
+      renderTrustList();
+      break;
+    case 'pair_request': await handlePairRequest(bridge, m); break;
+    case 'pair_response': await handlePairResponse(bridge, m); break;
+    case 'pair_confirm': await handlePairConfirm(bridge, m); break;
+    case 'pair_reject': handlePairReject(bridge, m); break;
+    case 'pair_ack': handlePairAck(bridge, m); break;
+    case 'auth_challenge': await handleAuthChallenge(bridge, m); break;
+    case 'auth_verify': await handleAuthVerify(bridge, m); break;
+    case 'auth_reject': handleAuthReject(bridge, m); break;
     case 'sessions':
       if(m.host) hosts[bridge]=m.host;
       bidByBridge[bridge]=m.bridge_id??null; lastListByBridge[bridge]=m.list||[];
@@ -190,9 +454,10 @@ function rebuildSessions(){
 }
 function bridgeGone(bridge){
   delete bidByBridge[bridge]; delete lastListByBridge[bridge]; delete primaryByBridge[bridge];
+  const c=conns[bridge]; if(c){ c.authenticated=false; c.sessionKeys=null; c.counters={send:0,recv:0}; c.pairing=null; c.authPending=null; }
   electPrimary(); rebuildSessions();   // a surviving shadow on another path is promoted -> its sessions show
   if(focus && focus.bridge===bridge){ focus=null; ask=null; feed=[]; }
-  renderSessions(); renderStatus(); render();
+  renderSessions(); renderStatus(); render(); renderPairing(); renderTrustList();
 }
 function focusedTitle(){ const s=focus && sessions.find(x=>x.bridge===focus.bridge && x.sid===focus.sid); return s?s.title:'—'; }
 function renderSessions(){ const sb=document.getElementById('sessbar'); sb.innerHTML='';
@@ -203,7 +468,7 @@ function renderSessions(){ const sb=document.getElementById('sessbar'); sb.inner
     const clash = sessions.some(o=>o!==s && o.bridge!==s.bridge && o.title===s.title);
     c.innerHTML = s.title + (clash && hosts[s.bridge] ? `<span class="host">@${hosts[s.bridge]}</span>` : '');
     c.title=`${s.sid} @ bridge ${s.bridge}`;
-    c.onclick=()=>{ focus={sid:s.sid, bridge:s.bridge}; feed=[]; sendTo(s.bridge,{type:'focus', sid:s.sid}); renderSessions(); renderStatus(); if(mode==='decide') render(); };
+    c.onclick=()=>{ focus={sid:s.sid, bridge:s.bridge}; feed=[]; sendSecureTo(s.bridge,{type:'focus', sid:s.sid}); renderSessions(); renderStatus(); if(mode==='decide') render(); };
     sb.appendChild(c); }); }
 function renderStatus(){ document.getElementById('dot').className='dot '+(state.state||'idle');
   document.getElementById('titletxt').textContent=focusedTitle();
@@ -295,7 +560,7 @@ function confirmMulti(q){ answersAcc[q.question]=q.options.filter((_,i)=>sel[i])
 function setTab(){ document.querySelectorAll('.tab').forEach(t=>t.classList.toggle('active', t.dataset.m===mode)); }
 document.querySelectorAll('.tab').forEach(t=> t.onclick=()=>{ if(t.dataset.m==='voice'){ voiceToggle(); return; } mode=t.dataset.m; setTab(); render(); });
 
-renderStatus(); render(); PORTS.forEach((_,i)=>connectBridge(i));
+renderStatus(); render(); renderPairing(); renderTrustList(); PORTS.forEach((_,i)=>connectBridge(i));
 </script>
 </body>
 </html>

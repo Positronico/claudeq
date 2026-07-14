@@ -14,18 +14,23 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import os from 'node:os';
 import { spawn, spawnSync } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
+import crypto from 'node:crypto';
 import { WebSocketServer } from 'ws';
+import * as trust from './trust.mjs';
+import * as pcrypto from './crypto.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = parseInt(process.env.CCDECK_PORT || '8787', 10);
 const SHORT_HOST = (process.env.CCDECK_HOST || os.hostname() || 'host').replace(/\.local$/, '').split('.')[0].slice(0, 16);  // for the deck to label chips on title clashes; override with CCDECK_HOST
 // Stable per-process id so the deck can tell that this bridge — reached via the LAN and via the tailnet
-// at two different IPs — is ONE machine, and show its sessions once. Override with CCDECK_BRIDGE_ID.
-const BRIDGE_ID = process.env.CCDECK_BRIDGE_ID || randomUUID();
+// at two different IPs — is ONE machine, and show its sessions once. Persisted in trust.json (unlike a
+// bare per-process randomUUID()) so pairing survives a bridge restart; override with CCDECK_BRIDGE_ID.
+const BRIDGE_ID = trust.BRIDGE_ID;
+const BRIDGE_FW = (() => { try { return JSON.parse(fs.readFileSync(path.join(__dirname, 'package.json'), 'utf8')).version || '0.0.0'; } catch { return '0.0.0'; } })();
 const DEFAULT_TMUX = process.env.CCDECK_TMUX_TARGET || 'ccdeck';   // fallback for legacy `cc`
 const ASK_TIMEOUT_MS = parseInt(process.env.CCDECK_ASK_TIMEOUT_MS || '280000', 10);
 const PRUNE_GRACE_MS = parseInt(process.env.CCDECK_PRUNE_GRACE_MS || '20000', 10);
+const PAIR_TIMEOUT_MS = parseInt(process.env.CCDECK_PAIR_TIMEOUT_MS || '90000', 10);
 const MACROS_FILE = path.join(__dirname, 'macros.json');
 const MOCK_FILE = path.join(__dirname, 'mock-device.html');
 const SOUNDS_DIR = path.join(__dirname, 'sounds');
@@ -51,7 +56,7 @@ function loadSound(name) {
 function sendSound(name) {
   const pcm = loadSound(name);
   if (!pcm || !pcm.length) return;
-  for (const ws of clients) { try { ws.send(pcm, { binary: true }); } catch {} }
+  for (const ws of clients) sendSecureBinary(ws, pcm);
 }
 
 // ---------- state ----------
@@ -101,8 +106,7 @@ function loadMacros() {
 
 // ---------- ws helpers ----------
 function broadcast(obj) {
-  const s = JSON.stringify(obj);
-  for (const ws of clients) { try { ws.send(s); } catch {} }
+  for (const ws of clients) sendSecure(ws, obj);
 }
 function needsAttn(s) { return !!s.pendingAsk || s.attn; }
 function sessionsList() {
@@ -307,6 +311,24 @@ function readBody(req) {
   });
 }
 
+// Poll `check` every `intervalMs` until it returns something other than `undefined`, or `timeoutMs`
+// elapses (resolves `null` on timeout). Used by the /admin/pair/* long-polls below — pairing is a rare,
+// human-paced admin action, so a simple poll loop is plenty and avoids wiring an event-emitter for it.
+function waitFor(check, timeoutMs, intervalMs = 150) {
+  return new Promise((resolve) => {
+    const start = Date.now();
+    (function tick() {
+      const v = check();
+      if (v !== undefined) { resolve(v); return; }
+      if (Date.now() - start >= timeoutMs) { resolve(null); return; }
+      setTimeout(tick, intervalMs);
+    })();
+  });
+}
+function isLoopback(addr) {
+  return addr === '127.0.0.1' || addr === '::1' || addr === '::ffff:127.0.0.1';
+}
+
 const server = http.createServer(async (req, res) => {
   const u = new URL(req.url, `http://localhost:${PORT}`);
 
@@ -374,6 +396,76 @@ const server = http.createServer(async (req, res) => {
     const name = u.searchParams.get('name') || 'alert';
     sendSound(name);
     res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify({ ok: true, name })); return;
+  }
+
+  // Device management for `claudeq pair` / `claudeq devices ...` (bridge/claudeq). Loopback-only: unlike
+  // /ask (answer one question) or /event (push telemetry), these can disconnect or revoke a live paired
+  // device, so they get a stricter trust bar than the rest of this HTTP surface.
+  if (u.pathname.startsWith('/admin/')) {
+    if (!isLoopback(req.socket.remoteAddress || '')) {
+      res.writeHead(403, { 'content-type': 'application/json' }); res.end('{"error":"loopback only"}'); return;
+    }
+    const json = (obj, code = 200) => { res.writeHead(code, { 'content-type': 'application/json' }); res.end(JSON.stringify(obj)); };
+
+    if (req.method === 'GET' && u.pathname === '/admin/devices/pending') { json(pendingPairings()); return; }
+
+    if (req.method === 'GET' && u.pathname === '/admin/devices') {
+      json(trust.listDevices().map(({ psk, ...d }) => {
+        const ws = findSocketByDeviceId(d.deviceId);
+        return { ...d, connected: !!ws, authenticated: !!(ws && ws._authenticated) };
+      }));
+      return;
+    }
+
+    if (req.method === 'POST' && u.pathname === '/admin/pair/start') {
+      const payload = JSON.parse((await readBody(req)) || '{}');
+      const ws = findSocketByDeviceId(payload.deviceId);
+      if (!ws) { json({ ok: false, reason: 'not-connected' }, 404); return; }
+      const started = startPairing(ws);
+      if (!started.ok) { json(started); return; }
+      const code = await waitFor(() => (!ws._pairing ? null : (ws._pairing.sas || undefined)), PAIR_TIMEOUT_MS);
+      json(code ? { ok: true, code } : { ok: false, reason: 'no-response' });
+      return;
+    }
+
+    if (req.method === 'POST' && u.pathname === '/admin/pair/confirm') {
+      const payload = JSON.parse((await readBody(req)) || '{}');
+      const ws = findSocketByDeviceId(payload.deviceId);
+      if (!ws) { json({ ok: false, reason: 'not-connected' }, 404); return; }
+      const r = confirmPairingLocal(ws);
+      if (!r.ok) { json(r); return; }
+      const paired = await waitFor(() => {
+        if (trust.isPaired(payload.deviceId)) return true;
+        if (!ws._pairing) return false;   // aborted after our confirm (peer rejected/timed out)
+        return undefined;
+      }, PAIR_TIMEOUT_MS);
+      json({ ok: true, paired: !!paired });
+      return;
+    }
+
+    if (req.method === 'POST' && u.pathname === '/admin/pair/reject') {
+      const payload = JSON.parse((await readBody(req)) || '{}');
+      const ws = findSocketByDeviceId(payload.deviceId);
+      json(ws ? rejectPairingLocal(ws, payload.reason || 'user') : { ok: false, reason: 'not-connected' });
+      return;
+    }
+
+    const dm = u.pathname.match(/^\/admin\/devices\/([^/]+)\/(disconnect|forget)$/);
+    if (req.method === 'POST' && dm) {
+      const id = decodeURIComponent(dm[1]);
+      const ws = findSocketByDeviceId(id);
+      if (dm[2] === 'disconnect') {
+        if (ws) ws.close(4001, 'admin-disconnect');
+        json({ ok: true, disconnected: !!ws });
+      } else {
+        const existed = trust.forgetDevice(id);
+        if (ws) ws.close(4001, 'admin-forget');
+        json({ ok: true, existed });
+      }
+      return;
+    }
+
+    json({ error: 'not found' }, 404); return;
   }
 
   res.writeHead(404); res.end('not found');
@@ -447,30 +539,250 @@ function sweepSessions() {
 }
 setInterval(sweepSessions, 8000).unref();
 
+// ---------- pairing / authentication ----------
+// Every connection starts unauthenticated and may only exchange the types below (see docs/PROTOCOL.md's
+// "Pairing" / "Authentication & encryption" sections). Everything else — session data, macros, focus,
+// answers, voice — requires a completed per-connection auth handshake, and travels wrapped in a `sec`
+// envelope from then on. Per-socket state (`ws._deviceId`, `_authenticated`, `_pairing`, `_authPending`,
+// `_sessionKeys`, `_counters`) is initialized in `wss.on('connection', ...)` below.
+const HANDSHAKE_TYPES = new Set([
+  'hello', 'pair_request', 'pair_response', 'pair_confirm', 'pair_reject', 'pair_ack',
+  'auth_hello', 'auth_verify', 'sec', 'ping',
+]);
+
+function findSocketByDeviceId(deviceId) {
+  for (const ws of clients) if (ws._deviceId === deviceId) return ws;
+  return null;
+}
+
+// A fresh directional AES key + 12-byte IV built from a strictly-increasing per-direction counter — safe
+// because a brand-new session_key is derived from a fresh ephemeral ECDH exchange on every reconnect
+// (see handleAuthHello), so a (key, IV) pair never repeats across the bridge's lifetime.
+function sendSecure(ws, obj) {
+  if (!ws._authenticated) return;   // an unauthenticated socket never receives app/session data
+  const n = ++ws._counters.send;
+  const ct = pcrypto.gcmEncrypt(ws._sessionKeys.send, n, Buffer.from(JSON.stringify(obj), 'utf8'));
+  try { ws.send(JSON.stringify({ type: 'sec', n, ct: ct.toString('base64') })); } catch {}
+}
+// Binary frames (audio) get a lightweight envelope instead of base64+JSON: 8-byte BE counter, then the
+// AES-GCM ciphertext+tag — sharing the same per-direction counter sequence as sendSecure's `sec` frames.
+function sendSecureBinary(ws, buf) {
+  if (!ws._authenticated) return;
+  const n = ++ws._counters.send;
+  const ct = pcrypto.gcmEncrypt(ws._sessionKeys.send, n, buf);
+  const header = Buffer.alloc(8); header.writeBigUInt64BE(BigInt(n), 0);
+  try { ws.send(Buffer.concat([header, ct]), { binary: true }); } catch {}
+}
+
+// ---- pairing ceremony: ephemeral X25519 ECDH + a human-verified 6-digit code (see crypto.mjs) ----
+function pairingAbort(ws, reason) {
+  if (ws._pairing?.timer) clearTimeout(ws._pairing.timer);
+  ws._pairing = null;
+  try { ws.send(JSON.stringify({ type: 'pair_reject', reason })); } catch {}
+}
+// Bridge-initiated: an admin action (claudeq pair) wants to pair with an already-connected device.
+function startPairing(ws) {
+  if (ws._pairing) return { ok: false, reason: 'busy' };
+  const { privateKey, rawPublic } = pcrypto.genKeyPair();
+  ws._pairing = {
+    myPriv: privateKey, myPub: rawPublic, theirPub: null, shared: null, sas: null,
+    confirmedByMe: false, confirmedByPeer: false,
+    timer: setTimeout(() => pairingAbort(ws, 'timeout'), PAIR_TIMEOUT_MS),
+  };
+  try { ws.send(JSON.stringify({ type: 'pair_request', pub: rawPublic.toString('base64') })); } catch {}
+  return { ok: true };
+}
+// Peer (device) initiated pairing — we're the responder, so we can compute the SAS immediately.
+function handlePairRequest(ws, m) {
+  if (ws._pairing) { try { ws.send(JSON.stringify({ type: 'pair_reject', reason: 'busy' })); } catch {} return; }
+  let theirPub;
+  try { theirPub = Buffer.from(m.pub, 'base64'); } catch { return; }
+  if (theirPub.length !== 32) return;
+  const { privateKey, rawPublic } = pcrypto.genKeyPair();
+  const shared = pcrypto.ecdh(privateKey, theirPub);
+  const sas = pcrypto.sas6(shared, rawPublic, theirPub);
+  ws._pairing = {
+    myPriv: privateKey, myPub: rawPublic, theirPub, shared, sas,
+    confirmedByMe: false, confirmedByPeer: false,
+    timer: setTimeout(() => pairingAbort(ws, 'timeout'), PAIR_TIMEOUT_MS),
+  };
+  console.log(`[pair] request from device ${ws._deviceId || '?'} — code ${sas} (confirm via 'claudeq pair')`);
+  try { ws.send(JSON.stringify({ type: 'pair_response', pub: rawPublic.toString('base64') })); } catch {}
+}
+// Reply to a bridge-initiated pair_request — now we know both pubkeys, compute the SAS.
+function handlePairResponse(ws, m) {
+  const p = ws._pairing;
+  if (!p || p.theirPub) return;   // no outstanding bridge-initiated request on this socket
+  let theirPub;
+  try { theirPub = Buffer.from(m.pub, 'base64'); } catch { return; }
+  if (theirPub.length !== 32) return;
+  p.theirPub = theirPub;
+  p.shared = pcrypto.ecdh(p.myPriv, theirPub);
+  p.sas = pcrypto.sas6(p.shared, p.myPub, theirPub);
+  console.log(`[pair] code for device ${ws._deviceId || '?'} — ${p.sas} (confirm via 'claudeq pair')`);
+}
+function maybeFinalizePairing(ws) {
+  const p = ws._pairing;
+  if (!p || !p.confirmedByMe || !p.confirmedByPeer) return;
+  clearTimeout(p.timer);
+  const deviceId = ws._deviceId;
+  if (!deviceId) { pairingAbort(ws, 'mismatch'); return; }   // shouldn't happen: hello always precedes pairing
+  const psk = pcrypto.derivePsk(p.shared);
+  trust.addDevice(deviceId, ws._deviceName || deviceId, psk);
+  ws._pairing = null;
+  console.log(`[pair] paired with device ${deviceId}`);
+  try { ws.send(JSON.stringify({ type: 'pair_ack', ok: true, label: SHORT_HOST })); } catch {}
+}
+function handlePairConfirm(ws, m) {
+  const p = ws._pairing;
+  if (!p || !p.sas) return;   // peer confirmed before the ECDH exchange even completed — ignore
+  p.confirmedByPeer = true;
+  maybeFinalizePairing(ws);
+}
+function handlePairReject(ws, m) {
+  if (!ws._pairing) return;
+  console.log(`[pair] rejected by peer (${m.reason || 'unknown'})`);
+  clearTimeout(ws._pairing.timer);
+  ws._pairing = null;
+}
+function handlePairAck(ws, m) {
+  console.log(`[pair] peer confirmed pairing complete (ok=${!!m.ok})`);
+}
+// Admin-facing actions (used by the /admin/pair/* HTTP routes — see below).
+function confirmPairingLocal(ws) {
+  if (!ws._pairing || !ws._pairing.sas) return { ok: false, reason: 'not-ready' };
+  ws._pairing.confirmedByMe = true;
+  try { ws.send(JSON.stringify({ type: 'pair_confirm' })); } catch {}
+  maybeFinalizePairing(ws);
+  return { ok: true };
+}
+function rejectPairingLocal(ws, reason = 'user') {
+  if (!ws._pairing) return { ok: false };
+  pairingAbort(ws, reason);
+  return { ok: true };
+}
+function pendingPairings() {
+  const out = [];
+  for (const ws of clients) {
+    if (!ws._deviceId || ws._authenticated) continue;
+    out.push({
+      deviceId: ws._deviceId, name: ws._deviceName,
+      pairing: ws._pairing ? { code: ws._pairing.sas || null, confirmedByMe: ws._pairing.confirmedByMe, confirmedByPeer: ws._pairing.confirmedByPeer } : null,
+    });
+  }
+  return out;
+}
+
+// ---- per-connection auth handshake: runs automatically once a hello_ack shows the device is already
+// paired. Combines the long-term PSK with a fresh ephemeral ECDH every reconnect for forward secrecy. ----
+function handleAuthHello(ws, m) {
+  const deviceId = ws._deviceId;
+  const psk = deviceId ? trust.pskFor(deviceId) : null;
+  if (!psk) { try { ws.send(JSON.stringify({ type: 'auth_reject', reason: 'unknown_device' })); } catch {} return; }
+  let nonceDevice, pubDeviceEph;
+  try {
+    nonceDevice = Buffer.from(m.nonce, 'base64'); pubDeviceEph = Buffer.from(m.pub, 'base64');
+    if (nonceDevice.length !== 16 || pubDeviceEph.length !== 32) throw new Error('bad length');
+  } catch { try { ws.send(JSON.stringify({ type: 'auth_reject', reason: 'bad_request' })); } catch {} return; }
+  const { privateKey, rawPublic } = pcrypto.genKeyPair();
+  const nonceBridge = pcrypto.randomBytes(16);
+  const ecdhShared = pcrypto.ecdh(privateKey, pubDeviceEph);
+  const transcript = pcrypto.authTranscript(nonceDevice, nonceBridge, pubDeviceEph, rawPublic);
+  const sessionKey = pcrypto.deriveSessionKey(psk, ecdhShared, transcript);
+  const dirs = pcrypto.directionalKeys(sessionKey);
+  if (ws._authPending?.timer) clearTimeout(ws._authPending.timer);
+  ws._authPending = { sessionKey, dirs, transcript, timer: setTimeout(() => { ws._authPending = null; }, PAIR_TIMEOUT_MS) };
+  try { ws.send(JSON.stringify({ type: 'auth_challenge', nonce: nonceBridge.toString('base64'), pub: rawPublic.toString('base64') })); } catch {}
+}
+function handleAuthVerify(ws, m) {
+  const ap = ws._authPending;
+  if (!ap) return;
+  let mac;
+  try { mac = Buffer.from(m.mac, 'base64'); } catch { return; }
+  const expected = pcrypto.authTag(ap.sessionKey, 'device', ap.transcript);
+  if (mac.length !== expected.length || !crypto.timingSafeEqual(mac, expected)) {
+    try { ws.send(JSON.stringify({ type: 'auth_reject', reason: 'bad_mac' })); } catch {}
+    ws.close(4004, 'bad-auth-mac');
+    return;
+  }
+  clearTimeout(ap.timer);
+  ws._sessionKeys = { send: ap.dirs.b2d, recv: ap.dirs.d2b };
+  ws._counters = { send: 0, recv: 0 };
+  ws._authenticated = true;
+  ws._authPending = null;
+  try { ws.send(JSON.stringify({ type: 'auth_verify', mac: pcrypto.authTag(ap.sessionKey, 'bridge', ap.transcript).toString('base64') })); } catch {}
+  console.log(`[auth] device ${ws._deviceId} authenticated`);
+  sendSnapshot(ws);
+}
+
 // ---------- websocket ----------
 function sendSnapshot(ws) {
-  ws.send(JSON.stringify({ type: 'macros', items: macros }));
-  ws.send(JSON.stringify({ type: 'sessions', list: sessionsList(), focus: focusedSid, host: SHORT_HOST, bridge_id: BRIDGE_ID }));
+  sendSecure(ws, { type: 'macros', items: macros });
+  sendSecure(ws, { type: 'sessions', list: sessionsList(), focus: focusedSid, host: SHORT_HOST, bridge_id: BRIDGE_ID });
   const s = sessions.get(focusedSid);
   if (s) {
-    ws.send(JSON.stringify(statusMsg(s)));
-    ws.send(JSON.stringify(hudMsg(s)));
-    if (s.pendingAsk) ws.send(JSON.stringify(askMsg(s)));
-    ws.send(JSON.stringify(feedMsg(s)));   // after the ask (see pushFocused)
+    sendSecure(ws, statusMsg(s));
+    sendSecure(ws, hudMsg(s));
+    if (s.pendingAsk) sendSecure(ws, askMsg(s));
+    sendSecure(ws, feedMsg(s));   // after the ask (see pushFocused)
   } else {
-    ws.send(JSON.stringify({ type: 'status', sid: null, state: 'idle', text: 'idle', tool: null }));
+    sendSecure(ws, { type: 'status', sid: null, state: 'idle', text: 'idle', tool: null });
   }
 }
 const wss = new WebSocketServer({ server });
 wss.on('connection', (ws, req) => {
   clients.add(ws);
-  console.log(`[ws] deck connected (${clients.size} total) from ${req.socket.remoteAddress}`);
-  sendSnapshot(ws);
+  ws._deviceId = null; ws._deviceName = null; ws._authenticated = false;
+  ws._pairing = null; ws._authPending = null;
+  ws._sessionKeys = null; ws._counters = { send: 0, recv: 0 };
+  console.log(`[ws] connection (${clients.size} total) from ${req.socket.remoteAddress} — awaiting hello/auth`);
   ws.on('message', (buf, isBinary) => {
-    if (isBinary) { if (ws._recording) ws._mic.push(buf); return; }   // mic PCM frames
+    if (isBinary) {   // mic PCM frames — encrypted once authenticated, unusable (dropped) before that
+      if (!ws._authenticated) return;
+      if (buf.length < 24) return;   // 8-byte counter + >=16-byte tag
+      const n = Number(buf.readBigUInt64BE(0));
+      if (n <= ws._counters.recv) { ws.close(4002, 'replay'); return; }
+      let pcm;
+      try { pcm = pcrypto.gcmDecrypt(ws._sessionKeys.recv, n, buf.subarray(8)); }
+      catch { ws.close(4003, 'bad-auth-tag'); return; }
+      ws._counters.recv = n;
+      if (ws._recording) ws._mic.push(pcm);
+      return;
+    }
     let m; try { m = JSON.parse(buf.toString()); } catch { return; }
+
+    if (m.type === 'sec') {
+      if (!ws._authenticated) return;
+      if (typeof m.n !== 'number' || m.n <= ws._counters.recv) { ws.close(4002, 'replay'); return; }
+      let inner;
+      try { inner = JSON.parse(pcrypto.gcmDecrypt(ws._sessionKeys.recv, m.n, Buffer.from(m.ct, 'base64')).toString('utf8')); }
+      catch { ws.close(4003, 'bad-auth-tag'); return; }
+      ws._counters.recv = m.n;
+      m = inner;   // fall through to the existing dispatch below, exactly as if it had arrived in the clear
+    } else if (!HANDSHAKE_TYPES.has(m.type)) {
+      return;   // unauthenticated socket, not a handshake/keepalive type -> drop silently
+    }
+
     switch (m.type) {
-      case 'hello': console.log(`[ws] hello from ${m.name} (${m.fw})`); sendSound('done'); break;
+      case 'hello':
+        ws._deviceId = typeof m.device_id === 'string' ? m.device_id : null;
+        ws._deviceName = typeof m.name === 'string' ? m.name : null;
+        console.log(`[ws] hello from ${m.name} (${m.fw}) device_id=${ws._deviceId || '?'}`);
+        sendSound('done');
+        try {
+          ws.send(JSON.stringify({
+            type: 'hello_ack', bridge_id: BRIDGE_ID, host: SHORT_HOST, fw: BRIDGE_FW,
+            paired: ws._deviceId ? trust.isPaired(ws._deviceId) : false,
+          }));
+        } catch {}
+        break;
+      case 'pair_request': handlePairRequest(ws, m); break;
+      case 'pair_response': handlePairResponse(ws, m); break;
+      case 'pair_confirm': handlePairConfirm(ws, m); break;
+      case 'pair_reject': handlePairReject(ws, m); break;
+      case 'pair_ack': handlePairAck(ws, m); break;
+      case 'auth_hello': handleAuthHello(ws, m); break;
+      case 'auth_verify': handleAuthVerify(ws, m); break;
       case 'voice_start': ws._mic = []; ws._recording = true; ws._voiceId = m.id; console.log('[voice] start'); break;
       case 'voice_end': finishVoice(ws); break;
       case 'voice_commit': {
@@ -515,6 +827,8 @@ wss.on('connection', (ws, req) => {
   ws.on('close', () => {
     clients.delete(ws);
     ws._pendingVoice = null;
+    if (ws._pairing?.timer) clearTimeout(ws._pairing.timer);
+    if (ws._authPending?.timer) clearTimeout(ws._authPending.timer);
     console.log(`[ws] disconnected (${clients.size} left)`);
     if (clients.size === 0) {  // no deck left to answer -> unblock pending asks so Claude falls back to its TUI picker
       for (const [id, p] of pendingAsks) {

@@ -26,6 +26,11 @@ if [ "${1:-}" = "flash" ]; then
   exit 1
 fi
 
+# ---- `claudeq pair` / `claudeq devices ...` — pairing + trust management, see docs/PROTOCOL.md ----
+if [ "${1:-}" = "pair" ] || [ "${1:-}" = "devices" ]; then
+  exec node "$SCRIPT_DIR/cli-admin.mjs" "$@"
+fi
+
 # ---- `claudeq restart-bridge` — stop + relaunch the bridge (picks up edited bridge code) ----
 if [ "${1:-}" = "restart-bridge" ] || [ "${1:-}" = "restart" ]; then
   PORT="${CCDECK_PORT:-8787}"

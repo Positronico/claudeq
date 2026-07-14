@@ -254,6 +254,12 @@ static void ensure_bridge(const char *ip, int port, bool is_lan) {
     cfg.reconnect_timeout_ms = 4000;
     cfg.network_timeout_ms = 5000;
     cfg.buffer_size = 2048;
+    // Default task_stack is only 4KB (esp_websocket_client's WEBSOCKET_TASK_STACK) -- this event
+    // callback now also does the pairing/auth envelope crypto (a stack-resident mbedtls_gcm_context
+    // carries ~300+ bytes of GHASH tables alone) before handing off to ui_handle_message's cJSON/LVGL
+    // work, all on this one task. That combination plausibly overflows the tight default; give it the
+    // same headroom already used elsewhere in this firmware for similarly-loaded tasks (discovery_task).
+    cfg.task_stack = 8192;
     b->client = esp_websocket_client_init(&cfg);
     esp_websocket_register_events(b->client, WEBSOCKET_EVENT_ANY, ws_evt, (void *)(intptr_t)slot);
     esp_websocket_client_start(b->client);

@@ -744,26 +744,28 @@ void ui_handle_message(cJSON *root, int bridge) {
 // True while a question overlay is up: the power task keeps the screen awake so the ask can't be missed.
 bool ui_has_pending_ask(void) { return s_ask != NULL; }
 
-void ui_set_net_status(bool online, int bridges, bool ts_configured, bool ts_up) {
+void ui_set_net_status(bool wifi_up, int bridges, bool ts_configured, bool ts_up) {
     if (!s_conn) return;
     if (!ui_lock(1000)) return;
-    lv_label_set_text(s_conn, online ? LV_SYMBOL_WIFI : LV_SYMBOL_CLOSE);
-    lv_obj_set_style_text_color(s_conn, lv_color_hex(online ? COL_OK : COL_ERR), 0);
+    // WiFi icon reflects the actual STA/IP link state -- independent of bridges/pairing, so it stays
+    // accurate even with WiFi up but zero reachable bridges (e.g. right after a fresh pairing wipe).
+    lv_label_set_text(s_conn, wifi_up ? LV_SYMBOL_WIFI : LV_SYMBOL_CLOSE);
+    lv_obj_set_style_text_color(s_conn, lv_color_hex(wifi_up ? COL_OK : COL_ERR), 0);
     if (s_ts_cell) {                                // Tailscale logo: shown only when configured
         if (ts_configured) lv_obj_clear_flag(s_ts_cell, LV_OBJ_FLAG_HIDDEN);
         else               lv_obj_add_flag(s_ts_cell, LV_OBJ_FLAG_HIDDEN);
     }
     for (int i = 0; i < 4; i++)                     // light the logo's lit dots green when the tailnet is up
         if (s_ts_dots[i]) lv_obj_set_style_bg_color(s_ts_dots[i], lv_color_hex(ts_up ? COL_OK : COL_TSOFF), 0);
-    if (s_bridges) {                                // bridge count: always shown; dim when none connected
-        char b[12]; snprintf(b, sizeof(b), "%d", online ? bridges : 0);
+    if (s_bridges) {                                // bridge count: its own signal, independent of the WiFi icon
+        char b[12]; snprintf(b, sizeof(b), "%d", bridges);
         lv_label_set_text(s_bridges, b);
-        lv_obj_set_style_text_color(s_bridges, lv_color_hex((online && bridges > 0) ? COL_INK : COL_DIM), 0);
+        lv_obj_set_style_text_color(s_bridges, lv_color_hex(bridges > 0 ? COL_INK : COL_DIM), 0);
     }
     // With no session in focus there's no per-session status, so the strip would keep its stale "connecting..."
-    // init text even while online — reflect the actual link state instead.
+    // init text even while online — reflect the actual WiFi link state instead.
     if (s_state && !focus_sid[0])
-        lv_label_set_text(s_state, online ? "ready - no session" : "connecting...");
+        lv_label_set_text(s_state, wifi_up ? "ready - no session" : "connecting...");
     ui_unlock();
 }
 

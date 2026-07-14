@@ -15,7 +15,7 @@ void ui_unlock(void);
 void ui_init(void);                      // build the UI once; caller already holds the LVGL lock
 void ui_handle_message(cJSON *root, int bridge);  // handle a message from bridge index `bridge`
 void ui_bridge_gone(int bridge);         // a bridge disconnected -> drop its sessions
-void ui_set_net_status(bool online, int bridges, bool ts_configured, bool ts_up); // top-bar net icons; takes the lock
+void ui_set_net_status(bool wifi_up, int bridges, bool ts_configured, bool ts_up); // top-bar net icons; takes the lock. wifi_up = actual STA/IP link state (independent of bridge/pairing reachability)
 bool ui_set_battery(int pct, bool charging, bool present); // update status-bar battery gauge; false if UI not ready
 void ui_show_setup(const char *ap_ssid, const char *ap_ip); // overlay shown while provisioning
 void ui_show_lock_notice(bool show);     // brief "Locked" flash before the screen blanks (BOOT long-press)

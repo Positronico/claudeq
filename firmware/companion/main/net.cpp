@@ -57,22 +57,25 @@ static int s_focus_bridge = 0;       // where net_send_text/binary (macros/voice
 static TaskHandle_t s_disc_task = NULL;   // discovery_task handle; the tailnet toggle command rides its
                                           // notification value (1 enable, 2 disable) so it's read atomically
 
-// Push the top-bar network state (online + distinct-bridge count + tailscale), derived by scanning so there's
-// no shared-counter race. Bridge count = connected PRIMARY slots (a machine reachable via both LAN + tailnet
+// Push the top-bar network state (WiFi link + distinct-bridge count + tailscale), derived by scanning so
+// there's no shared-counter race. WiFi icon = s_got_ip (the actual STA/IP link state) -- independent of
+// whether any bridge happens to be reachable, so it stays accurate even with WiFi up but zero paired/
+// reachable bridges. Bridge count = connected PRIMARY slots (a machine reachable via both LAN + tailnet
 // keeps one primary, so it isn't double-counted).
 static void update_conn_icon(void) {
-    bool any = false; int bridges = 0;
+    int bridges = 0;
     for (int i = 0; i < MAX_BRIDGES; i++) {
-        if (s_br[i].used && s_br[i].connected) { any = true; if (s_br[i].primary) bridges++; }
+        if (s_br[i].used && s_br[i].connected && s_br[i].primary) bridges++;
     }
     bool ts_configured = (g_cfg.tailscale_authkey[0] != 0 && g_cfg.tailscale_enabled != 0);
-    ui_set_net_status(any, bridges, ts_configured, s_ml != NULL);
+    ui_set_net_status(s_got_ip, bridges, ts_configured, s_ml != NULL);
 }
 
 static void wifi_evt(void *arg, esp_event_base_t base, int32_t id, void *data) {
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
         esp_wifi_connect();
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
+        s_got_ip = false;    // WiFi actually dropped -- reflect that immediately, independent of bridge state
         ui_set_net_status(false, 0, (g_cfg.tailscale_authkey[0] != 0 && g_cfg.tailscale_enabled != 0), s_ml != NULL);
         if (!s_provisioning) { vTaskDelay(pdMS_TO_TICKS(1000)); esp_wifi_connect(); }
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
@@ -80,6 +83,7 @@ static void wifi_evt(void *arg, esp_event_base_t base, int32_t id, void *data) {
         ESP_LOGI(TAG, "got IP " IPSTR, IP2STR(&e->ip_info.ip));
         s_got_ip = true;
         xEventGroupSetBits(s_wifi_eg, WIFI_CONNECTED_BIT);
+        update_conn_icon();   // WiFi just came up -- refresh the icon now, don't wait for the next bridge event
     }
 }
 

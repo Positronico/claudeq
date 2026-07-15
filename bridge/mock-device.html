@@ -24,14 +24,30 @@
   @keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
   .title{ font-weight:600; color:var(--ink); font-size:11px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:80px; }
   .state{ color:var(--dim); font-size:10px; margin-left:auto; white-space:nowrap; }
-  .sessbar{ flex:0 0 auto; display:flex; gap:5px; padding:5px 6px; overflow-x:auto; border-bottom:1px solid var(--line); }
+  /* session selector: one bar showing the focused session; tap -> dropdown picker (mirrors the firmware) */
+  .sessbar{ flex:0 0 auto; padding:5px 6px; border-bottom:1px solid var(--line); position:relative; }
   .sessbar:empty{ display:none; padding:0; border:0; }
-  .chip{ flex:0 0 auto; font-size:13px; padding:6px 14px; border-radius:16px; border:1px solid var(--line);
-         background:var(--panel); color:var(--dim); cursor:pointer; white-space:nowrap; }
-  .chip.focus{ border:2px solid var(--accent); color:var(--ink); background:rgba(214,116,58,.16); }
-  .chip.needs{ border-color:var(--warn); color:var(--warn); animation:pulse 1s infinite; }
-  .chip.needs.focus{ color:var(--ink); animation:none; }
-  .chip .host{ font-size:10px; color:var(--dim); margin-left:5px; }
+  .sessbtn{ display:flex; align-items:center; gap:6px; font-size:13px; padding:6px 12px; border-radius:16px;
+            border:1px solid var(--line); background:var(--panel); color:var(--ink); cursor:pointer; }
+  .sessbtn.focus{ border:2px solid var(--accent); padding:5px 11px; }
+  .sessbtn.needs{ border:2px solid var(--warn); padding:5px 11px; }
+  .sessbtn .t{ flex:1 1 auto; min-width:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .sessbtn .t.dim{ color:var(--dim); }
+  .sessbtn .badge{ flex:0 0 auto; color:var(--warn); font-size:11px; animation:pulse 1s infinite; }
+  .sessbtn .n{ flex:0 0 auto; color:var(--dim); font-size:11px; }
+  .sesspick{ position:absolute; left:6px; right:6px; top:calc(100% - 2px); z-index:20; background:var(--bg);
+             border:1px solid var(--line); border-radius:10px; padding:6px; max-height:320px; overflow-y:auto;
+             box-shadow:0 8px 24px rgba(0,0,0,.5); }
+  .pickrow{ display:flex; align-items:center; gap:6px; padding:8px; border:1px solid var(--line); border-radius:9px;
+            background:var(--panel); cursor:pointer; margin-bottom:6px; font-size:13px; color:var(--ink); }
+  .pickrow:last-child{ margin-bottom:0; }
+  .pickrow:hover{ border-color:var(--accent2); }
+  .pickrow.focus{ border:2px solid var(--accent); background:rgba(214,116,58,.16); padding:7px; }
+  .pickrow.needs{ border-color:var(--warn); }
+  .pickrow.needs:not(.focus) .t{ color:var(--warn); }
+  .pickrow .ic{ flex:0 0 16px; text-align:center; }
+  .pickrow .t{ flex:1 1 auto; min-width:0; overflow-wrap:anywhere; }
+  .pickrow .host{ font-size:10px; color:var(--dim); margin-left:5px; }
   .body{ flex:1 1 auto; overflow-y:auto; padding:8px; }
   .hdr{ font-size:10px; letter-spacing:.08em; text-transform:uppercase; color:var(--accent);
         background:rgba(214,116,58,.12); border:1px solid rgba(214,116,58,.3); border-radius:6px;
@@ -429,7 +445,7 @@ async function handle(m, bridge){
       electPrimary(); rebuildSessions(); renderSessions(); renderStatus(); if(mode==='decide') render();
       break;
     case 'status': if(concernsFocus(m,bridge)){ state=m; renderStatus(); } break;
-    case 'ask': if(m.sid){ if(!focus || focus.bridge!==bridge || focus.sid!==m.sid) feed=[]; focus={sid:m.sid, bridge}; } ask=m; qIdx=0; answersAcc={}; sel={}; mode='decide'; setTab(); renderSessions(); renderStatus(); render(); flash(); break;
+    case 'ask': if(m.sid){ if(!focus || focus.bridge!==bridge || focus.sid!==m.sid) feed=[]; focus={sid:m.sid, bridge}; } ask=m; qIdx=0; answersAcc={}; sel={}; mode='decide'; setTab(); pickOpen=false; renderSessions(); renderStatus(); render(); flash(); break;
     case 'ask_cancel': if(concernsFocus(m,bridge)){ ask=null; render(); } break;
     case 'hud': if(concernsFocus(m,bridge)){ hud=m; if(mode==='decide' && voiceState==='idle') render(); } break;
     case 'transcript': if(voiceState==='wait' && m.id===voiceId){ voiceState='confirm'; voiceText=m.text||''; render(); } break;
@@ -466,16 +482,49 @@ function bridgeGone(bridge){
   renderSessions(); renderStatus(); render(); renderPairing(); renderTrustList();
 }
 function focusedTitle(){ const s=focus && sessions.find(x=>x.bridge===focus.bridge && x.sid===focus.sid); return s?s.title:'—'; }
-function renderSessions(){ const sb=document.getElementById('sessbar'); sb.innerHTML='';
-  if(sessions.length<=1){ return; }
-  sessions.forEach(s=>{ const c=document.createElement('div');
-    const isFoc = focus && s.bridge===focus.bridge && s.sid===focus.sid;
-    c.className='chip'+(isFoc?' focus':'')+(s.needs?' needs':'');
+// One selector bar (focused session + count + "elsewhere needs you" badge); tap -> dropdown picker.
+// Mirrors the firmware: the bar updates in place, only the dropdown lists every session.
+let pickOpen=false;
+function renderSessions(){ const sb=document.getElementById('sessbar');
+  const prevPick=sb.querySelector('.sesspick');
+  const prevScroll=prevPick?prevPick.scrollTop:null;   // null = picker wasn't in the DOM (this is a fresh open)
+  sb.innerHTML='';
+  if(!sessions.length){ pickOpen=false; return; }
+  const foc = focus && sessions.find(s=>s.bridge===focus.bridge && s.sid===focus.sid);
+  const needsElsewhere = sessions.filter(s=>s!==foc && s.needs).length;
+  const btn=document.createElement('div');
+  btn.className='sessbtn'+(needsElsewhere?' needs':(foc?' focus':''));
+  const t=document.createElement('span'); t.className='t'+(foc?'':' dim'); t.textContent=foc?foc.title:'tap to select';
+  btn.appendChild(t);
+  if(needsElsewhere){ const b=document.createElement('span'); b.className='badge'; b.textContent='🔔'+needsElsewhere; btn.appendChild(b); }
+  const n=document.createElement('span'); n.className='n'; n.textContent=sessions.length+' ▾';
+  btn.appendChild(n);
+  btn.onclick=()=>{ pickOpen=!pickOpen; renderSessions(); };
+  sb.appendChild(btn);
+  if(!pickOpen) return;
+  const pick=document.createElement('div'); pick.className='sesspick';
+  sessions.forEach(s=>{
+    const isFoc = s===foc;
     const clash = sessions.some(o=>o!==s && o.bridge!==s.bridge && o.title===s.title);
-    c.innerHTML = s.title + (clash && hosts[s.bridge] ? `<span class="host">@${hosts[s.bridge]}</span>` : '');
-    c.title=`${s.sid} @ bridge ${s.bridge}`;
-    c.onclick=()=>{ focus={sid:s.sid, bridge:s.bridge}; feed=[]; sendSecureTo(s.bridge,{type:'focus', sid:s.sid}); renderSessions(); renderStatus(); if(mode==='decide') render(); };
-    sb.appendChild(c); }); }
+    const r=document.createElement('div');
+    r.className='pickrow'+(isFoc?' focus':'')+(s.needs?' needs':'');
+    const ic=document.createElement('span'); ic.className='ic'; ic.textContent=s.needs?'🔔':(isFoc?'›':'');
+    const tt=document.createElement('span'); tt.className='t'; tt.textContent=s.title;
+    if(clash && hosts[s.bridge]){ const h=document.createElement('span'); h.className='host'; h.textContent='@'+hosts[s.bridge]; tt.appendChild(h); }
+    r.append(ic,tt);
+    r.title=`${s.sid} @ bridge ${s.bridge}`;
+    r.onclick=(ev)=>{ ev.stopPropagation(); pickOpen=false;
+      focus={sid:s.sid, bridge:s.bridge}; feed=[]; sendSecureTo(s.bridge,{type:'focus', sid:s.sid});
+      renderSessions(); renderStatus(); if(mode==='decide') render(); };
+    pick.appendChild(r);
+  });
+  sb.appendChild(pick);
+  if(prevScroll!=null){ pick.scrollTop=prevScroll; }   // live rebuild: keep the user's scroll position
+  else{ // fresh open: land on the first OTHER session that needs you, else the focused one (mirrors firmware)
+    const tgt=pick.querySelector('.pickrow.needs:not(.focus)')||pick.querySelector('.pickrow.focus');
+    if(tgt) pick.scrollTop=Math.max(0, tgt.offsetTop-8);
+  }
+}
 function renderStatus(){ document.getElementById('dot').className='dot '+(state.state||'idle');
   document.getElementById('titletxt').textContent=focusedTitle();
   document.getElementById('statetxt').textContent=(state.text||state.state||''); }

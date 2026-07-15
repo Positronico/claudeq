@@ -86,17 +86,25 @@ additive, not exclusive: mDNS and tailnet discovery keep connecting to every oth
 
 ## Multi-session model
 Each bridge tracks every live Claude Code session on its machine (keyed by `session_id`), each with a
-tmux target, project `title`, status, an optional pending question, and an attention flag. The deck
-**merges sessions from all connected bridges** into one chip strip and remembers which single session is
-**focused** (and on which bridge). Status/HUD/ask messages a bridge pushes are for *its* focused session;
-the deck displays only the ones matching its globally-focused session. Macros and voice inject into the
-focused session's tmux target on its bridge. A question auto-focuses the session that asked, on any bridge.
+tmux target, `title`, status, an optional pending question, and an attention flag. The `title` is
+**Claude Code's own session name** — read from its per-process registry `~/.claude/sessions/<pid>.json`
+(matched by `sessionId`, freshest `updatedAt` wins), so the deck shows the same name the user sees
+locally and follows `/rename` live (idle sessions are re-checked on the bridge's periodic sweep). The
+registry is an internal Claude Code file (not a documented API), so two fallbacks stand behind it: the
+`session_title` field of the SessionStart hook payload, then the launcher's project-folder title
+(`CLAUDEQ_TITLE`). The deck
+**merges sessions from all connected bridges** into one session picker and remembers which single session
+is **focused** (and on which bridge): a selector bar shows the focused session (plus a count and an
+"another session needs you" bell badge); tapping it opens a full-screen picker listing every session.
+Status/HUD/ask messages a bridge pushes are for *its* focused session; the deck displays only the ones
+matching its globally-focused session. Macros and voice inject into the focused session's tmux target on
+its bridge. A question auto-focuses the session that asked, on any bridge.
 
 ## Bridge → Device
 | type | fields | meaning |
 |---|---|---|
 | `hello_ack` | `bridge_id`, `host`, `fw`, `paired` | Always sent in reply to `hello`, on any connection regardless of trust — identity only, no session data. `paired` tells the device whether to automatically start the auth handshake. |
-| `sessions` | `list[]` = `{sid, title, needs}`, `focus` (sid), `host`, `bridge_id` | Session chips + which is focused + the bridge's machine name + a stable per-process id. `needs` = pending question/attention. The deck shows `host` on a chip only when that title also exists on another bridge (a cross-machine clash). `bridge_id` lets the deck recognize that the same bridge reached via the LAN *and* the tailnet (two different IPs) is one machine, and show its sessions once (keeping both connections, preferring the LAN path, failing over instantly if it drops). Override with `CCDECK_HOST` / `CCDECK_BRIDGE_ID`. Only sent post-authentication (wrapped in `sec`), but `bridge_id` is learned earlier from `hello_ack` so dedup works before any session data arrives. |
+| `sessions` | `list[]` = `{sid, title, needs}`, `focus` (sid), `host`, `bridge_id` | The session list + which is focused + the bridge's machine name + a stable per-process id. `title` is Claude Code's session name (see "Multi-session model"), deck-safe and byte-clipped (≤39 UTF-8 bytes, cut at a code-point boundary) to fit the deck's fixed title buffer. `needs` = pending question/attention. The deck shows `host` on a picker row only when that title also exists on another bridge (a cross-machine clash). `bridge_id` lets the deck recognize that the same bridge reached via the LAN *and* the tailnet (two different IPs) is one machine, and show its sessions once (keeping both connections, preferring the LAN path, failing over instantly if it drops). Override with `CCDECK_HOST` / `CCDECK_BRIDGE_ID`. Only sent post-authentication (wrapped in `sec`), but `bridge_id` is learned earlier from `hello_ack` so dedup works before any session data arrives. |
 | `status` | `sid`, `state` (`idle`/`thinking`/`working`/`waiting`/`done`/`error`), `text`, `tool` | Live state of the focused session for the status strip |
 | `ask` | `id`, `sid`, `questions[]` = `{question, header, multiSelect, options[]:{label,description}}` | A question to render; user taps to choose. Sent **after** the `sessions` message that focuses `sid` |
 | `ask_cancel` | `sid`, `id?`, `reason` | Question resolved/cancelled (or focus moved to a session with no pending question) — clear it |
@@ -124,7 +132,9 @@ Every hook carries `session_id` + `cwd` (from Claude Code). The `claudeq` launch
 exports `CLAUDEQ_TMUX` (the tmux target) and `CLAUDEQ_TITLE` (project name); the hooks forward
 those — `event.sh` via `x-claudeq-tmux` / `x-claudeq-title` headers, `askquestion.mjs` in the
 `/ask` body's `session` object. The first event from a session registers it; a `tmux has-session`
-sweep prunes it when its pane is gone.
+sweep prunes it when its pane is gone. The display `title` is then resolved from Claude Code's
+session registry (`~/.claude/sessions/`, see "Multi-session model"); `CLAUDEQ_TITLE` is only the
+fallback.
 
 The hook commands in `ccdeck-settings.json` locate their scripts via **`$CLAUDEQ_HOME`**, which the
 `claudeq` launcher exports (pointing at the bridge install dir). Running `claude --settings

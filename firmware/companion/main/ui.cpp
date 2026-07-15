@@ -1,5 +1,6 @@
 // Claudeq UI (LVGL 8.4, native portrait 172x640).
-// Top: status strip + session chip row. Body: Session / Macros / (mic action) / Settings bottom-nav.
+// Top: status strip + session selector bar (tap -> full-screen session picker).
+// Body: Session / Macros / (mic action) / Settings bottom-nav.
 #include <string.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -44,18 +45,18 @@ static lv_obj_t *s_ts_dots[4] = {0};                     // the 4 "lit" dots of 
 static lv_obj_t *s_botbar = NULL;                         // bottom status strip (dot + state text) above the nav
 static lv_obj_t *s_bat_body = NULL, *s_bat_fill = NULL;   // drawn battery gauge
 #define BAT_FILL_MAX 18                                   // inner fill width at 100% (px) — spans the body inner width
-// sessions (chip strip) — aggregated across every connected bridge
+// sessions (selector bar + picker) — aggregated across every connected bridge
 static lv_obj_t *s_sessbar;
 #define MAX_SESS 24      // headroom for several bridges (MAX_BRIDGES) x several sessions each
 static char sess_sid[MAX_SESS][48];
-static char sess_title[MAX_SESS][24];
+static char sess_title[MAX_SESS][40];   // fits Claude Code's session names (bridge clips at 36 + ellipsis)
 static bool sess_needs[MAX_SESS];
 static int  sess_bridge[MAX_SESS];   // which bridge connection owns each session
 static int  sess_n = 0;
 static char focus_sid[48];
 static int  focus_bridge = -1;       // the focused session lives on this bridge
 // MAX_BRIDGES is defined in app.h (shared with net.cpp)
-static char bridge_host[MAX_BRIDGES][24];  // machine name per bridge (shown on a chip only on a title clash)
+static char bridge_host[MAX_BRIDGES][24];  // machine name per bridge (shown in the picker only on a title clash)
 // pages + bottom nav grid. Nav index 2 (Voice) is an ACTION button (starts listening), not a page.
 static lv_obj_t *t_decide, *t_macros, *t_settings;
 static lv_obj_t *nav_btns[4], *nav_icons[4], *nav_lbls[4];
@@ -109,9 +110,10 @@ static void style_switch(lv_obj_t *sw) {
     lv_obj_set_style_bg_color(sw, lv_color_hex(COL_OK), LV_PART_INDICATOR | LV_STATE_CHECKED);
     lv_obj_set_style_bg_color(sw, lv_color_hex(COL_INK), LV_PART_KNOB);
 }
-// Forward decl: a filled-dot icon primitive, defined further down (near make_page) but also needed by
-// the Paired Bridges screen, defined earlier in the file (in the Settings-callbacks section).
+// Forward decls: icon/container primitives, defined further down (near make_page) but also needed by
+// the Paired Bridges screen and the session picker, defined earlier in the file.
 static lv_obj_t *mkdot(lv_obj_t *parent, int d, uint32_t color);
+static lv_obj_t *mkcell(lv_obj_t *parent, int w, int h);
 
 // ---------- decide (supports multi-question asks) ----------
 static void opt_clicked(lv_event_t *e);
@@ -523,10 +525,24 @@ static void show_hud(cJSON *root) {
     lv_label_set_text(hud_line, buf);
 }
 
-// ---------- sessions (chip strip, aggregated across bridges) ----------
-static void render_chips(void);
+// ---------- sessions (selector bar + full-screen picker, aggregated across bridges) ----------
+// The old horizontally-scrolling chip strip is gone: it was destroyed and rebuilt on every sessions
+// broadcast (every prompt/stop/notification), which reset its scroll position mid-swipe, and small
+// content-sized chips were hard targets. The bar now shows only the FOCUSED session (plus a count
+// and an "elsewhere needs you" badge); tapping it opens a full-screen vertical picker where every
+// session is a big tappable row. The bar itself never scrolls, so refreshes can't fight the user.
+static void render_session_bar(void);
+static void sesspick_rebuild(void);
 
-static void chip_clicked(lv_event_t *e) {
+static lv_obj_t *s_sess_title = NULL, *s_sess_badge = NULL, *s_sess_count = NULL;
+static lv_obj_t *s_sesspick_ov = NULL, *s_sesspick_list = NULL;
+
+static void sesspick_close(void) {
+    if (s_sesspick_ov) { lv_obj_del(s_sesspick_ov); s_sesspick_ov = NULL; s_sesspick_list = NULL; }
+}
+static void sesspick_close_cb(lv_event_t *e) { (void)e; sesspick_close(); }
+
+static void sesspick_row_cb(lv_event_t *e) {
     if (s_vstate == VOICE_REC) return;   // don't move focus mid-capture (mic PCM routes to the focus bridge)
     int idx = (int)(intptr_t)lv_event_get_user_data(e);
     if (idx < 0 || idx >= sess_n || !sess_sid[idx][0]) return;
@@ -538,39 +554,134 @@ static void chip_clicked(lv_event_t *e) {
     if (s) { net_send_to(focus_bridge, s); ESP_LOGI(TAG, "focus -> b%d %s", focus_bridge, sess_sid[idx]); cJSON_free(s); }
     cJSON_Delete(m);
     if (!s_ask) show_idle_view();   // feed was cleared by set_local_focus; its bridge will resend it
-    render_chips();
+    sesspick_close();
+    render_session_bar();
 }
 
-static void render_chips(void) {
-    lv_obj_clean(s_sessbar);
+// Rebuild the picker rows from the sess_* arrays, keeping the user's scroll position — the list
+// refreshes live while open (sessions broadcasts arrive on every prompt/stop/notification).
+static void sesspick_rebuild(void) {
+    if (!s_sesspick_list) return;
+    lv_coord_t sy = lv_obj_get_scroll_y(s_sesspick_list);
+    lv_obj_clean(s_sesspick_list);
     for (int i = 0; i < sess_n; i++) {
         bool focused = focus_sid[0] && sess_bridge[i] == focus_bridge && !strcmp(sess_sid[i], focus_sid);
-        uint32_t border = focused ? COL_ACCENT : (sess_needs[i] ? COL_WARN : COL_LINE);
-        uint32_t fg     = focused ? COL_INK    : (sess_needs[i] ? COL_WARN : COL_DIM);
         // only label the machine when this title also exists on a *different* bridge (a real clash)
         bool clash = false;
         for (int j = 0; j < sess_n; j++)
             if (j != i && sess_bridge[j] != sess_bridge[i] && !strcmp(sess_title[j], sess_title[i])) { clash = true; break; }
-        lv_obj_t *chip = lv_obj_create(s_sessbar);
-        lv_obj_set_size(chip, LV_SIZE_CONTENT, 34);
-        lv_obj_set_style_bg_color(chip, lv_color_hex(focused ? 0x2a1c12 : COL_PANEL), 0);
-        lv_obj_set_style_border_color(chip, lv_color_hex(border), 0);
-        lv_obj_set_style_border_width(chip, focused ? 2 : 1, 0);
-        lv_obj_set_style_radius(chip, 16, 0);
-        lv_obj_set_style_pad_hor(chip, 14, 0);
-        lv_obj_set_style_pad_ver(chip, 0, 0);
-        lv_obj_set_style_pad_column(chip, 5, 0);
-        lv_obj_clear_flag(chip, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_add_flag(chip, LV_OBJ_FLAG_CLICKABLE);
-        lv_obj_add_event_cb(chip, chip_clicked, LV_EVENT_CLICKED, (void *)(intptr_t)i);
-        lv_obj_set_flex_flow(chip, LV_FLEX_FLOW_ROW);
-        lv_obj_set_flex_align(chip, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-        mklabel(chip, sess_title[i], &lv_font_montserrat_16, fg);
+        lv_obj_t *row = lv_obj_create(s_sesspick_list);
+        lv_obj_set_size(row, LV_PCT(100), LV_SIZE_CONTENT);
+        style_card(row);
+        lv_obj_set_style_bg_color(row, lv_color_hex(focused ? 0x2a1c12 : COL_PANEL), 0);
+        lv_obj_set_style_border_color(row, lv_color_hex(focused ? COL_ACCENT : (sess_needs[i] ? COL_WARN : COL_LINE)), 0);
+        lv_obj_set_style_border_width(row, focused ? 2 : 1, 0);
+        lv_obj_set_style_pad_all(row, 8, 0);
+        lv_obj_set_style_pad_column(row, 6, 0);
+        lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(row, sesspick_row_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+        lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        // status glyph: bell = needs you, chevron = the focused session, blank spacer otherwise
+        lv_obj_t *ic = mklabel(row, sess_needs[i] ? LV_SYMBOL_BELL : (focused ? LV_SYMBOL_RIGHT : " "),
+                               &lv_font_montserrat_16, sess_needs[i] ? COL_WARN : COL_ACCENT);
+        lv_obj_set_width(ic, 18);
+        lv_obj_t *tc = mkcell(row, 106, LV_SIZE_CONTENT);   // text column: title + optional @machine
+        lv_obj_set_flex_flow(tc, LV_FLEX_FLOW_COLUMN);
+        lv_obj_t *tl = mklabel(tc, sess_title[i], &lv_font_montserrat_16, sess_needs[i] && !focused ? COL_WARN : COL_INK);
+        lv_label_set_long_mode(tl, LV_LABEL_LONG_WRAP);
+        lv_obj_set_width(tl, LV_PCT(100));
         if (clash && bridge_host[sess_bridge[i]][0]) {
             char hb[26]; snprintf(hb, sizeof(hb), "@%s", bridge_host[sess_bridge[i]]);
-            mklabel(chip, hb, &lv_font_montserrat_12, COL_DIM);
+            mklabel(tc, hb, &lv_font_montserrat_12, COL_DIM);
         }
     }
+    if (sess_n == 0) {
+        lv_obj_t *ph = mklabel(s_sesspick_list, "No sessions.\nRun 'claudeq' in a\nterminal to start one.", &lv_font_montserrat_12, COL_DIM);
+        lv_label_set_long_mode(ph, LV_LABEL_LONG_WRAP);
+        lv_obj_set_width(ph, 148);
+    }
+    lv_obj_scroll_to_y(s_sesspick_list, sy, LV_ANIM_OFF);
+}
+
+static void sesspick_open(void) {
+    sesspick_close();
+    lv_obj_t *ov = lv_obj_create(lv_layer_top());
+    s_sesspick_ov = ov;
+    lv_obj_set_size(ov, SCR_W, 640);
+    lv_obj_align(ov, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_bg_color(ov, lv_color_hex(COL_BG), 0);
+    lv_obj_set_style_border_width(ov, 0, 0);
+    lv_obj_set_style_radius(ov, 0, 0);
+    lv_obj_set_style_pad_all(ov, 10, 0);
+    lv_obj_clear_flag(ov, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(ov, LV_OBJ_FLAG_CLICKABLE);   // eat taps so they don't fall through to the nav below
+
+    lv_obj_t *tl = mklabel(ov, "Sessions", &lv_font_montserrat_16, COL_ACCENT);
+    lv_obj_align(tl, LV_ALIGN_TOP_MID, 0, 4);
+
+    lv_obj_t *list = lv_obj_create(ov);
+    s_sesspick_list = list;
+    lv_obj_set_size(list, 152, 540);
+    lv_obj_align(list, LV_ALIGN_TOP_MID, 0, 30);
+    lv_obj_set_style_bg_opa(list, LV_OPA_0, 0);
+    lv_obj_set_style_border_width(list, 0, 0);
+    lv_obj_set_style_pad_all(list, 0, 0);
+    lv_obj_set_style_pad_gap(list, 6, 0);
+    lv_obj_set_flex_flow(list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(list, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    lv_obj_set_scroll_dir(list, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(list, LV_SCROLLBAR_MODE_AUTO);
+
+    lv_obj_t *close = lv_obj_create(ov);
+    lv_obj_set_size(close, 148, 46); style_card(close);
+    lv_obj_add_flag(close, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(close, sesspick_close_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_align(close, LV_ALIGN_BOTTOM_MID, 0, -6);
+    lv_obj_center(mklabel(close, "Close", &lv_font_montserrat_16, COL_INK));
+
+    sesspick_rebuild();
+    // Land the eye where it matters: the first OTHER session calling for attention (the focused one's
+    // question is already on the Session page — the picker exists to switch away), else the focused one.
+    int target = -1;
+    for (int i = 0; i < sess_n && target < 0; i++) {
+        bool focused = focus_sid[0] && sess_bridge[i] == focus_bridge && !strcmp(sess_sid[i], focus_sid);
+        if (sess_needs[i] && !focused) target = i;
+    }
+    for (int i = 0; i < sess_n && target < 0; i++)
+        if (focus_sid[0] && sess_bridge[i] == focus_bridge && !strcmp(sess_sid[i], focus_sid)) target = i;
+    if (target >= 0) {
+        lv_obj_t *row = lv_obj_get_child(list, target);
+        if (row) lv_obj_scroll_to_view(row, LV_ANIM_OFF);
+    }
+}
+static void sessbar_cb(lv_event_t *e) { (void)e; if (s_sesspick_ov) sesspick_close(); else sesspick_open(); }
+
+// Refresh the selector bar: focused title, session count, "N other sessions need you" bell badge.
+// Labels update in place — nothing is rebuilt and nothing scrolls.
+static void render_session_bar(void) {
+    if (!s_sess_title) return;
+    const char *title = NULL;
+    int needs_elsewhere = 0;
+    for (int i = 0; i < sess_n; i++) {
+        bool focused = focus_sid[0] && sess_bridge[i] == focus_bridge && !strcmp(sess_sid[i], focus_sid);
+        if (focused) title = sess_title[i];
+        else if (sess_needs[i]) needs_elsewhere++;
+    }
+    lv_label_set_text(s_sess_title, title ? title : (sess_n > 0 ? "tap to select" : "no session"));
+    lv_obj_set_style_text_color(s_sess_title, lv_color_hex(title ? COL_INK : COL_DIM), 0);
+    char b[20];
+    snprintf(b, sizeof(b), "%d", sess_n);
+    lv_label_set_text(s_sess_count, b);
+    if (needs_elsewhere > 0) {
+        snprintf(b, sizeof(b), LV_SYMBOL_BELL "%d", needs_elsewhere);
+        lv_label_set_text(s_sess_badge, b);
+        lv_obj_clear_flag(s_sess_badge, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(s_sess_badge, LV_OBJ_FLAG_HIDDEN);
+    }
+    lv_obj_set_style_border_color(s_sessbar, lv_color_hex(needs_elsewhere > 0 ? COL_WARN : (title ? COL_ACCENT : COL_LINE)), 0);
+    if (s_sesspick_ov) sesspick_rebuild();
 }
 
 // drop the rows belonging to `bridge`, compacting the flat arrays in place
@@ -626,7 +737,7 @@ static void show_sessions(cJSON *root, int bridge) {
     }
     if (!focus_sid[0] && sess_n > 0)     // no focus yet -> adopt the first session
         set_local_focus(sess_sid[0], sess_bridge[0]);
-    render_chips();
+    render_session_bar();
 }
 
 void ui_bridge_gone(int bridge) {
@@ -634,7 +745,7 @@ void ui_bridge_gone(int bridge) {
     if (s_vstate != VOICE_IDLE && bridge == s_voice_bridge) voice_reset();   // capture's bridge vanished
     drop_bridge_sessions(bridge);
     if (focus_bridge == bridge) { set_local_focus(NULL, -1); clear_ask(); }
-    render_chips();
+    render_session_bar();
     ui_unlock();
 }
 
@@ -695,7 +806,8 @@ void ui_handle_message(cJSON *root, int bridge) {
         cJSON *sid = cJSON_GetObjectItem(root, "sid");
         if (cJSON_IsString(sid))             // a question pulls focus to its session, on whichever bridge
             set_local_focus(sid->valuestring, bridge);   // clears stale feed; bridge resends snapshot after the ask
-        show_ask(root); set_state("waiting", "tap to choose"); render_chips();
+        sesspick_close();                    // the question renders on the Session page — don't hide it under the picker
+        show_ask(root); set_state("waiting", "tap to choose"); render_session_bar();
         app_wake_for_event();                // a question needs you -> wake the screen from standby
     } else if (!strcmp(t, "ask_cancel")) {
         if (concerns_focus(root, bridge)) clear_ask();
@@ -1210,10 +1322,10 @@ static void ui_show_paired_bridges(void) {
 }
 static void pb_open_cb(lv_event_t *e) { (void)e; ui_show_paired_bridges(); }
 
-// A full-screen content page in the area between the chip strip and the bottom status strip.
+// A full-screen content page in the area between the session selector bar and the bottom status strip.
 static lv_obj_t *make_page(lv_obj_t *parent) {
     lv_obj_t *p = lv_obj_create(parent);
-    lv_obj_set_size(p, SCR_W, 406);   // chip strip ends at 74; bottom status strip starts at 480
+    lv_obj_set_size(p, SCR_W, 406);   // selector bar's band ends at 74; bottom status strip starts at 480
     lv_obj_align(p, LV_ALIGN_TOP_MID, 0, 74);
     lv_obj_set_style_bg_color(p, lv_color_hex(COL_BG), 0);
     lv_obj_set_style_border_width(p, 0, 0);
@@ -1228,6 +1340,9 @@ static lv_obj_t *make_page(lv_obj_t *parent) {
 }
 
 // A transparent, borderless, non-scrollable container — used as an evenly-spaced top-bar cell.
+// NOT clickable: plain lv_objs are clickable by default in LVGL 8, and a decoration/container that
+// intercepts taps steals them from the clickable ancestor that actually has the event callback
+// (labels don't have this problem — lv_label clears CLICKABLE itself).
 static lv_obj_t *mkcell(lv_obj_t *parent, int w, int h) {
     lv_obj_t *c = lv_obj_create(parent);
     lv_obj_set_size(c, w, h);
@@ -1236,10 +1351,11 @@ static lv_obj_t *mkcell(lv_obj_t *parent, int w, int h) {
     lv_obj_set_style_radius(c, 0, 0);
     lv_obj_set_style_pad_all(c, 0, 0);
     lv_obj_clear_flag(c, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(c, LV_OBJ_FLAG_CLICKABLE);
     return c;
 }
 
-// A small solid rectangle (icon primitive).
+// A small solid rectangle (icon primitive). Not clickable, same reason as mkcell.
 static lv_obj_t *mkrect(lv_obj_t *parent, int w, int h, uint32_t color) {
     lv_obj_t *r = lv_obj_create(parent);
     lv_obj_set_size(r, w, h);
@@ -1248,6 +1364,7 @@ static lv_obj_t *mkrect(lv_obj_t *parent, int w, int h, uint32_t color) {
     lv_obj_set_style_border_width(r, 0, 0);
     lv_obj_set_style_pad_all(r, 0, 0);
     lv_obj_clear_flag(r, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(r, LV_OBJ_FLAG_CLICKABLE);
     return r;
 }
 
@@ -1401,18 +1518,30 @@ void ui_init(void) {
     lv_label_set_long_mode(s_state, LV_LABEL_LONG_DOT);
     lv_obj_align(s_state, LV_ALIGN_LEFT_MID, 16, 0);
 
-    // --- session chip strip (bigger, horizontally scrollable) ---
+    // --- session selector bar: the focused session + count + attention badge; tap -> picker ---
     s_sessbar = lv_obj_create(scr);
-    lv_obj_set_size(s_sessbar, SCR_W, 44);
-    lv_obj_align(s_sessbar, LV_ALIGN_TOP_MID, 0, 30);
-    lv_obj_set_style_bg_color(s_sessbar, lv_color_hex(COL_BG), 0);
-    lv_obj_set_style_border_width(s_sessbar, 0, 0);
-    lv_obj_set_style_pad_all(s_sessbar, 5, 0);
-    lv_obj_set_style_pad_gap(s_sessbar, 5, 0);
+    lv_obj_set_size(s_sessbar, SCR_W - 10, 34);
+    lv_obj_align(s_sessbar, LV_ALIGN_TOP_MID, 0, 35);   // centered in the 30..74 band the chip strip used
+    style_card(s_sessbar);
+    lv_obj_set_style_radius(s_sessbar, 16, 0);
+    lv_obj_set_style_pad_hor(s_sessbar, 12, 0);
+    lv_obj_set_style_pad_ver(s_sessbar, 0, 0);
+    lv_obj_set_style_pad_column(s_sessbar, 6, 0);
+    lv_obj_add_flag(s_sessbar, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(s_sessbar, sessbar_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_set_flex_flow(s_sessbar, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(s_sessbar, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_scroll_dir(s_sessbar, LV_DIR_HOR);
-    lv_obj_set_scrollbar_mode(s_sessbar, LV_SCROLLBAR_MODE_OFF);
+    s_sess_title = mklabel(s_sessbar, "no session", &lv_font_montserrat_16, COL_DIM);
+    lv_label_set_long_mode(s_sess_title, LV_LABEL_LONG_DOT);
+    lv_obj_set_flex_grow(s_sess_title, 1);              // take whatever the badge/count/chevron leave over
+    s_sess_badge = mklabel(s_sessbar, LV_SYMBOL_BELL "0", &lv_font_montserrat_12, COL_WARN);
+    lv_obj_add_flag(s_sess_badge, LV_OBJ_FLAG_HIDDEN);
+    s_sess_count = mklabel(s_sessbar, "0", &lv_font_montserrat_12, COL_DIM);
+    // drawn "open me" chevron — the deck font has no chevron-down glyph, so stack three narrowing bars
+    lv_obj_t *chev = mkcell(s_sessbar, 12, 8);
+    lv_obj_align(mkrect(chev, 12, 2, COL_DIM), LV_ALIGN_TOP_MID, 0, 0);
+    lv_obj_align(mkrect(chev, 8, 2, COL_DIM), LV_ALIGN_TOP_MID, 0, 3);
+    lv_obj_align(mkrect(chev, 4, 2, COL_DIM), LV_ALIGN_TOP_MID, 0, 6);
 
     // --- content pages (one visible at a time; nav index 2 is the mic action, no page) ---
     t_decide   = make_page(scr);

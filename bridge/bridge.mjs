@@ -78,9 +78,63 @@ let focusedSid = null;
 let sessionSeq = 0;
 let macros = loadMacros();
 
+// ---------- session names from Claude Code's own registry ----------
+// Every running Claude Code process maintains ~/.claude/sessions/<pid>.json with its sessionId and
+// live session `name` — the same title shown locally in /resume and updated by /rename. Chips use
+// that name so the deck matches what the user sees in the terminal; the launcher's CLAUDEQ_TITLE
+// (project folder) stays as the fallback for CC versions without the registry. Files are keyed by
+// pid and can linger after exit, so match by sessionId and let the freshest updatedAt win.
+const CC_SESSIONS_DIR = path.join(os.homedir(), '.claude', 'sessions');
+const CC_NAMES_TTL_MS = 2000;   // events can arrive in bursts (every tool call) — cap registry reads
+let ccNamesCache = { at: 0, bySid: new Map() };
+function ccSessionNames() {
+  if (Date.now() - ccNamesCache.at < CC_NAMES_TTL_MS) return ccNamesCache.bySid;
+  const bySid = new Map();
+  let files = [];
+  try { files = fs.readdirSync(CC_SESSIONS_DIR); } catch {}
+  for (const f of files) {
+    if (!f.endsWith('.json')) continue;
+    try {
+      const d = JSON.parse(fs.readFileSync(path.join(CC_SESSIONS_DIR, f), 'utf8'));
+      if (!d.sessionId || !d.name) continue;
+      const prev = bySid.get(d.sessionId);
+      if (!prev || (d.updatedAt || 0) > prev.updatedAt) bySid.set(d.sessionId, { name: String(d.name), updatedAt: d.updatedAt || 0 });
+    } catch {}
+  }
+  // Claude Code rewrites these files IN PLACE (truncate+write, no rename), so a read can catch a
+  // torn/empty file mid-write. Keep the previous resolution for any tracked sid missing from this
+  // scan instead of flapping to the fallback title and back (two spurious broadcasts).
+  for (const [sid, v] of ccNamesCache.bySid) if (!bySid.has(sid) && sessions.has(sid)) bySid.set(sid, v);
+  ccNamesCache = { at: Date.now(), bySid };
+  return bySid;
+}
+// The chip title for a session: Claude Code's live session name (registry), else the SessionStart
+// hook's session_title, else the launcher's project title. Pure — never mutates session state.
+function sessionTitle(s) {
+  const cc = ccSessionNames().get(s.sid);
+  return (cc && cc.name) || s.hookTitle || s.title;
+}
+// Re-resolve every session's name; true if any chip title changed (caller broadcasts). This is the
+// ONLY place shownTitle (the acknowledged-as-broadcast name) may be written: call it ONLY from paths
+// that broadcast on change (touchSession, sweepSessions) — a non-broadcasting caller would consume
+// the pending change and the rename would never reach the deck.
+function refreshTitles() {
+  let changed = false;
+  for (const s of sessions.values()) {
+    const t = sessionTitle(s);
+    if (t !== s.shownTitle) {
+      if (s.shownTitle != null) console.log(`[session] title: ${s.shownTitle} -> ${t}`);
+      s.shownTitle = t; changed = true;
+    }
+  }
+  return changed;
+}
+
 function newSession(sid) {
   return {
     sid, seq: ++sessionSeq, tmux: DEFAULT_TMUX, title: 'session', cwd: null,
+    hookTitle: null,                       // session_title from the SessionStart hook payload, if any
+    shownTitle: null,                      // last title broadcast to the deck (registry name or fallback)
     state: 'idle', text: 'idle', tool: null, attn: false,
     hud: { model: null, elapsedMs: 0, lastTool: null, todos: [], cwd: null },
     feed: [],                              // recent activity lines (for the "follow along" screen)
@@ -99,7 +153,8 @@ function touchSession(meta) {
   if (meta.title) s.title = meta.title;
   if (meta.cwd) { s.cwd = meta.cwd; s.hud.cwd = meta.cwd; }
   s.lastSeen = Date.now();
-  if (isNew) { if (!focusedSid) focusedSid = sid; broadcastSessions(); }
+  if (isNew) { s.shownTitle = sessionTitle(s); if (!focusedSid) focusedSid = sid; broadcastSessions(); }
+  else if (refreshTitles()) broadcastSessions();   // a /rename (or auto-name) shows up on the next event
   return s;
 }
 
@@ -124,9 +179,31 @@ function broadcast(obj) {
   for (const ws of clients) sendSecure(ws, obj);
 }
 function needsAttn(s) { return !!s.pendingAsk || s.attn; }
+// UTF-8-byte-safe clip: the deck stores a title in a fixed 40-byte buffer, and deck-safe titles can
+// still be multi-byte (Latin-1, typographic punctuation) — clip by BYTES at a code-point boundary
+// (39 max, incl. the 3-byte ellipsis when clipped) so the firmware's snprintf never cuts mid-sequence.
+function clipTitleBytes(str, maxBytes = 39) {
+  if (Buffer.byteLength(str, 'utf8') <= maxBytes) return str;
+  let out = '';
+  for (const ch of str) {
+    if (Buffer.byteLength(out + ch, 'utf8') > maxBytes - 3) break;
+    out += ch;
+  }
+  return out + '…';
+}
+// The wire title: resolved, stripped to deck-font glyphs, byte-clipped — with a fallback chain so a
+// name made entirely of glyphs the deck lacks (e.g. a CJK /rename) never yields a blank row.
+function deckTitle(s) {
+  const t = clipTitleBytes(deckSafe(sessionTitle(s)).trim());
+  if (t) return t;
+  return clipTitleBytes(deckSafe(s.title).trim()) || 'session';
+}
 function sessionsList() {
+  // Titles resolve at send time (they live in CC's registry and change under us) but WITHOUT touching
+  // shownTitle — this is called from non-broadcasting paths (/health, sendSnapshot) that must not
+  // consume the pending-change flag refreshTitles() maintains for the broadcast gates.
   return [...sessions.values()].sort((a, b) => a.seq - b.seq)
-    .map((s) => ({ sid: s.sid, title: s.title, needs: needsAttn(s) }));
+    .map((s) => ({ sid: s.sid, title: deckTitle(s), needs: needsAttn(s) }));
 }
 function broadcastSessions() {
   broadcast({ type: 'sessions', list: sessionsList(), focus: focusedSid, host: SHORT_HOST, bridge_id: BRIDGE_ID });
@@ -511,6 +588,9 @@ function handleEvent(kind, ev, meta) {
   if (!s) return;                       // no session id -> can't attribute; ignore
   switch (kind) {
     case 'SessionStart': {
+      // The hook payload's session_title is a documented name source (unlike the ~/.claude/sessions
+      // registry, which is internal) — keep it as the mid-priority fallback in sessionTitle().
+      if (typeof ev.session_title === 'string' && ev.session_title.trim()) s.hookTitle = ev.session_title.trim();
       const model = ev.model || (ev.transcript_path && transcriptModel(ev.transcript_path));
       if (model) s.hud.model = model;
       s.attn = false; setSessionStatus(s, 'idle', 'ready');
@@ -558,7 +638,9 @@ function tmuxAlive(target) {
   return r.status === 0;
 }
 function sweepSessions() {
-  let changed = false;
+  // An idle session generates no hook traffic, so a /rename there would otherwise never reach the
+  // deck — pick up registry name changes on the sweep tick too.
+  let changed = refreshTitles();
   for (const [sid, s] of sessions) {
     if (Date.now() - s.lastSeen <= PRUNE_GRACE_MS) continue;
     // Keep only if it has a real, *distinct* tmux target that still exists; otherwise prune on TTL.

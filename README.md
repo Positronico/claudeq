@@ -54,16 +54,27 @@ The deck restarts and connects. Settings live on the device. To change networks 
 **Settings** tab and **hold** "WiFi portal" — or just power it up somewhere new.
 
 ### Voice (optional) — local transcription, no API key
-Download the model to the bridge's default location (works for both the `brew` and from-source installs):
+```bash
+claudeq setup-voice
+```
+That's it — it installs `whisper-cpp` (Homebrew) if needed and downloads the transcription model
+(~148 MB, one-time) to where the bridge looks by default. `claudeq` also offers this setup once on
+launch if voice isn't ready; answering `n` writes a marker so it never asks again (run
+`claudeq setup-voice` whenever you change your mind). A running bridge picks the model up
+immediately — no restart needed.
+
+<details><summary>Manual setup / non-standard paths</summary>
+
 ```bash
 brew install whisper-cpp
 mkdir -p ~/.claudeq/whisper
 curl -L -o ~/.claudeq/whisper/ggml-base.en.bin \
   https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin
 ```
-That's it — the bridge looks in `~/.claudeq/whisper/` by default (set `CCDECK_WHISPER_MODEL` only for a
+The bridge looks in `~/.claudeq/whisper/` by default (set `CCDECK_WHISPER_MODEL` only for a
 non-standard path). `whisper-cli` is found on your `PATH`; set `CCDECK_WHISPER_BIN` only if it lives
-somewhere unusual. If the bridge was already running, `claudeq restart-bridge` picks the model up.
+somewhere unusual. `CCDECK_WHISPER_URL` overrides where `setup-voice` downloads from (mirrors).
+</details>
 
 ---
 

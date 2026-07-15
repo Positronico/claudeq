@@ -42,6 +42,69 @@ bridge_start() {
   done
   return 1
 }
+# ---- voice setup: whisper-cli + the transcription model (one-time, ~148 MB) --------------------
+# Mirrors the bridge's own model resolution (bridge.mjs): env override, then the per-user state dir,
+# then a dev checkout's tools/ dir. The download lands where the bridge already looks by default, and
+# the bridge re-checks the path on every capture — a running bridge picks it up with no restart.
+WHISPER_URL="${CCDECK_WHISPER_URL:-https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin}"
+VOICE_DECLINED="$STATE_DIR/.voice-setup-declined"
+voice_model_present() {
+  if [ -n "${CCDECK_WHISPER_MODEL:-}" ]; then [ -f "$CCDECK_WHISPER_MODEL" ]; return; fi
+  [ -f "$STATE_DIR/whisper/ggml-base.en.bin" ] || [ -f "$SCRIPT_DIR/../tools/whisper-models/ggml-base.en.bin" ]
+}
+voice_cli_present() { command -v "${CCDECK_WHISPER_BIN:-whisper-cli}" >/dev/null 2>&1; }
+voice_ready() { voice_cli_present && voice_model_present; }
+# Interactive setup. Prompts before anything is installed or downloaded; safe to re-run anytime.
+setup_voice() {
+  if voice_ready; then
+    echo "claudeq: voice is ready (whisper-cli + model found)."
+    rm -f "$VOICE_DECLINED"
+    return 0
+  fi
+  if ! voice_cli_present; then
+    if command -v brew >/dev/null 2>&1; then
+      printf "claudeq: voice needs whisper-cpp. Install it with Homebrew now? [Y/n] "
+      read -r a || a="n"
+      case "$a" in
+        n*|N*) echo "claudeq: skipped. Run 'claudeq setup-voice' when you're ready."; touch "$VOICE_DECLINED"; return 1 ;;
+        *) brew install whisper-cpp || { echo "claudeq: whisper-cpp install failed." >&2; return 1; } ;;
+      esac
+    else
+      echo "claudeq: voice needs whisper.cpp — install it so 'whisper-cli' is on your PATH" >&2
+      echo "         (https://github.com/ggml-org/whisper.cpp), then run 'claudeq setup-voice'." >&2
+      return 1
+    fi
+  fi
+  if ! voice_model_present; then
+    MODEL_PATH="${CCDECK_WHISPER_MODEL:-$STATE_DIR/whisper/ggml-base.en.bin}"
+    printf "claudeq: voice needs a one-time model download (~148 MB). Download now? [Y/n] "
+    read -r a || a="n"
+    case "$a" in
+      n*|N*) echo "claudeq: skipped. Run 'claudeq setup-voice' when you're ready."; touch "$VOICE_DECLINED"; return 1 ;;
+    esac
+    mkdir -p "$(dirname "$MODEL_PATH")"
+    # download to .part then move: a half-finished file must never sit at the path the bridge checks
+    if curl -L --progress-bar -o "$MODEL_PATH.part" "$WHISPER_URL"; then
+      mv "$MODEL_PATH.part" "$MODEL_PATH"
+    else
+      rm -f "$MODEL_PATH.part"
+      echo "claudeq: model download failed — run 'claudeq setup-voice' to retry." >&2
+      return 1
+    fi
+  fi
+  rm -f "$VOICE_DECLINED"
+  echo "claudeq: voice is ready — tap the mic on the deck and speak."
+  return 0
+}
+# The gentle launch-time nudge: only in an interactive terminal, only until the user says no once.
+offer_voice_setup() {
+  [ -t 0 ] && [ -t 1 ] || return 0        # never prompt from scripts/launchd
+  voice_ready && return 0
+  [ -f "$VOICE_DECLINED" ] && return 0    # they said no before — 'claudeq setup-voice' re-enables
+  echo "claudeq: the deck's Voice feature isn't set up on this machine yet."
+  setup_voice || true
+}
+
 # After a `brew upgrade`, a bridge from the DELETED old keg can keep running (and serving /health)
 # indefinitely — every new claudeq invocation would silently keep using stale bridge code. Compare the
 # running bridge's version against this install's and bounce it on mismatch.
@@ -72,6 +135,7 @@ Usage:
   claudeq devices [list]             list paired devices + their live connection status
   claudeq devices disconnect <id>    drop a device's live connection (trust kept — it re-authenticates)
   claudeq devices forget <id>        revoke a device's pairing (needs a fresh pairing afterward)
+  claudeq setup-voice                set up voice dictation (installs whisper-cpp + the model, ~148 MB)
   claudeq start-bridge               start the bridge if it isn't running (alias: start)
   claudeq stop-bridge                stop the bridge if it's running (alias: stop)
   claudeq restart-bridge             stop + start, to pick up edited bridge code (alias: restart)
@@ -100,6 +164,13 @@ fi
 # ---- `claudeq pair` / `claudeq devices ...` — pairing + trust management, see docs/PROTOCOL.md ----
 if [ "${1:-}" = "pair" ] || [ "${1:-}" = "devices" ]; then
   exec node "$SCRIPT_DIR/cli-admin.mjs" "$@"
+fi
+
+# ---- `claudeq setup-voice` — one-time voice dictation setup (whisper-cpp + model) ----
+if [ "${1:-}" = "setup-voice" ]; then
+  mkdir -p "$STATE_DIR"
+  setup_voice
+  exit $?
 fi
 
 # ---- `claudeq start-bridge` — start the bridge only, no Claude session (alias: start) ----
@@ -164,6 +235,9 @@ if ! bridge_is_up "$PORT"; then
 else
   bridge_ensure_current "$PORT" || echo "claudeq: bridge restart failed — see $LOG_FILE" >&2
 fi
+
+# ---- 1b. one-time offer: set up voice dictation (skipped silently once declined, or non-interactive) ----
+offer_voice_setup
 
 # ---- 2. project title + tmux target ----
 TITLE="$(basename "$PWD" | tr -cd '[:alnum:]._ -' | cut -c1-24)"

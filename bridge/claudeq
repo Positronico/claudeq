@@ -15,6 +15,55 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SETTINGS="$SCRIPT_DIR/ccdeck-settings.json"
 
+# ---- shared bridge start/stop helpers — used by start-bridge/stop-bridge/restart-bridge below AND
+# the default launch path's own "make sure it's up" step, so there's one place that knows how. ----
+bridge_is_up() { curl -fsS -m 1 "http://127.0.0.1:${1}/health" >/dev/null 2>&1; }
+bridge_stop() {
+  local port="$1"
+  lsof -ti tcp:"$port" 2>/dev/null | xargs kill 2>/dev/null || true   # kill whatever holds the port
+  pkill -f "$SCRIPT_DIR/bridge.mjs" 2>/dev/null || true               # and any launcher-started copy
+}
+bridge_start() {
+  local port="$1"
+  # Append (not truncate): if two launchers race to start the bridge, the loser exits on
+  # EADDRINUSE (harmless, one wins) and must not clobber the winner's startup log.
+  CCDECK_PORT="$port" nohup node "$SCRIPT_DIR/bridge.mjs" >>"$SCRIPT_DIR/bridge.log" 2>&1 &
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    bridge_is_up "$port" && return 0
+    sleep 0.3
+  done
+  return 1
+}
+
+# ---- `claudeq help` / `-h` / `--help` — claudeq's OWN usage, never falls through to `claude` ----
+# Any other first argument not matched below is passed straight through to `claude` (see the bottom
+# of this script), so `claudeq --continue`/`claudeq -p "..."`/etc. all still work as before — only
+# these reserved keywords are claudeq's own namespace, kept small and deliberate on purpose.
+if [ "${1:-}" = "help" ] || [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
+  cat <<'USAGE'
+claudeq — run Claude Code wired to the Claudeq deck
+
+Usage:
+  claudeq                            launch Claude Code here, wired to the deck (default)
+  claudeq flash [port]               write firmware to the device over USB (no toolchain needed)
+  claudeq pair                       pair a connected-but-untrusted device (interactive)
+  claudeq devices [list]             list paired devices + their live connection status
+  claudeq devices disconnect <id>    drop a device's live connection (trust kept — it re-authenticates)
+  claudeq devices forget <id>        revoke a device's pairing (needs a fresh pairing afterward)
+  claudeq start-bridge               start the bridge if it isn't running (alias: start)
+  claudeq stop-bridge                stop the bridge if it's running (alias: stop)
+  claudeq restart-bridge             stop + start, to pick up edited bridge code (alias: restart)
+  claudeq help                       show this message (aliases: -h, --help)
+
+Any other arguments (e.g. --continue, --model opus, -p "prompt") are passed straight through to
+`claude`. For Claude Code's own CLI reference, run `claude --help` directly.
+
+Environment: CCDECK_PORT (bridge port, default 8787), CCDECK_HOST (this machine's chip label,
+shown on a session chip only when it clashes with another machine's).
+USAGE
+  exit 0
+fi
+
 # ---- `claudeq flash` — write the firmware to the device, no toolchain (delegates to flash.sh) ----
 if [ "${1:-}" = "flash" ]; then
   shift
@@ -31,18 +80,50 @@ if [ "${1:-}" = "pair" ] || [ "${1:-}" = "devices" ]; then
   exec node "$SCRIPT_DIR/cli-admin.mjs" "$@"
 fi
 
+# ---- `claudeq start-bridge` — start the bridge only, no Claude session (alias: start) ----
+if [ "${1:-}" = "start-bridge" ] || [ "${1:-}" = "start" ]; then
+  PORT="${CCDECK_PORT:-8787}"
+  if bridge_is_up "$PORT"; then
+    echo "claudeq: bridge already running on :${PORT}."
+    exit 0
+  fi
+  echo "claudeq: starting bridge on :${PORT}..."
+  if bridge_start "$PORT"; then
+    echo "claudeq: bridge started on :${PORT}."
+    exit 0
+  fi
+  echo "claudeq: bridge failed to start — see $SCRIPT_DIR/bridge.log" >&2
+  exit 1
+fi
+
+# ---- `claudeq stop-bridge` — stop the bridge only, decoupled from any Claude session (alias: stop) ----
+if [ "${1:-}" = "stop-bridge" ] || [ "${1:-}" = "stop" ]; then
+  PORT="${CCDECK_PORT:-8787}"
+  if ! bridge_is_up "$PORT"; then
+    echo "claudeq: no bridge running on :${PORT}."
+    exit 0
+  fi
+  echo "claudeq: stopping bridge on :${PORT}..."
+  bridge_stop "$PORT"
+  sleep 1
+  if bridge_is_up "$PORT"; then
+    echo "claudeq: bridge on :${PORT} did not stop." >&2
+    exit 1
+  fi
+  echo "claudeq: bridge stopped."
+  exit 0
+fi
+
 # ---- `claudeq restart-bridge` — stop + relaunch the bridge (picks up edited bridge code) ----
 if [ "${1:-}" = "restart-bridge" ] || [ "${1:-}" = "restart" ]; then
   PORT="${CCDECK_PORT:-8787}"
   echo "claudeq: restarting bridge on :${PORT}..."
-  lsof -ti tcp:"$PORT" 2>/dev/null | xargs kill 2>/dev/null || true   # kill whatever holds the port
-  pkill -f "$SCRIPT_DIR/bridge.mjs" 2>/dev/null || true               # and any launcher-started copy
+  bridge_stop "$PORT"
   sleep 1
-  CCDECK_PORT="$PORT" nohup node "$SCRIPT_DIR/bridge.mjs" >>"$SCRIPT_DIR/bridge.log" 2>&1 &
-  for _ in 1 2 3 4 5 6 7 8 9 10; do
-    curl -fsS -m 1 "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1 && { echo "claudeq: bridge restarted on :${PORT}."; exit 0; }
-    sleep 0.3
-  done
+  if bridge_start "$PORT"; then
+    echo "claudeq: bridge restarted on :${PORT}."
+    exit 0
+  fi
   echo "claudeq: bridge failed to restart — see $SCRIPT_DIR/bridge.log" >&2
   exit 1
 fi
@@ -51,18 +132,9 @@ PORT="${CCDECK_PORT:-8787}"
 export CCDECK_PORT="$PORT"
 
 # ---- 1. make sure the bridge is up ----
-if ! curl -fsS -m 1 "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; then
+if ! bridge_is_up "$PORT"; then
   echo "claudeq: starting bridge on :${PORT}..."
-  # Append (not truncate): if two launchers race to start the bridge, the loser exits on
-  # EADDRINUSE (harmless, one wins) and must not clobber the winner's startup log.
-  nohup node "$SCRIPT_DIR/bridge.mjs" >>"$SCRIPT_DIR/bridge.log" 2>&1 &
-  for _ in 1 2 3 4 5 6 7 8 9 10; do
-    curl -fsS -m 1 "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1 && break
-    sleep 0.3
-  done
-  if ! curl -fsS -m 1 "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; then
-    echo "claudeq: bridge failed to start — see $SCRIPT_DIR/bridge.log" >&2
-  fi
+  bridge_start "$PORT" || echo "claudeq: bridge failed to start — see $SCRIPT_DIR/bridge.log" >&2
 fi
 
 # ---- 2. project title + tmux target ----

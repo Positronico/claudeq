@@ -501,6 +501,7 @@ extern "C" void net_preload_config(void) {
         nvs_flash_erase(); nvs_flash_init();
     }
     cfg_load(&g_cfg);
+    pairing_init();   // allocate the PSRAM-backed connection table before any WS connection can start
 }
 
 extern "C" void net_start(void) {

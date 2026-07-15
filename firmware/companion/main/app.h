@@ -81,6 +81,7 @@ void trust_forget_by_index(int idx);
 // Live numeric-comparison (SAS) pairing ceremony over the existing WebSocket, then a PSK + fresh-ephemeral-
 // ECDH auth handshake on every reconnect, then AES-256-GCM envelope encryption for every app message.
 typedef enum { PAIR_IDLE, PAIR_WAIT_RESPONSE, PAIR_SHOW_SAS, PAIR_WAIT_PEER, PAIR_DONE, PAIR_FAILED } pairing_state_t;
+void pairing_init(void);                                     // allocate PSRAM-backed connection state; call once, before net_start()
 void pairing_start_as_device(int bridge_slot);              // UI: user tapped "Pair" on a discovered-but-untrusted bridge
 void pairing_confirm(void);                                 // UI: Confirm tapped on the SAS screen
 void pairing_reject(void);                                  // UI: Reject tapped

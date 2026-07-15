@@ -18,6 +18,7 @@
 #include "esp_random.h"
 #include "esp_timer.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 #include "mbedtls/gcm.h"
 #include "mbedtls/md.h"
 #include "mbedtls/base64.h"
@@ -111,7 +112,19 @@ typedef struct {
     uint8_t pending_transcript[96];
     size_t  pending_transcript_len;
 } pairing_conn_t;
-static pairing_conn_t s_conn[MAX_BRIDGES];
+// PSRAM-allocated, not a plain `static` array -- CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY is off on
+// this project, so a plain .bss array here would permanently pin ~3.4KB (MAX_BRIDGES * sizeof) to
+// internal DRAM, the exact resource OTA's TLS handshake already runs razor-thin on. Allocated once by
+// pairing_init() (called from net_preload_config(), before any WS connection -- and therefore any other
+// pairing.cpp function -- can possibly run), so no per-call NULL check is needed at the many s_conn[bi]
+// call sites below; array-index syntax is identical for a pointer, so none of them had to change.
+static pairing_conn_t *s_conn = NULL;
+
+void pairing_init(void) {
+    if (s_conn) return;
+    s_conn = (pairing_conn_t *)heap_caps_calloc(MAX_BRIDGES, sizeof(pairing_conn_t), MALLOC_CAP_SPIRAM);
+    if (!s_conn) ESP_LOGE(TAG, "failed to allocate pairing connection state from PSRAM");
+}
 
 static void start_auth_handshake(int bi) {
     pairing_conn_t *c = &s_conn[bi];
@@ -368,7 +381,11 @@ bool pairing_wrap_outgoing(int bi, const char *json, char **out_json, size_t *ou
     pairing_conn_t *c = &s_conn[bi];
     if (!c->authenticated) return false;
     size_t plen = strlen(json);
-    uint8_t *combined = (uint8_t *)malloc(plen + 16);   // ciphertext || tag
+    // heap_caps_malloc(..., MALLOC_CAP_SPIRAM) explicitly, not plain malloc(): this project's
+    // CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096 forces any *default* allocation under 4KB to come from
+    // internal DRAM regardless of size -- and most messages here are well under that, so a plain
+    // malloc() would silently compete with OTA's internal-RAM-hungry TLS handshake on every message.
+    uint8_t *combined = (uint8_t *)heap_caps_malloc(plen + 16, MALLOC_CAP_SPIRAM);   // ciphertext || tag
     if (!combined) return false;
     uint64_t n = ++c->send_ctr;
     uint8_t iv[12]; counter_iv(n, iv);
@@ -379,13 +396,13 @@ bool pairing_wrap_outgoing(int bi, const char *json, char **out_json, size_t *ou
     mbedtls_gcm_free(&gcm);
     if (rc != 0) { free(combined); return false; }
     size_t b64cap = 4 * ((plen + 16 + 2) / 3) + 4;
-    char *b64 = (char *)malloc(b64cap);
+    char *b64 = (char *)heap_caps_malloc(b64cap, MALLOC_CAP_SPIRAM);
     if (!b64) { free(combined); return false; }
     int b64len = b64_encode(combined, plen + 16, b64, b64cap);
     free(combined);
     if (b64len < 0) { free(b64); return false; }
     size_t jcap = (size_t)b64len + 64;
-    char *msg = (char *)malloc(jcap);
+    char *msg = (char *)heap_caps_malloc(jcap, MALLOC_CAP_SPIRAM);
     if (!msg) { free(b64); return false; }
     int mn = snprintf(msg, jcap, "{\"type\":\"sec\",\"n\":%llu,\"ct\":\"%s\"}", (unsigned long long)n, b64);
     free(b64);
@@ -399,7 +416,7 @@ bool pairing_wrap_outgoing_binary(int bi, const uint8_t *data, size_t len, uint8
     if (bi < 0 || bi >= MAX_BRIDGES || !data || !out || !out_len) return false;
     pairing_conn_t *c = &s_conn[bi];
     if (!c->authenticated) return false;
-    uint8_t *buf = (uint8_t *)malloc(8 + len + 16);
+    uint8_t *buf = (uint8_t *)heap_caps_malloc(8 + len + 16, MALLOC_CAP_SPIRAM);
     if (!buf) return false;
     uint64_t n = ++c->send_ctr;
     for (int i = 0; i < 8; i++) buf[i] = (uint8_t)(n >> (8 * (7 - i)));   // big-endian counter header
@@ -426,12 +443,12 @@ cJSON *pairing_unwrap_incoming(cJSON *sec_root, int bi) {
     const char *ct_b64 = ct_item->valuestring;
     size_t b64_len = strlen(ct_b64);
     size_t raw_cap = (b64_len / 4 + 1) * 3;
-    uint8_t *raw = (uint8_t *)malloc(raw_cap);
+    uint8_t *raw = (uint8_t *)heap_caps_malloc(raw_cap, MALLOC_CAP_SPIRAM);
     if (!raw) return NULL;
     int raw_len = b64_decode(ct_b64, raw, raw_cap);
     if (raw_len < 16) { free(raw); ESP_LOGW(TAG, "bridge %d: sec bad base64", bi); return NULL; }
     size_t ct_len = (size_t)raw_len - 16;
-    uint8_t *pt = (uint8_t *)malloc(ct_len + 1);
+    uint8_t *pt = (uint8_t *)heap_caps_malloc(ct_len + 1, MALLOC_CAP_SPIRAM);
     if (!pt) { free(raw); return NULL; }
     uint8_t iv[12]; counter_iv(n, iv);
     mbedtls_gcm_context gcm; mbedtls_gcm_init(&gcm);
@@ -457,7 +474,7 @@ bool pairing_unwrap_incoming_binary(int bi, const uint8_t *data, size_t len, uin
     size_t ct_len = len - 8 - 16;
     const uint8_t *ct = data + 8;
     const uint8_t *tag = data + 8 + ct_len;
-    uint8_t *pt = (uint8_t *)malloc(ct_len ? ct_len : 1);
+    uint8_t *pt = (uint8_t *)heap_caps_malloc(ct_len ? ct_len : 1, MALLOC_CAP_SPIRAM);
     if (!pt) return false;
     uint8_t iv[12]; counter_iv(n, iv);
     mbedtls_gcm_context gcm; mbedtls_gcm_init(&gcm);

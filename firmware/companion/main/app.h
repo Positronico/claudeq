@@ -74,6 +74,8 @@ int  trust_find(const char *bridge_id);                       // -1 if untrusted
 bool trust_get(int idx, trust_bridge_t *out);
 int  trust_count(void);
 bool trust_add(const char *bridge_id, const char *label, const uint8_t psk[32]);
+void trust_set_label(const char *bridge_id, const char *label);  // update display label after pair_ack
+void trust_preload(void);                                        // eager NVS load, call while single-threaded
 void trust_forget(const char *bridge_id);
 void trust_forget_by_index(int idx);
 

@@ -18,6 +18,17 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive   # microlink (Tailscale client) is a submodule
+      - name: Verify version consistency with the tag
+        # A tag cut without bumping firmware/dist/VERSION (or app_config.h's DEVICE_FW) would publish
+        # release assets whose manifest.json/ota.json claim the PREVIOUS version — and OTA clients
+        # would see "no update available". Fail fast instead.
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          VERSION="$(cat firmware/dist/VERSION)"
+          DEVICE_FW="$(sed -n 's/.*#define DEVICE_FW *"\([^"]*\)".*/\1/p' firmware/companion/main/app_config.h)"
+          echo "tag=$TAG dist/VERSION=$VERSION DEVICE_FW=$DEVICE_FW"
+          [ "$TAG" = "$VERSION" ] || { echo "::error::tag v$TAG != firmware/dist/VERSION $VERSION"; exit 1; }
+          [ "$TAG" = "$DEVICE_FW" ] || { echo "::error::tag v$TAG != app_config.h DEVICE_FW $DEVICE_FW"; exit 1; }
       - name: Build firmware + repackage dist
         uses: espressif/esp-idf-ci-action@v1
         with:

@@ -3,6 +3,7 @@
 // cfg_clear()'s nvs_erase_all wipes this too, for free -- a factory reset also forgets every pairing).
 // See docs/PROTOCOL.md's "Pairing" section for the ceremony that populates this table.
 #include <string.h>
+#include <time.h>
 #include "esp_random.h"
 #include "esp_timer.h"
 #include "esp_log.h"
@@ -51,6 +52,10 @@ static void recompute_count(void) {
     s_trust->count = (uint16_t)n;
 }
 
+// NOTE on init order: trust_preload() is called from net_preload_config() while the system is still
+// single-threaded, so the lazy load_once() below never actually races in practice. The s_loaded flag
+// is still set up-front (not at the end) deliberately -- load_once() logs via trust_count() which
+// itself calls load_once(), so end-setting would recurse.
 static void load_once(void) {
     if (s_loaded) return;
     s_loaded = true;
@@ -137,12 +142,30 @@ bool trust_add(const char *bridge_id, const char *label, const uint8_t psk[32]) 
     snprintf(e->bridge_id, sizeof(e->bridge_id), "%s", bridge_id);
     snprintf(e->label, sizeof(e->label), "%s", (label && label[0]) ? label : bridge_id);
     memcpy(e->psk, psk, 32);
-    e->paired_at = (uint32_t)(esp_timer_get_time() / 1000000);
+    // Real epoch time when the clock is synced (SNTP lands within seconds of WiFi), else uptime-seconds.
+    // Uptime alone made full-table eviction arbitrary: every reboot restarts the "age" of new pairings
+    // at ~0, so eviction could remove the NEWEST pairing. Mixed old uptime-stamped entries sort as
+    // "oldest" (small values), which is an acceptable one-time migration bias.
+    time_t now = time(NULL);
+    e->paired_at = (now > 1600000000) ? (uint32_t)now : (uint32_t)(esp_timer_get_time() / 1000000);
     recompute_count();
     save_trust();
     ESP_LOGI(TAG, "paired with bridge %s (%s)", bridge_id, e->label);
     return true;
 }
+
+void trust_set_label(const char *bridge_id, const char *label) {
+    load_once();
+    if (!s_trust || !label || !label[0]) return;
+    int idx = trust_find(bridge_id);
+    if (idx < 0) return;
+    snprintf(s_trust->entries[idx].label, sizeof(s_trust->entries[idx].label), "%s", label);
+    save_trust();
+}
+
+// Force the (otherwise lazy) NVS load while the system is still single-threaded -- called from
+// net_preload_config() so no two tasks can ever race the first load.
+void trust_preload(void) { load_once(); }
 
 void trust_forget_by_index(int idx) {
     load_once();

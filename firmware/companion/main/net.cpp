@@ -51,6 +51,8 @@ typedef struct {
     bool  is_lan;          // discovered via LAN mDNS (preferred) vs the tailnet
     bool  primary;         // forward this connection's messages to the UI? (optimistic true until demoted)
     char *last_sessions;   // cached last 'sessions' JSON, replayed if this slot is promoted on a failover
+    bool  ever_connected;  // the WS handshake has succeeded at least once — i.e. something IS a bridge there
+    uint32_t first_seen;   // tick the slot was created; never-connected slots are given up on after a grace period
 } bridge_t;
 static bridge_t s_br[MAX_BRIDGES];
 static int s_focus_bridge = 0;       // where net_send_text/binary (macros/voice) go
@@ -117,7 +119,7 @@ static void ws_evt(void *args, esp_event_base_t base, int32_t id, void *data) {
     switch (id) {
     case WEBSOCKET_EVENT_CONNECTED: {
         ESP_LOGI(TAG, "bridge %d connected (%s:%d)", bi, b->ip, b->port);
-        b->connected = true; update_conn_icon();
+        b->connected = true; b->ever_connected = true; update_conn_icon();
         pairing_on_connect(bi);                   // fresh connection -> fresh auth/pairing state for this slot
         char hello[220];
         int n = snprintf(hello, sizeof(hello),
@@ -165,9 +167,11 @@ static void ws_evt(void *args, esp_event_base_t base, int32_t id, void *data) {
         if (b->rx && d->data_len > 0) memcpy(b->rx + d->payload_offset, d->data_ptr, d->data_len);
         if (b->rx && (d->payload_offset + d->data_len) >= d->payload_len) {
             if (b->rx_op == 0x2) {                    // binary -> encrypted audio clip envelope (see pairing.cpp)
+                ESP_LOGI(TAG, "binary frame: %d bytes from bridge %d (primary=%d)", (int)d->payload_len, bi, (int)b->primary);
                 if (b->primary) {
                     uint8_t *pcm = NULL; size_t pcm_len = 0;
                     if (pairing_unwrap_incoming_binary(bi, (const uint8_t *)b->rx, d->payload_len, &pcm, &pcm_len)) {
+                        ESP_LOGI(TAG, "binary frame decrypted: %u bytes pcm -> audio", (unsigned)pcm_len);
                         audio_play_pcm(pcm, pcm_len);
                         free(pcm);
                     }
@@ -238,15 +242,42 @@ static bool result_ipv4(mdns_result_t *r, char *ip, size_t iplen, int *port) {
 
 // Open a WS to ip:port if we don't already have a slot for it. is_lan = discovered via LAN mDNS (the
 // preferred path) vs the tailnet; used to elect the primary connection when a machine is reachable both ways.
+// Negative cache for peers that turned out not to be bridges (nothing accepted the WS handshake within
+// the grace period). Without this, tailnet discovery re-adds every online tailscale peer (phones, other
+// laptops...) every ~8s pass, each retrying its dead connection every 4s FOREVER — and with >8 peers the
+// slots fill up so a real bridge can be locked out entirely.
+#define PEER_BACKOFF_N      16
+#define PEER_BACKOFF_MS     (10 * 60 * 1000)   // leave a non-bridge peer alone for 10 min
+#define NEVER_CONNECTED_MS  (60 * 1000)        // grace: how long a fresh slot may keep failing before we give up
+static struct { char ip[40]; uint32_t until; } s_peer_backoff[PEER_BACKOFF_N];
+
+static bool peer_backed_off(const char *ip) {
+    uint32_t now = xTaskGetTickCount();
+    for (int i = 0; i < PEER_BACKOFF_N; i++) {
+        if (!s_peer_backoff[i].ip[0]) continue;
+        if ((int32_t)(s_peer_backoff[i].until - now) <= 0) { s_peer_backoff[i].ip[0] = 0; continue; }  // expired
+        if (strcmp(s_peer_backoff[i].ip, ip) == 0) return true;
+    }
+    return false;
+}
+static void peer_backoff_add(const char *ip) {
+    int slot = 0;
+    for (int i = 0; i < PEER_BACKOFF_N; i++) { if (!s_peer_backoff[i].ip[0]) { slot = i; break; } slot = i; }
+    snprintf(s_peer_backoff[slot].ip, sizeof(s_peer_backoff[slot].ip), "%s", ip);
+    s_peer_backoff[slot].until = xTaskGetTickCount() + pdMS_TO_TICKS(PEER_BACKOFF_MS);
+}
+
 static void ensure_bridge(const char *ip, int port, bool is_lan) {
     for (int i = 0; i < MAX_BRIDGES; i++)
         if (s_br[i].used && s_br[i].port == port && strcmp(s_br[i].ip, ip) == 0) { s_br[i].last_seen = xTaskGetTickCount(); return; }  // already known
+    if (!is_lan && peer_backed_off(ip)) return;   // recently proven not to be a bridge — don't churn a slot on it
     int slot = -1;
     for (int i = 0; i < MAX_BRIDGES; i++) if (!s_br[i].used) { slot = i; break; }
     if (slot < 0) return;  // all slots in use
     bridge_t *b = &s_br[slot];
     b->used = true; b->connected = false; b->port = port; b->last_seen = xTaskGetTickCount();
     b->is_lan = is_lan; b->primary = true; b->bridge_id[0] = 0; b->last_sessions = NULL;
+    b->ever_connected = false; b->first_seen = xTaskGetTickCount();
     snprintf(b->ip, sizeof(b->ip), "%s", ip);
     char uri[80]; snprintf(uri, sizeof(uri), "ws://%s:%d/", ip, port);
     esp_websocket_client_config_t cfg = {};
@@ -368,40 +399,58 @@ static void discovery_task(void *arg) {
     esp_sntp_config_t sntp_cfg = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
     esp_netif_sntp_init(&sntp_cfg);
 
-    mdns_init();
+    esp_err_t mdns_err = mdns_init();
+    if (mdns_err != ESP_OK) ESP_LOGE(TAG, "mdns_init failed: %s", esp_err_to_name(mdns_err));
+    mdns_hostname_set(DEVICE_NAME);        // makes the device resolvable as claudeq.local too
+    mdns_instance_name_set(DEVICE_NAME);
     tailnet_start();                       // join the tailnet if an auth key is configured
     for (;;) {
         if (g_cfg.bridge[0]) ensure_bridge(g_cfg.bridge, g_cfg.port > 0 ? g_cfg.port : 8787, true);  // explicit override
         mdns_result_t *res = NULL;
-        if (mdns_query_ptr("_claudeq", "_tcp", 3000, MAX_BRIDGES * 2, &res) == ESP_OK) {
+        esp_err_t q_err = mdns_query_ptr("_claudeq", "_tcp", 3000, MAX_BRIDGES * 2, &res);
+        if (q_err == ESP_OK) {
+            int n = 0;
             for (mdns_result_t *r = res; r; r = r->next) {
+                n++;
                 char ip[40]; int port = g_cfg.port > 0 ? g_cfg.port : 8787;
                 if (result_ipv4(r, ip, sizeof(ip), &port)) ensure_bridge(ip, port, true);
             }
+            ESP_LOGI(TAG, "mdns query ok, %d result(s)", n);
             mdns_query_results_free(res);
+        } else {
+            ESP_LOGW(TAG, "mdns query failed: %s", esp_err_to_name(q_err));
         }
         if (s_ml) tailnet_discover_bridges();  // also pick up bridges reachable over the tailnet
-        // reclaim slots whose bridge stopped advertising and isn't connected (vanished / changed IP)
+        // reclaim slots whose bridge stopped advertising and isn't connected (vanished / changed IP),
+        // and give up on TAILNET peers that never completed a WS handshake within the grace period —
+        // those are almost certainly not bridges at all (phones, laptops...); back them off for 10 min.
+        // LAN slots are exempt from the never-connected reclaim: an mDNS _claudeq._tcp advertisement IS
+        // proof a bridge lives there, and a bridge that's merely restarting must not get blacklisted
+        // (that would blind the deck to it for 10 minutes over a few seconds of downtime).
         uint32_t now = xTaskGetTickCount();
         for (int i = 0; i < MAX_BRIDGES; i++) {
             bridge_t *b = &s_br[i];
-            if (b->used && !b->connected && (now - b->last_seen) > pdMS_TO_TICKS(30000)) {
-                ESP_LOGW(TAG, "reclaiming stale bridge slot %d (%s:%d)", i, b->ip, b->port);
+            bool vanished = b->used && !b->connected && (now - b->last_seen) > pdMS_TO_TICKS(30000);
+            bool notabridge = b->used && !b->connected && !b->ever_connected && !b->is_lan && (now - b->first_seen) > pdMS_TO_TICKS(NEVER_CONNECTED_MS);
+            if (vanished || notabridge) {
+                ESP_LOGW(TAG, "reclaiming %s bridge slot %d (%s:%d)", notabridge ? "never-connected" : "stale", i, b->ip, b->port);
+                if (notabridge) peer_backoff_add(b->ip);
                 if (b->client) { esp_websocket_client_stop(b->client); esp_websocket_client_destroy(b->client); }
                 free(b->rx);
                 ls_lock(); free(b->last_sessions); b->last_sessions = NULL; ls_unlock();
                 b->client = NULL; b->rx = NULL; b->used = false; b->connected = false;
             }
         }
-        // re-discover every ~8s, but wake early on a Settings toggle or a UI "Disconnect" tap. The command
-        // rides the notification value (atomically read + cleared here), so nothing posted from the LVGL
-        // task is ever lost. Disconnect-slot commands are encoded as 100+slot (slot < MAX_BRIDGES <= 8,
-        // so this never collides with the tailnet on/off values 1/2).
+        // re-discover every ~8s, but wake early on a Settings toggle or a UI "Disconnect" tap. Commands
+        // are MERGED BITS in the notification value (bit 0 = tailnet config changed, bit 8+i = disconnect
+        // slot i), so concurrent commands accumulate instead of overwriting each other — nothing posted
+        // from the LVGL task is ever lost. Tailnet on/off is re-read from g_cfg (the persisted source of
+        // truth) rather than encoded in the command, so a rapid flip applies its FINAL state.
         uint32_t cmd = 0;
         xTaskNotifyWait(0, 0xFFFFFFFF, &cmd, pdMS_TO_TICKS(8000));
-        if (cmd == 1) tailnet_start();
-        else if (cmd == 2) tailnet_stop();
-        else if (cmd >= 100 && cmd < 100 + MAX_BRIDGES) disconnect_bridge_slot((int)(cmd - 100));
+        if (cmd & (1u << 0)) { if (g_cfg.tailscale_enabled) tailnet_start(); else tailnet_stop(); }
+        for (int i = 0; i < MAX_BRIDGES; i++)
+            if (cmd & (1u << (8 + i))) disconnect_bridge_slot(i);
         update_conn_icon();   // keep the top-bar tailscale badge / bridge count fresh even without a WS event
     }
 }
@@ -422,8 +471,11 @@ extern "C" void net_wifi_set_enabled(bool on) {
 extern "C" void net_tailnet_set_enabled(bool on) {
     cfg_set_tailscale_enabled(on ? 1 : 0);
     g_cfg.tailscale_enabled = on ? 1 : 0;
-    // Command rides the notification value (overwrite = last toggle wins); discovery_task reads it atomically.
-    if (s_disc_task) xTaskNotify(s_disc_task, on ? 1 : 2, eSetValueWithOverwrite);
+    // Commands ride the notification value as MERGED BITS (eSetBits), not an overwritten value — with
+    // overwrite, a disconnect tap posted while a toggle was still pending silently swallowed the toggle.
+    // The bit only says "tailnet config changed"; the applied state is read fresh from g_cfg on wake,
+    // so rapid on/off flips always land on the LAST persisted state, never a stale intermediate.
+    if (s_disc_task) xTaskNotify(s_disc_task, 1u << 0, eSetBits);
 }
 
 extern "C" void net_get_flags(bool *wifi_en, bool *ts_en, bool *ts_has_key) {
@@ -448,13 +500,25 @@ extern "C" void net_send_raw(int bridge, const char *json) {
 // Auth-gated + AES-256-GCM-encrypted send: every real app message (focus/answer/macro/voice/...) goes
 // through here. An unauthenticated bridge slot carries no app traffic in either direction -- the message
 // is simply dropped, not queued, matching the receive side's equivalent gate in ws_evt.
+//
+// s_tx_mux makes wrap+send one atomic step. Two tasks send concurrently (LVGL taps, the mic capture
+// task streaming voice PCM): without the lock, (a) the non-atomic 64-bit ++send_ctr can tear or
+// duplicate on the dual-core S3 -- a duplicate counter value REUSES a GCM IV under the same key --
+// and (b) frames can hit the wire out of counter order, which the bridge treats as replay and punishes
+// by closing the connection (4002).
+static SemaphoreHandle_t s_tx_mux = NULL;
+static void tx_lock(void)   { if (s_tx_mux) xSemaphoreTake(s_tx_mux, portMAX_DELAY); }
+static void tx_unlock(void) { if (s_tx_mux) xSemaphoreGive(s_tx_mux); }
+
 extern "C" void net_send_to(int bridge, const char *json) {
     if (!pairing_is_authenticated(bridge)) return;
     char *wrapped = NULL; size_t wrapped_len = 0;
+    tx_lock();
     if (pairing_wrap_outgoing(bridge, json, &wrapped, &wrapped_len)) {
         net_send_raw(bridge, wrapped);
         free(wrapped);
     }
+    tx_unlock();
 }
 
 extern "C" void net_send_text(const char *json) { net_send_to(s_focus_bridge, json); }
@@ -464,10 +528,12 @@ extern "C" void net_send_binary(const void *data, size_t len) {
     bridge_t *b = &s_br[s_focus_bridge];
     if (!b->client || !b->connected) return;
     uint8_t *wrapped = NULL; size_t wrapped_len = 0;
+    tx_lock();
     if (pairing_wrap_outgoing_binary(s_focus_bridge, (const uint8_t *)data, len, &wrapped, &wrapped_len)) {
         esp_websocket_client_send_bin(b->client, (const char *)wrapped, wrapped_len, pdMS_TO_TICKS(200));
         free(wrapped);
     }
+    tx_unlock();
 }
 
 // For the "Paired Bridges" / "Pair new bridge" Settings screens (ui.cpp), which need to enumerate live
@@ -488,7 +554,7 @@ extern "C" bool net_bridge_info(int idx, bool *used, bool *connected, char *brid
 // esp_websocket_client_stop() can block, and this is called from the LVGL-lock-holding UI task.
 extern "C" bool net_disconnect_bridge(int idx) {
     if (idx < 0 || idx >= MAX_BRIDGES || !s_br[idx].used) return false;
-    if (s_disc_task) xTaskNotify(s_disc_task, 100 + idx, eSetValueWithOverwrite);
+    if (s_disc_task) xTaskNotify(s_disc_task, 1u << (8 + idx), eSetBits);
     return true;
 }
 
@@ -507,6 +573,7 @@ extern "C" void net_preload_config(void) {
 extern "C" void net_start(void) {
     s_wifi_eg = xEventGroupCreate();
     s_ls_mux = xSemaphoreCreateMutex();   // guards bridge_t.last_sessions; created before any ws task starts
+    s_tx_mux = xSemaphoreCreateMutex();   // serializes encrypted sends (counter order + IV uniqueness)
     esp_err_t r = nvs_flash_init();
     if (r == ESP_ERR_NVS_NO_FREE_PAGES || r == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
@@ -514,7 +581,8 @@ extern "C" void net_start(void) {
     }
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
-    esp_netif_create_default_wifi_sta();
+    esp_netif_t *sta_netif = esp_netif_create_default_wifi_sta();
+    esp_netif_set_hostname(sta_netif, DEVICE_NAME);   // so the router/DHCP list shows "claudeq", not "espressif"
     wifi_init_config_t ic = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&ic));
     esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_evt, NULL, NULL);

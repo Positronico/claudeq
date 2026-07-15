@@ -54,17 +54,16 @@ The deck restarts and connects. Settings live on the device. To change networks 
 **Settings** tab and **hold** "WiFi portal" — or just power it up somewhere new.
 
 ### Voice (optional) — local transcription, no API key
-Download the model to a fixed location and point the bridge at it (works for both the `brew` and
-from-source installs):
+Download the model to the bridge's default location (works for both the `brew` and from-source installs):
 ```bash
 brew install whisper-cpp
 mkdir -p ~/.claudeq/whisper
 curl -L -o ~/.claudeq/whisper/ggml-base.en.bin \
   https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin
-echo 'export CCDECK_WHISPER_MODEL="$HOME/.claudeq/whisper/ggml-base.en.bin"' >> ~/.zshrc
-source ~/.zshrc
 ```
-`whisper-cli` is found on your `PATH`; set `CCDECK_WHISPER_BIN` only if it lives somewhere unusual.
+That's it — the bridge looks in `~/.claudeq/whisper/` by default (set `CCDECK_WHISPER_MODEL` only for a
+non-standard path). `whisper-cli` is found on your `PATH`; set `CCDECK_WHISPER_BIN` only if it lives
+somewhere unusual. If the bridge was already running, `claudeq restart-bridge` picks the model up.
 
 ---
 
@@ -77,6 +76,15 @@ claudeq
 ```
 That's the whole workflow. `claudeq` starts the bridge if needed, runs Claude in a tmux session named
 after the project (so it shows up as a chip), and enables the deck. Plain `claude` is unaffected.
+
+`claudeq` also has a few subcommands (run **`claudeq help`** for the full list):
+
+| Command | What |
+|---|---|
+| `claudeq flash [port]` | Write the firmware to the device over USB — no toolchain needed. |
+| `claudeq pair` | Pair a connected-but-untrusted deck (interactive). |
+| `claudeq devices [list]` | List paired decks + their live connection status (`claudeq devices disconnect <id>` / `forget <id>` to manage). |
+| `claudeq start-bridge` / `stop-bridge` / `restart-bridge` | Start, stop, or restart the background bridge on its own (aliases: `start` / `stop` / `restart`). Run `restart-bridge` to pick up edits to macros, sounds, or the trust store. |
 
 **On the screen:**
 
@@ -123,9 +131,10 @@ drive; a question auto-focuses the session that asked, wherever it's running.
 
 > 🔒 **Security — pairing required.** The device↔bridge link is now authenticated and encrypted: a deck
 > and a bridge must complete a one-time pairing (live numeric-comparison code, like Bluetooth/Signal
-> pairing — no password to type) before the bridge will send session data or accept commands. Pair from
-> the deck's **Settings → Paired Bridges → Pair new bridge**, or run **`claudeq pair`** on the bridge
-> machine. After pairing, every reconnect re-authenticates automatically and all traffic is AES-256-GCM
+> pairing — no password to type) before the bridge will send session data or accept commands. To pair, open
+> the deck's **Settings → Paired Bridges**: any connected-but-unpaired bridge appears there as a tappable
+> **"New bridge — tap to pair →"** row — tap it to start the ceremony. (Or run **`claudeq pair`** on the
+> bridge machine.) After pairing, every reconnect re-authenticates automatically and all traffic is AES-256-GCM
 > encrypted. Manage paired devices with `claudeq devices [list]` / `claudeq devices disconnect <id>` /
 > `claudeq devices forget <id>`. See `docs/PROTOCOL.md`'s "Pairing" section for the full model.
 >
@@ -136,13 +145,17 @@ drive; a question auto-focuses the session that asked, wherever it's running.
 ---
 
 # Customize
-- **Macros** — edit `bridge/macros.json` (`id` / `icon` / `label` / `prompt`), restart the bridge.
-- **Paired devices** — `bridge/trust.json` holds each paired device's persistent id and key; managed via
-  `claudeq pair`/`claudeq devices`, not by hand. Delete it (bridge restart) to forget every pairing at once.
-- **Sounds** — drop any audio file at `bridge/sounds/alert.*` or `done.*` (auto-converted via ffmpeg).
+Your editable state lives in **`~/.claudeq/`** (override the dir with `$CLAUDEQ_STATE_DIR`) — kept out of
+the install dir so a `brew upgrade` can't wipe it; an existing setup's files are migrated there once,
+automatically. After editing any of these, run **`claudeq restart-bridge`** to apply them.
+- **Macros** — edit `~/.claudeq/macros.json` (`id` / `icon` / `label` / `prompt`), then `claudeq restart-bridge`.
+- **Paired devices** — `~/.claudeq/trust.json` holds each paired device's persistent id and key; managed via
+  `claudeq pair`/`claudeq devices`, not by hand. Delete it (then `claudeq restart-bridge`) to forget every pairing at once.
+- **Sounds** — drop any audio file at `~/.claudeq/sounds/alert.*` or `~/.claudeq/sounds/done.*` (auto-converted
+  via ffmpeg). With no custom clip, the deck plays a built-in tone instead.
 - **Voice** — `CCDECK_VOICE_AUTOSUBMIT=0` types the transcript without pressing Enter;
-  `CCDECK_WHISPER_MODEL=/path` points at the model (set during voice setup above; needed for a `brew`
-  install, where there's no in-repo default); `CCDECK_WHISPER_BIN=/path` if `whisper-cli` isn't on `PATH`.
+  `CCDECK_WHISPER_MODEL=/path` overrides the model location (default: `~/.claudeq/whisper/ggml-base.en.bin`);
+  `CCDECK_WHISPER_BIN=/path` if `whisper-cli` isn't on `PATH`.
 - **Machine name** — when two computers run a session with the same project name, the deck tags those
   chips with `@host` to tell them apart. The name is the hostname by default; set `CCDECK_HOST=mylaptop`
   before launching a bridge for a friendlier label.

@@ -28,6 +28,15 @@ command -v esptool >/dev/null 2>&1 || ESPTOOL=(python3 -m esptool)
 
 VERSION="$(cat "$DIST_DIR/VERSION" 2>/dev/null || echo 0.1.0)"
 
+# DEVICE_FW (what the device reports/shows) and dist/VERSION (what OTA/manifest/Homebrew see) are two
+# hand-maintained copies of the same fact — refuse to package a build where they disagree, since that
+# ships an OTA manifest claiming a version the binary doesn't believe it is.
+DEVICE_FW="$(sed -n 's/.*#define DEVICE_FW *"\([^"]*\)".*/\1/p' "$REPO_ROOT/firmware/companion/main/app_config.h" 2>/dev/null || true)"
+if [ -n "$DEVICE_FW" ] && [ "$DEVICE_FW" != "$VERSION" ]; then
+  echo "error: firmware/dist/VERSION ($VERSION) != app_config.h DEVICE_FW ($DEVICE_FW) — bump both before packaging" >&2
+  exit 1
+fi
+
 # Pull chip, flash settings, and the offset→file map straight out of the build's own recipe,
 # so this keeps working after the app/project is renamed.
 read -r CHIP MODE FREQ SIZE < <(python3 - "$ARGS_JSON" <<'PY'

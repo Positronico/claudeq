@@ -15,6 +15,8 @@
 // hand-counted byte length -- a single off-by-one there would silently break interop with the bridge
 // and mock, since HMAC/AES-GCM inputs must be byte-identical across all three implementations.
 #include <string.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "esp_random.h"
 #include "esp_timer.h"
 #include "esp_log.h"
@@ -120,10 +122,20 @@ typedef struct {
 // call sites below; array-index syntax is identical for a pointer, so none of them had to change.
 static pairing_conn_t *s_conn = NULL;
 
+// Guards the single global SAS ceremony (s_pair): it is mutated from BOTH the LVGL task (confirm/
+// reject/dismiss taps, the get_state timeout abort) and the websocket task (handle_pair_* / finalize).
+// Without it, the timeout abort can zero s_pair.shared WHILE try_finalize_pairing derives the PSK from
+// it -- persisting a garbage PSK that fails every future auth against that bridge.
+static SemaphoreHandle_t s_pair_mux = NULL;
+static void pair_lock(void)   { if (s_pair_mux) xSemaphoreTake(s_pair_mux, portMAX_DELAY); }
+static void pair_unlock(void) { if (s_pair_mux) xSemaphoreGive(s_pair_mux); }
+
 void pairing_init(void) {
     if (s_conn) return;
     s_conn = (pairing_conn_t *)heap_caps_calloc(MAX_BRIDGES, sizeof(pairing_conn_t), MALLOC_CAP_SPIRAM);
     if (!s_conn) ESP_LOGE(TAG, "failed to allocate pairing connection state from PSRAM");
+    s_pair_mux = xSemaphoreCreateMutex();
+    trust_preload();   // eager NVS load while still single-threaded (see trust.cpp)
 }
 
 static void start_auth_handshake(int bi) {
@@ -195,6 +207,7 @@ static void handle_auth_verify(cJSON *root, int bi) {
     memset(c->pending_session_key, 0, 32);
     memset(c->auth_priv, 0, 32);
     ESP_LOGI(TAG, "bridge %d authenticated", bi);
+    audio_play_alert("soft");   // connection greeting: the deck itself, so it works with zero bridge-side sound files
 }
 
 static void handle_auth_reject(cJSON *root, int bi) {
@@ -232,14 +245,18 @@ static void abort_pairing(pairing_state_t final_state) {
 void pairing_on_disconnect(int bi) {
     if (bi < 0 || bi >= MAX_BRIDGES) return;
     memset(&s_conn[bi], 0, sizeof(s_conn[bi]));
+    pair_lock();
     if (s_pair.bridge == bi && s_pair.state != PAIR_IDLE && s_pair.state != PAIR_DONE && s_pair.state != PAIR_FAILED) {
         ESP_LOGW(TAG, "pairing aborted: bridge %d disconnected mid-ceremony", bi);
         abort_pairing(PAIR_FAILED);
     }
+    pair_unlock();
 }
 
 void pairing_start_as_device(int bridge_slot) {
-    if (bridge_slot < 0 || bridge_slot >= MAX_BRIDGES || s_pair.state != PAIR_IDLE) return;
+    if (bridge_slot < 0 || bridge_slot >= MAX_BRIDGES) return;
+    pair_lock();
+    if (s_pair.state != PAIR_IDLE) { pair_unlock(); return; }
     memset(&s_pair, 0, sizeof(s_pair));
     s_pair.bridge = bridge_slot;
     esp_fill_random(s_pair.my_priv, 32);
@@ -247,9 +264,10 @@ void pairing_start_as_device(int bridge_slot) {
     s_pair.state = PAIR_WAIT_RESPONSE;
     s_pair.deadline_us = esp_timer_get_time() + (int64_t)PAIR_TIMEOUT_MS * 1000;
     char pub_b64[64];
-    if (b64_encode(s_pair.my_pub, 32, pub_b64, sizeof(pub_b64)) < 0) { abort_pairing(PAIR_FAILED); return; }
+    if (b64_encode(s_pair.my_pub, 32, pub_b64, sizeof(pub_b64)) < 0) { abort_pairing(PAIR_FAILED); pair_unlock(); return; }
     char msg[128];
     snprintf(msg, sizeof(msg), "{\"type\":\"pair_request\",\"pub\":\"%s\"}", pub_b64);
+    pair_unlock();
     net_send_raw(bridge_slot, msg);
 }
 
@@ -319,36 +337,50 @@ static void handle_pair_reject(cJSON *root, int bi) {
 
 static void handle_pair_ack(cJSON *root, int bi) {
     cJSON *ok = cJSON_GetObjectItem(root, "ok");
+    // The bridge's pair_ack carries its human-readable label (hostname) -- the trust entry was already
+    // written by try_finalize_pairing with the raw bridge_id as a placeholder; upgrade it now.
+    cJSON *label = cJSON_GetObjectItem(root, "label");
+    if (cJSON_IsString(label) && label->valuestring[0] && s_conn[bi].bridge_id_snapshot[0])
+        trust_set_label(s_conn[bi].bridge_id_snapshot, label->valuestring);
     ESP_LOGI(TAG, "bridge %d confirmed pairing complete (ok=%d)", bi, cJSON_IsTrue(ok) ? 1 : 0);
 }
 
 void pairing_confirm(void) {
-    if (s_pair.state != PAIR_SHOW_SAS) return;
+    pair_lock();
+    if (s_pair.state != PAIR_SHOW_SAS) { pair_unlock(); return; }
     s_pair.confirmed_by_me = true;
     net_send_raw(s_pair.bridge, "{\"type\":\"pair_confirm\"}");
     s_pair.state = PAIR_WAIT_PEER;
     s_pair.deadline_us = esp_timer_get_time() + (int64_t)PAIR_TIMEOUT_MS * 1000;
     try_finalize_pairing();
+    pair_unlock();
 }
 
 void pairing_reject(void) {
-    if (s_pair.state == PAIR_IDLE || s_pair.state == PAIR_DONE || s_pair.state == PAIR_FAILED) return;
+    pair_lock();
+    if (s_pair.state == PAIR_IDLE || s_pair.state == PAIR_DONE || s_pair.state == PAIR_FAILED) { pair_unlock(); return; }
     net_send_raw(s_pair.bridge, "{\"type\":\"pair_reject\",\"reason\":\"user\"}");
     abort_pairing(PAIR_FAILED);
+    pair_unlock();
 }
 
 void pairing_dismiss(void) {
+    pair_lock();
     if (s_pair.state == PAIR_DONE || s_pair.state == PAIR_FAILED) s_pair.state = PAIR_IDLE;
+    pair_unlock();
 }
 
 pairing_state_t pairing_get_state(void) {
+    pair_lock();
     if ((s_pair.state == PAIR_WAIT_RESPONSE || s_pair.state == PAIR_SHOW_SAS || s_pair.state == PAIR_WAIT_PEER)
         && esp_timer_get_time() > s_pair.deadline_us) {
         ESP_LOGW(TAG, "pairing ceremony timed out");
         if (s_pair.bridge >= 0) net_send_raw(s_pair.bridge, "{\"type\":\"pair_reject\",\"reason\":\"timeout\"}");
         abort_pairing(PAIR_FAILED);
     }
-    return s_pair.state;
+    pairing_state_t st = s_pair.state;
+    pair_unlock();
+    return st;
 }
 const char *pairing_get_code(void) { return s_pair.code; }
 int pairing_get_bridge(void) { return s_pair.state == PAIR_IDLE ? -1 : s_pair.bridge; }
@@ -365,11 +397,17 @@ void pairing_on_message(cJSON *root, int bi) {
         if (cJSON_IsString(bid)) snprintf(s_conn[bi].bridge_id_snapshot, sizeof(s_conn[bi].bridge_id_snapshot), "%s", bid->valuestring);
         if (cJSON_IsTrue(paired) && !s_conn[bi].authenticated && !s_conn[bi].auth_in_flight) start_auth_handshake(bi);
     }
-    else if (!strcmp(t, "pair_request"))  handle_pair_request(root, bi);
-    else if (!strcmp(t, "pair_response")) handle_pair_response(root, bi);
-    else if (!strcmp(t, "pair_confirm"))  handle_pair_confirm(root, bi);
-    else if (!strcmp(t, "pair_reject"))   handle_pair_reject(root, bi);
-    else if (!strcmp(t, "pair_ack"))      handle_pair_ack(root, bi);
+    // pair_* handlers mutate the shared ceremony state (s_pair), which the LVGL task also touches
+    // (confirm/reject taps, get_state's timeout abort) -- serialize via the ceremony mutex.
+    else if (!strncmp(t, "pair_", 5)) {
+        pair_lock();
+        if      (!strcmp(t, "pair_request"))  handle_pair_request(root, bi);
+        else if (!strcmp(t, "pair_response")) handle_pair_response(root, bi);
+        else if (!strcmp(t, "pair_confirm"))  handle_pair_confirm(root, bi);
+        else if (!strcmp(t, "pair_reject"))   handle_pair_reject(root, bi);
+        else if (!strcmp(t, "pair_ack"))      handle_pair_ack(root, bi);
+        pair_unlock();
+    }
     else if (!strcmp(t, "auth_challenge")) handle_auth_challenge(root, bi);
     else if (!strcmp(t, "auth_verify"))    handle_auth_verify(root, bi);
     else if (!strcmp(t, "auth_reject"))    handle_auth_reject(root, bi);

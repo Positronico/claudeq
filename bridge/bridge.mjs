@@ -26,23 +26,34 @@ const SHORT_HOST = (process.env.CCDECK_HOST || os.hostname() || 'host').replace(
 // at two different IPs — is ONE machine, and show its sessions once. Persisted in trust.json (unlike a
 // bare per-process randomUUID()) so pairing survives a bridge restart; override with CCDECK_BRIDGE_ID.
 const BRIDGE_ID = trust.BRIDGE_ID;
-const BRIDGE_FW = (() => { try { return JSON.parse(fs.readFileSync(path.join(__dirname, 'package.json'), 'utf8')).version || '0.0.0'; } catch { return '0.0.0'; } })();
+// Single source of truth for the release version: firmware/dist/VERSION ships in both the repo and the
+// Homebrew keg (../firmware/dist relative to this file in both layouts). package.json is only a fallback.
+const BRIDGE_FW = (() => {
+  try { return fs.readFileSync(path.join(__dirname, '..', 'firmware', 'dist', 'VERSION'), 'utf8').trim(); } catch {}
+  try { return JSON.parse(fs.readFileSync(path.join(__dirname, 'package.json'), 'utf8')).version || '0.0.0'; } catch { return '0.0.0'; }
+})();
 const DEFAULT_TMUX = process.env.CCDECK_TMUX_TARGET || 'ccdeck';   // fallback for legacy `cc`
 const ASK_TIMEOUT_MS = parseInt(process.env.CCDECK_ASK_TIMEOUT_MS || '280000', 10);
 const PRUNE_GRACE_MS = parseInt(process.env.CCDECK_PRUNE_GRACE_MS || '20000', 10);
 const PAIR_TIMEOUT_MS = parseInt(process.env.CCDECK_PAIR_TIMEOUT_MS || '90000', 10);
-const MACROS_FILE = path.join(__dirname, 'macros.json');
+// Mutable/user-customizable state lives in ~/.claudeq (see trust.mjs) — NOT the install dir, which under
+// Homebrew is the versioned keg: files there are silently wiped on every `brew upgrade`.
+const STATE_DIR = trust.STATE_DIR;
+const MACROS_FILE = path.join(STATE_DIR, 'macros.json');
+const LEGACY_MACROS_FILE = path.join(__dirname, 'macros.json');
 const MOCK_FILE = path.join(__dirname, 'mock-device.html');
-const SOUNDS_DIR = path.join(__dirname, 'sounds');
+const SOUNDS_DIRS = [path.join(STATE_DIR, 'sounds'), path.join(__dirname, 'sounds')];  // user dir first, bundled second
 const SOUND_SR = 16000;
 const SOUND_EXTS = ['wav', 'mp3', 'm4a', 'ogg', 'flac', 'aiff', 'aif'];
 const soundCache = {}; // name -> { mtime, pcm }
 
 // Find sounds/<name>.<ext>, convert to 16k mono s16le PCM via ffmpeg, cache by mtime.
-// Drop any audio file at bridge/sounds/alert.* or done.* to customize — picked up automatically.
+// Drop any audio file at ~/.claudeq/sounds/alert.* or done.* to customize — picked up automatically.
 function loadSound(name) {
   let file = null;
-  for (const e of SOUND_EXTS) { const p = path.join(SOUNDS_DIR, `${name}.${e}`); if (fs.existsSync(p)) { file = p; break; } }
+  outer: for (const dir of SOUNDS_DIRS) {
+    for (const e of SOUND_EXTS) { const p = path.join(dir, `${name}.${e}`); if (fs.existsSync(p)) { file = p; break outer; } }
+  }
   if (!file) return null;
   const mt = fs.statSync(file).mtimeMs;
   const c = soundCache[name];
@@ -93,6 +104,10 @@ function touchSession(meta) {
 }
 
 function loadMacros() {
+  // one-time migration from the pre-2.1.5 install-dir location (wiped on brew upgrade)
+  if (!fs.existsSync(MACROS_FILE) && fs.existsSync(LEGACY_MACROS_FILE)) {
+    try { fs.mkdirSync(STATE_DIR, { recursive: true }); fs.copyFileSync(LEGACY_MACROS_FILE, MACROS_FILE); } catch {}
+  }
   try { return JSON.parse(fs.readFileSync(MACROS_FILE, 'utf8')); }
   catch { return [
     { id: 'review',   icon: '🔍', label: 'Code review', prompt: '/code-review' },
@@ -259,7 +274,13 @@ function injectToCC(text, submit = true, target = focusedTmux()) {
 // Resolved off PATH by default (sh -c below), so it works on Apple-Silicon, Intel, and Linuxbrew
 // alike; override with CCDECK_WHISPER_BIN for a non-standard install.
 const WHISPER_BIN = process.env.CCDECK_WHISPER_BIN || 'whisper-cli';
-const WHISPER_MODEL = process.env.CCDECK_WHISPER_MODEL || path.join(__dirname, '..', 'tools', 'whisper-models', 'ggml-base.en.bin');
+// Model resolution order: env override, then the documented per-user location (~/.claudeq/whisper — where
+// the README's setup downloads it), then the dev checkout's gitignored tools/ dir. The old default was
+// ONLY the tools/ path, which no published install ever has.
+const WHISPER_MODEL = process.env.CCDECK_WHISPER_MODEL
+  || [path.join(STATE_DIR, 'whisper', 'ggml-base.en.bin'),
+      path.join(__dirname, '..', 'tools', 'whisper-models', 'ggml-base.en.bin')].find(p => fs.existsSync(p))
+  || path.join(STATE_DIR, 'whisper', 'ggml-base.en.bin');
 const VOICE_AUTOSUBMIT = process.env.CCDECK_VOICE_AUTOSUBMIT !== '0';   // type+Enter by default; set 0 to type only
 const VOICE_CONFIRM = process.env.CCDECK_VOICE_CONFIRM !== '0';         // on-device Send/Cancel; set 0 for legacy auto-inject
 let voiceSeq = 0;
@@ -272,8 +293,12 @@ function pcmToWav(pcm, sr = 16000) {
   return Buffer.concat([h, pcm]);
 }
 function transcribeWav(wavPath) {
-  const r = spawnSync('/bin/sh', ['-c', `"${WHISPER_BIN}" -m "${WHISPER_MODEL}" -f "${wavPath}" -nt -np 2>/dev/null`], { maxBuffer: 16 * 1024 * 1024 });
-  if (r.status !== 0) { console.error('[voice] whisper failed:', (r.stderr || '').toString().slice(0, 200)); return ''; }
+  if (!fs.existsSync(WHISPER_MODEL)) {
+    console.error(`[voice] whisper model not found at ${WHISPER_MODEL} — see the README "Voice" setup (download to ~/.claudeq/whisper/)`);
+    return '';
+  }
+  const r = spawnSync('/bin/sh', ['-c', `"${WHISPER_BIN}" -m "${WHISPER_MODEL}" -f "${wavPath}" -nt -np`], { maxBuffer: 16 * 1024 * 1024 });
+  if (r.status !== 0) { console.error('[voice] whisper failed:', (r.stderr || '').toString().slice(0, 300)); return ''; }
   return (r.stdout || '').toString().replace(/\s+/g, ' ').trim();
 }
 function finishVoice(ws) {
@@ -332,6 +357,16 @@ function isLoopback(addr) {
 const server = http.createServer(async (req, res) => {
   const u = new URL(req.url, `http://localhost:${PORT}`);
 
+  // The ENTIRE plain-HTTP surface is loopback-only. The deck speaks exclusively WebSocket (paired +
+  // encrypted); the HTTP routes exist for local hooks (/event, /ask), local admin (claudeq pair/devices),
+  // and the local mock page. Without this gate, any LAN/tailnet peer could inject fake session events,
+  // fake questions, and sounds onto the deck (or read session titles from /health).
+  if (!isLoopback(req.socket.remoteAddress || '')) {
+    res.writeHead(403, { 'content-type': 'application/json' });
+    res.end('{"error":"loopback only"}');
+    return;
+  }
+
   if (req.method === 'GET' && (u.pathname === '/' || u.pathname === '/mock' || u.pathname === '/mock-device.html')) {
     fs.readFile(MOCK_FILE, (e, data) => {
       if (e) { res.writeHead(404); res.end('mock not found'); return; }
@@ -341,7 +376,7 @@ const server = http.createServer(async (req, res) => {
   }
   if (req.method === 'GET' && u.pathname === '/health') {
     res.writeHead(200, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({ ok: true, clients: clients.size, sessions: sessionsList(), focus: focusedSid })); return;
+    res.end(JSON.stringify({ ok: true, fw: BRIDGE_FW, clients: clients.size, sessions: sessionsList(), focus: focusedSid })); return;
   }
 
   // AskUserQuestion hook -> long-poll until the deck answers
@@ -418,7 +453,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === 'POST' && u.pathname === '/admin/pair/start') {
-      const payload = JSON.parse((await readBody(req)) || '{}');
+      let payload; try { payload = JSON.parse((await readBody(req)) || '{}'); } catch { json({ ok: false, reason: 'bad-json' }, 400); return; }
       const ws = findSocketByDeviceId(payload.deviceId);
       if (!ws) { json({ ok: false, reason: 'not-connected' }, 404); return; }
       const started = startPairing(ws);
@@ -429,7 +464,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === 'POST' && u.pathname === '/admin/pair/confirm') {
-      const payload = JSON.parse((await readBody(req)) || '{}');
+      let payload; try { payload = JSON.parse((await readBody(req)) || '{}'); } catch { json({ ok: false, reason: 'bad-json' }, 400); return; }
       const ws = findSocketByDeviceId(payload.deviceId);
       if (!ws) { json({ ok: false, reason: 'not-connected' }, 404); return; }
       const r = confirmPairingLocal(ws);
@@ -444,7 +479,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === 'POST' && u.pathname === '/admin/pair/reject') {
-      const payload = JSON.parse((await readBody(req)) || '{}');
+      let payload; try { payload = JSON.parse((await readBody(req)) || '{}'); } catch { json({ ok: false, reason: 'bad-json' }, 400); return; }
       const ws = findSocketByDeviceId(payload.deviceId);
       json(ws ? rejectPairingLocal(ws, payload.reason || 'user') : { ok: false, reason: 'not-connected' });
       return;
@@ -500,14 +535,16 @@ function handleEvent(kind, ev, meta) {
     case 'Notification':
       s.attn = true; setSessionStatus(s, 'waiting', 'needs you');
       pushFeed(s, 'notify', 'needs you', clip(ev.message));
-      broadcast({ type: 'alert', sid: s.sid, level: 'attn', text: ev.message || 'Claude needs you', sound: 'chirp' });
+      // sound: the deck's built-in tone, UNLESS a custom sounds/alert.* clip exists — then stream that
+      // instead and omit the tone field so the two never double-play.
+      broadcast({ type: 'alert', sid: s.sid, level: 'attn', text: ev.message || 'Claude needs you', ...(loadSound('alert') ? {} : { sound: 'chirp' }) });
       sendSound('alert'); broadcastSessions(); break;
     case 'Stop':
       if (s.promptStartedAt) s.hud.elapsedMs = Date.now() - s.promptStartedAt;
       s.attn = false; setSessionStatus(s, 'done', 'done');
       pushFeed(s, 'done', 'done', s.hud.elapsedMs ? Math.round(s.hud.elapsedMs / 1000) + 's' : '');
       if (ev.transcript_path) pushReplyWhenReady(s.sid, ev.transcript_path, 12, s.lastReplyId || '');
-      broadcast({ type: 'alert', sid: s.sid, level: 'info', text: 'done', sound: 'soft' });
+      broadcast({ type: 'alert', sid: s.sid, level: 'info', text: 'done', ...(loadSound('done') ? {} : { sound: 'soft' }) });
       sendSound('done'); broadcastSessions(); break;
   }
   if (s.promptStartedAt && s.state !== 'idle') s.hud.elapsedMs = Date.now() - s.promptStartedAt;
@@ -712,7 +749,7 @@ function handleAuthVerify(ws, m) {
   ws._authPending = null;
   try { ws.send(JSON.stringify({ type: 'auth_verify', mac: pcrypto.authTag(ap.sessionKey, 'bridge', ap.transcript).toString('base64') })); } catch {}
   console.log(`[auth] device ${ws._deviceId} authenticated`);
-  sendSnapshot(ws);
+  sendSnapshot(ws);   // (no greeting sound from the bridge -- the deck plays its own tone on auth success)
 }
 
 // ---------- websocket ----------
@@ -768,7 +805,6 @@ wss.on('connection', (ws, req) => {
         ws._deviceId = typeof m.device_id === 'string' ? m.device_id : null;
         ws._deviceName = typeof m.name === 'string' ? m.name : null;
         console.log(`[ws] hello from ${m.name} (${m.fw}) device_id=${ws._deviceId || '?'}`);
-        sendSound('done');
         try {
           ws.send(JSON.stringify({
             type: 'hello_ack', bridge_id: BRIDGE_ID, host: SHORT_HOST, fw: BRIDGE_FW,
@@ -843,18 +879,40 @@ wss.on('connection', (ws, req) => {
 });
 
 // ---------- mDNS advertising: the deck auto-discovers every bridge on the LAN (_claudeq._tcp) ----------
+// Chain: dns-sd (macOS, native) -> avahi-publish-service (Linux w/ avahi-utils) -> bonjour-service
+// (vendored pure-JS, works anywhere). spawn() never throws on a missing binary — it emits an async
+// 'error' — so success is only logged from the 'spawn' event, and each ENOENT advances the chain.
+// The old version logged "advertising" unconditionally and swallowed both failures, so a Linux box
+// without avahi silently never advertised while claiming it did.
 let mdnsProc = null;
+let mdnsBonjour = null;
 function startMdns() {
   const inst = `Claudeq @ ${os.hostname().replace(/\.local$/, '')}`;
-  const tryCmd = (cmd, args) => { try { const p = spawn(cmd, args, { stdio: 'ignore' }); return p; } catch { return null; } };
-  // macOS (Bonjour) first; fall back to Linux (Avahi) if dns-sd is missing
-  mdnsProc = tryCmd('dns-sd', ['-R', inst, '_claudeq._tcp', '.', String(PORT)]);
-  if (mdnsProc) {
-    mdnsProc.on('error', () => { mdnsProc = tryCmd('avahi-publish-service', [inst, '_claudeq._tcp', String(PORT)]); if (mdnsProc) mdnsProc.on('error', () => {}); });
-    console.log(`  mDNS: advertising "${inst}" as _claudeq._tcp on :${PORT}`);
-  }
+  const announce = (via) => console.log(`  mDNS: advertising "${inst}" as _claudeq._tcp on :${PORT} (via ${via})`);
+  const tryBonjour = async () => {
+    try {
+      const { Bonjour } = await import('bonjour-service');
+      mdnsBonjour = new Bonjour();
+      mdnsBonjour.publish({ name: inst, type: 'claudeq', port: PORT });
+      announce('bonjour-service');
+    } catch (e) {
+      console.error(`  mDNS: advertising UNAVAILABLE (${e.message}) — decks must be pointed at this host manually (Bridge address on the deck's setup screen)`);
+    }
+  };
+  const tryCmd = (cmd, args, via, onFail) => {
+    const p = spawn(cmd, args, { stdio: 'ignore' });
+    p.on('spawn', () => announce(via));
+    p.on('error', () => { mdnsProc = null; onFail(); });
+    return p;
+  };
+  mdnsProc = tryCmd('dns-sd', ['-R', inst, '_claudeq._tcp', '.', String(PORT)], 'dns-sd', () => {
+    mdnsProc = tryCmd('avahi-publish-service', [inst, '_claudeq._tcp', String(PORT)], 'avahi', () => { tryBonjour(); });
+  });
 }
-function stopMdns() { if (mdnsProc) { try { mdnsProc.kill(); } catch {} mdnsProc = null; } }
+function stopMdns() {
+  if (mdnsProc) { try { mdnsProc.kill(); } catch {} mdnsProc = null; }
+  if (mdnsBonjour) { try { mdnsBonjour.unpublishAll(); mdnsBonjour.destroy(); } catch {} mdnsBonjour = null; }
+}
 process.on('exit', stopMdns);
 process.on('SIGINT', () => { stopMdns(); process.exit(0); });
 process.on('SIGTERM', () => { stopMdns(); process.exit(0); });

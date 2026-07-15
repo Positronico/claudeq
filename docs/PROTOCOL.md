@@ -10,8 +10,9 @@ reconnect runs a fresh authentication handshake and all application traffic (`se
 in an AES-256-GCM `sec` envelope. See "Authentication & encryption" for the full model.
 
 ## Pairing
-Either side can start pairing against an already-connected socket: the device from Settings → **Paired
-Bridges** → **Pair new bridge**, or the bridge operator via **`claudeq pair`**. Both derive an ephemeral
+Either side can start pairing against an already-connected socket: on the device, open Settings → **Paired
+Bridges**, where any connected-but-unpaired bridge shows up as a tappable **"New bridge — tap to pair →"**
+row (tapping it starts the ceremony); or the bridge operator runs **`claudeq pair`**. Both derive an ephemeral
 X25519 key pair, exchange public keys, and independently compute a 6-digit code
 (`HMAC-SHA256(ecdh_shared, sorted(pub_a, pub_b))`, truncated). The device displays its code on-screen; the
 bridge CLI prints its own and asks "Codes match? [y/N]". This is a Bluetooth/Signal-style **Short
@@ -20,8 +21,8 @@ an active MITM had relayed/substituted the exchange, the two independently-compu
 
 Only when **both** sides confirm (device taps Confirm, bridge operator answers `y`) do they derive a
 persistent PSK (`HMAC-SHA256(ecdh_shared, "claudeq-psk-v1")`) and store a trust record — device in NVS
-(bounded table, `main/trust.cpp`), bridge in `bridge/trust.json` keyed by the device's persistent
-`device_id`. Either a reject or a ~90s timeout aborts with nothing persisted. Ephemeral keys and the raw
+(bounded table, `main/trust.cpp`), bridge in `~/.claudeq/trust.json` (override the dir with
+`$CLAUDEQ_STATE_DIR`) keyed by the device's persistent `device_id`. Either a reject or a ~90s timeout aborts with nothing persisted. Ephemeral keys and the raw
 ECDH shared secret are discarded immediately after deriving the PSK.
 
 | type | direction | fields | meaning |
@@ -33,9 +34,11 @@ ECDH shared secret are discarded immediately after deriving the PSK.
 | `pair_ack` | either | `ok`, `label` | Sent after this side has locally persisted the new trust record |
 
 Management: bridge — `claudeq pair` (interactive), `claudeq devices [list]`, `claudeq devices disconnect
-<id>`, `claudeq devices forget <id>`. Device — Settings → Paired Bridges: list with a live-connected dot,
-Pair new bridge, and per-entry Disconnect (drops the live connection, trust untouched, re-authenticates on
-reconnect) / Forget (revokes trust — a fresh pairing ceremony is required afterward).
+<id>`, `claudeq devices forget <id>`. Device — Settings → Paired Bridges: each paired bridge is a row with
+a live-connected dot and **Disc.** (drops the live connection, trust untouched, re-authenticates on
+reconnect) / **Forget** (revokes trust — a fresh pairing ceremony is required afterward) buttons; any
+connected-but-unpaired bridge appears below them as a tappable **"New bridge — tap to pair →"** row that
+starts a ceremony.
 
 ## Authentication & encryption
 Every reconnect between an already-paired device and bridge runs a mutual handshake **before** any
@@ -78,7 +81,8 @@ Each bridge advertises itself on the LAN over **mDNS** as `_claudeq._tcp` (port 
 The deck browses for that service and opens a WebSocket to **every** bridge it finds — so bridges
 on several computers all feed one deck. The deck tags each session with the connection it came from
 and routes `answer`/`focus`/`macro`/voice back to that same bridge. No bridge IP is configured on the
-deck; an explicit address can still be set to force a single fixed bridge.
+deck; an explicit address can still be set to **add** a fixed bridge (useful when mDNS is blocked) — it is
+additive, not exclusive: mDNS and tailnet discovery keep connecting to every other bridge alongside it.
 
 ## Multi-session model
 Each bridge tracks every live Claude Code session on its machine (keyed by `session_id`), each with a
@@ -99,7 +103,7 @@ focused session's tmux target on its bridge. A question auto-focuses the session
 | `hud` | `sid`, `model`, `elapsedMs`, `tokens`, `costUSD`, `lastTool`, `todos[]`, `cwd` | Telemetry of the focused session. Still sent by the bridge, but the deck no longer renders a HUD strip (the session state moved to the bottom status strip). |
 | `activity` | `sid`, and **either** `line` = `{ts, kind, label, detail, full?}` (append one) **or** `feed[]` (full snapshot, replace) | Live "what's Claude doing" feed for the Session screen. `kind` ∈ `tool`/`prompt`/`notify`/`done`/`reply`/`start`; a `reply` line also carries `full` = the complete (deck-safe, ≤2000 char) reply text — tapping the reply row opens it in the deck's landscape reader. `label` is the tool name (or `you`/`done`), `detail` the target (file, command, pattern…). The `start` line's `detail` is the **model name** (falling back to the project folder if unknown). The deck wakes the screen from standby on `ask`/`alert`/`reply`/`done`/`notify`, not on routine `tool`/`prompt`/`start`. A snapshot is sent on focus/connect (**after** any `ask`, so the deck has adopted the new focus before it lands); single lines stream as events arrive. Only for the focused session. The deck clears its feed on every focus change so one session's activity never appends onto another's. |
 | `macros` | `items[]` = `{id,label,icon,prompt}` | The macro deck contents (global) |
-| `alert` | `sid`, `level` (`info`/`attn`/`error`), `text`, `sound` | Pull-attention: chirp + flash |
+| `alert` | `sid`, `level` (`info`/`attn`/`error`), `text`, `sound` (`chirp`\|`soft`\|`error`) | Pull-attention: flash + play the named built-in tone. The `sound` field is **omitted** when a custom clip exists at `~/.claudeq/sounds/alert.*` (for `attn`) or `~/.claudeq/sounds/done.*` — the bridge streams that PCM clip instead, and dropping the tone field keeps the tone and the clip from double-playing. |
 | `transcript` | `id`, `text`, `sid` | Voice: the transcript for capture `id`, awaiting on-device confirmation. Replaces the old auto-inject — the deck shows `text` with **Send/Cancel** and the bridge holds it until `voice_commit`/`voice_cancel` (or 120 s). Empty `text` = nothing recognized. |
 
 ## Device → Bridge
@@ -121,6 +125,11 @@ exports `CLAUDEQ_TMUX` (the tmux target) and `CLAUDEQ_TITLE` (project name); the
 those — `event.sh` via `x-claudeq-tmux` / `x-claudeq-title` headers, `askquestion.mjs` in the
 `/ask` body's `session` object. The first event from a session registers it; a `tmux has-session`
 sweep prunes it when its pane is gone.
+
+The hook commands in `ccdeck-settings.json` locate their scripts via **`$CLAUDEQ_HOME`**, which the
+`claudeq` launcher exports (pointing at the bridge install dir). Running `claude --settings
+.../ccdeck-settings.json` **directly, without the launcher**, leaves `$CLAUDEQ_HOME` unset, so every hook
+path fails to resolve and **all deck events break** — always go through `claudeq`.
 
 ## CC-facing answer mechanism (bridge ↔ Claude Code)
 Decided empirically (see live tmux test):

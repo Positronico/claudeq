@@ -17,8 +17,13 @@ Discovery is **hybrid** — we *add* tailnet discovery without removing mDNS:
   that are **not** on your tailnet (so a home box that never joined Tailscale is still reachable while
   the deck is at home).
 - **Tailnet (remote):** when an auth key is configured, the deck also enumerates tailnet peers
-  (`microlink_get_peer_count` / `microlink_get_peer_info`, with a peer callback for liveness), filters to
-  Claudeq bridges, and opens a WebSocket to each over its `100.x` VPN IP.
+  (`microlink_get_peer_count` / `microlink_get_peer_info`, with a peer callback for liveness) and opens a
+  WebSocket to **every online peer** over its `100.x` VPN IP — there's no cheap way to know which peers run
+  a bridge without trying, so it probes them all. A peer that never completes a WS handshake within **60 s**
+  is almost certainly not a bridge (a phone, another laptop…), so the deck **backs it off for 10 minutes**
+  (a negative cache) instead of re-adding and retrying it every discovery pass forever. Peers that do
+  handshake stay connected; the backoff only sheds the dead ones. (Filtering peers up front by tag or
+  hostname is a possible future refinement.)
 
 A machine reachable both ways has **two different addresses** (its LAN IP and its `100.x` tailnet IP), so
 `ip:port` can't dedup it. Instead the bridge sends a stable per-process **`bridge_id`** in its `sessions`

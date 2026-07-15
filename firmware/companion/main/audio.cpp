@@ -80,8 +80,8 @@ static void audio_task(void *arg) {
 extern "C" void audio_set_muted(bool muted) { s_muted = muted; }
 
 extern "C" void audio_play_pcm(const void *data, size_t bytes) {
-    if (s_muted) return;
-    if (!s_dev || !data || bytes == 0 || bytes > 1024 * 1024) return;
+    if (s_muted) { ESP_LOGI(TAG, "pcm dropped: sounds off in Settings"); return; }
+    if (!s_dev || !data || bytes == 0 || bytes > 1024 * 1024) { ESP_LOGW(TAG, "pcm dropped: dev=%d bytes=%u", (int)(s_dev != NULL), (unsigned)bytes); return; }
     void *copy = heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM);
     if (!copy) { ESP_LOGW(TAG, "pcm alloc failed (%u)", (unsigned)bytes); return; }
     memcpy(copy, data, bytes);

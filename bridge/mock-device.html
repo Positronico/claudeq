@@ -210,7 +210,13 @@ function connectBridge(idx){
     const ws=new WebSocket(url); ws.binaryType='arraybuffer'; c.ws=ws;
     ws.onopen=()=>{ c.up=true; updateConn(); sendTo(idx,{type:'hello',name:'mock-device',fw:'mock-0.2',caps:['session','macros','voice','settings'],device_id:DEVICE_ID}); log(`b${idx} connected (${url})`); };
     ws.onclose=()=>{ c.up=false; updateConn(); bridgeGone(idx); setTimeout(open,1000); };
-    ws.onmessage=async (e)=>{
+    // Serialize the async handlers: WebCrypto awaits yield the event loop, so without this chain a
+    // burst of frames (e.g. the encrypted snapshot the bridge sends right after auth_verify) can be
+    // processed out of order / while c.authenticated is still being flipped — dropping the snapshot
+    // (empty Macros page) or tripping the counter check. Each message fully completes before the next.
+    c.q = Promise.resolve();
+    ws.onmessage=(ev)=>{ c.q = c.q.then(()=>handleMessage(ev)).catch(()=>{}); };
+    const handleMessage=async (e)=>{
       if (e.data instanceof ArrayBuffer) {   // binary: sound clip envelope [8B counter][ciphertext+tag]
         if (!c.authenticated) return;
         const buf = new Uint8Array(e.data);

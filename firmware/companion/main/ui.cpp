@@ -736,6 +736,10 @@ void ui_handle_message(cJSON *root, int bridge) {
         cJSON *lvl = cJSON_GetObjectItem(root, "level");
         const char *lv = cJSON_IsString(lvl) ? lvl->valuestring : "info";
         lv_obj_set_style_bg_color(lv_scr_act(), lv_color_hex(!strcmp(lv, "error") ? 0x3a1414 : 0x10161f), 0);
+        // Built-in tone: the bridge omits `sound` when it streams a custom PCM clip instead, so the two
+        // never double-play. With no bridge-side sound files (the default install), this IS the alert sound.
+        cJSON *snd = cJSON_GetObjectItem(root, "sound");
+        if (cJSON_IsString(snd) && snd->valuestring[0]) audio_play_alert(snd->valuestring);
         app_wake_for_event();                // an alert wants your attention -> wake the screen
     }
     ui_unlock();

@@ -3,14 +3,29 @@
 // device's persistent device_id; each entry holds the long-term PSK derived during pairing
 // (see crypto.mjs's derivePsk) plus a display label and pairing timestamp.
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const TRUST_FILE = path.join(__dirname, 'trust.json');
+// Mutable state lives OUTSIDE the install dir: under Homebrew, __dirname is the versioned keg, which
+// is wiped on every `brew upgrade` — trust.json there means every paired deck is silently orphaned on
+// upgrade (new bridgeId, empty device table). ~/.claudeq is the project's per-user state dir.
+export const STATE_DIR = process.env.CLAUDEQ_STATE_DIR || path.join(os.homedir(), '.claudeq');
+const TRUST_FILE = path.join(STATE_DIR, 'trust.json');
+const LEGACY_TRUST_FILE = path.join(__dirname, 'trust.json');
 
 function load() {
+  // one-time migration from the pre-2.1.5 install-dir location
+  if (!fs.existsSync(TRUST_FILE) && fs.existsSync(LEGACY_TRUST_FILE)) {
+    try {
+      fs.mkdirSync(STATE_DIR, { recursive: true });
+      fs.copyFileSync(LEGACY_TRUST_FILE, TRUST_FILE);
+      fs.chmodSync(TRUST_FILE, 0o600);
+      console.log(`[trust] migrated ${LEGACY_TRUST_FILE} -> ${TRUST_FILE}`);
+    } catch (e) { console.error(`[trust] migration failed: ${e.message}`); }
+  }
   try {
     const raw = JSON.parse(fs.readFileSync(TRUST_FILE, 'utf8'));
     if (!raw.devices || typeof raw.devices !== 'object') raw.devices = {};
@@ -21,7 +36,14 @@ function load() {
 }
 
 const state = load();
-function save() { fs.writeFileSync(TRUST_FILE, JSON.stringify(state, null, 2)); }
+function save() {
+  // atomic write (tmp + rename): a crash mid-write must never corrupt the store — load()'s catch would
+  // silently drop every paired device and mint a fresh bridgeId. 0600: the file holds per-device PSKs.
+  fs.mkdirSync(STATE_DIR, { recursive: true });
+  const tmp = TRUST_FILE + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(state, null, 2), { mode: 0o600 });
+  fs.renameSync(tmp, TRUST_FILE);
+}
 
 // BRIDGE_ID must survive process restarts for pairing to remain valid — previously this was
 // randomUUID() every run (bridge.mjs originally), which silently orphaned every paired device

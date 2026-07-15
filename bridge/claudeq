@@ -14,10 +14,17 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SETTINGS="$SCRIPT_DIR/ccdeck-settings.json"
+# Per-user state dir (also used by the bridge for trust.json/macros.json — see bridge.mjs). The log
+# must NOT live in $SCRIPT_DIR: under Homebrew that's the versioned keg — wiped on upgrade, and not
+# even writable when the keg belongs to another user.
+STATE_DIR="${CLAUDEQ_STATE_DIR:-$HOME/.claudeq}"
+LOG_FILE="$STATE_DIR/bridge.log"
 
 # ---- shared bridge start/stop helpers — used by start-bridge/stop-bridge/restart-bridge below AND
 # the default launch path's own "make sure it's up" step, so there's one place that knows how. ----
 bridge_is_up() { curl -fsS -m 1 "http://127.0.0.1:${1}/health" >/dev/null 2>&1; }
+# The running bridge's version, per /health (empty if not running / pre-2.1.5 bridge without the field).
+bridge_fw() { curl -fsS -m 1 "http://127.0.0.1:${1}/health" 2>/dev/null | sed -n 's/.*"fw":"\([^"]*\)".*/\1/p'; }
 bridge_stop() {
   local port="$1"
   lsof -ti tcp:"$port" 2>/dev/null | xargs kill 2>/dev/null || true   # kill whatever holds the port
@@ -25,14 +32,29 @@ bridge_stop() {
 }
 bridge_start() {
   local port="$1"
+  mkdir -p "$STATE_DIR"
   # Append (not truncate): if two launchers race to start the bridge, the loser exits on
   # EADDRINUSE (harmless, one wins) and must not clobber the winner's startup log.
-  CCDECK_PORT="$port" nohup node "$SCRIPT_DIR/bridge.mjs" >>"$SCRIPT_DIR/bridge.log" 2>&1 &
+  CCDECK_PORT="$port" nohup node "$SCRIPT_DIR/bridge.mjs" >>"$LOG_FILE" 2>&1 &
   for _ in 1 2 3 4 5 6 7 8 9 10; do
     bridge_is_up "$port" && return 0
     sleep 0.3
   done
   return 1
+}
+# After a `brew upgrade`, a bridge from the DELETED old keg can keep running (and serving /health)
+# indefinitely — every new claudeq invocation would silently keep using stale bridge code. Compare the
+# running bridge's version against this install's and bounce it on mismatch.
+bridge_ensure_current() {
+  local port="$1" want have
+  want="$(cat "$SCRIPT_DIR/../firmware/dist/VERSION" 2>/dev/null || true)"
+  [ -z "$want" ] && return 0
+  have="$(bridge_fw "$port")"
+  if [ "$have" != "$want" ]; then   # empty $have = pre-2.1.5 bridge with no fw field: stale by definition
+    echo "claudeq: bridge on :${port} is v${have:-unknown}, this install is v${want} — restarting it..."
+    bridge_stop "$port"; sleep 1; bridge_start "$port" || return 1
+  fi
+  return 0
 }
 
 # ---- `claudeq help` / `-h` / `--help` — claudeq's OWN usage, never falls through to `claude` ----
@@ -92,7 +114,7 @@ if [ "${1:-}" = "start-bridge" ] || [ "${1:-}" = "start" ]; then
     echo "claudeq: bridge started on :${PORT}."
     exit 0
   fi
-  echo "claudeq: bridge failed to start — see $SCRIPT_DIR/bridge.log" >&2
+  echo "claudeq: bridge failed to start — see $LOG_FILE" >&2
   exit 1
 fi
 
@@ -124,17 +146,23 @@ if [ "${1:-}" = "restart-bridge" ] || [ "${1:-}" = "restart" ]; then
     echo "claudeq: bridge restarted on :${PORT}."
     exit 0
   fi
-  echo "claudeq: bridge failed to restart — see $SCRIPT_DIR/bridge.log" >&2
+  echo "claudeq: bridge failed to restart — see $LOG_FILE" >&2
   exit 1
 fi
 
 PORT="${CCDECK_PORT:-8787}"
 export CCDECK_PORT="$PORT"
+# Hook commands in ccdeck-settings.json locate their scripts via $CLAUDEQ_HOME -- absolute paths would
+# only be right on the machine the file was authored on (this broke every Homebrew install: hooks
+# silently pointed at a dev checkout that doesn't exist there, so bridges never saw any session).
+export CLAUDEQ_HOME="$SCRIPT_DIR"
 
-# ---- 1. make sure the bridge is up ----
+# ---- 1. make sure the bridge is up AND running this install's code (not a pre-upgrade leftover) ----
 if ! bridge_is_up "$PORT"; then
   echo "claudeq: starting bridge on :${PORT}..."
-  bridge_start "$PORT" || echo "claudeq: bridge failed to start — see $SCRIPT_DIR/bridge.log" >&2
+  bridge_start "$PORT" || echo "claudeq: bridge failed to start — see $LOG_FILE" >&2
+else
+  bridge_ensure_current "$PORT" || echo "claudeq: bridge restart failed — see $LOG_FILE" >&2
 fi
 
 # ---- 2. project title + tmux target ----
@@ -155,6 +183,14 @@ TARGET="claudeq-${SLUG}-$$"
 
 # Carry identity via tmux's per-session env (-e) and pass the command as a real argv vector, so
 # Claude args with spaces/quotes survive intact and hook child processes inherit CLAUDEQ_*.
-exec tmux new-session -s "$TARGET" \
-  -e "CLAUDEQ_TMUX=$TARGET" -e "CLAUDEQ_TITLE=$TITLE" -e "CCDECK_PORT=$PORT" \
-  claude --settings "$SETTINGS" "$@"
+# `-e` needs tmux >= 3.2 (Ubuntu 20.04 ships 3.0a, Debian 11 ships 3.1c — there it's a usage error);
+# older tmux gets the env baked into a single %q-quoted command string instead.
+TMUX_VER="$(tmux -V 2>/dev/null | sed 's/[^0-9.]*//g')"
+if [ "$(printf '%s\n3.2\n' "${TMUX_VER:-0}" | sort -V | head -1)" = "3.2" ]; then
+  exec tmux new-session -s "$TARGET" \
+    -e "CLAUDEQ_TMUX=$TARGET" -e "CLAUDEQ_TITLE=$TITLE" -e "CCDECK_PORT=$PORT" -e "CLAUDEQ_HOME=$SCRIPT_DIR" \
+    claude --settings "$SETTINGS" "$@"
+fi
+CMD="CLAUDEQ_TMUX=$(printf '%q' "$TARGET") CLAUDEQ_TITLE=$(printf '%q' "$TITLE") CCDECK_PORT=$(printf '%q' "$PORT") CLAUDEQ_HOME=$(printf '%q' "$SCRIPT_DIR") claude --settings $(printf '%q' "$SETTINGS")"
+for a in "$@"; do CMD="$CMD $(printf '%q' "$a")"; done
+exec tmux new-session -s "$TARGET" "$CMD"

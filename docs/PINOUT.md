@@ -134,6 +134,6 @@ QSPI/touch/audio pins identical across V1/V2.
 - Backlight is **active-low**; enable bit1 AND set a non-max duty.
 - Panel is physically tall (172w×640h); we use it rotated to 640×172 landscape via software.
 - **ES8311 is a MONO codec.** Configure I2S + esp_codec_dev as mono (`channel=1`, `I2S_SLOT_MODE_MONO`). A stereo config double-speeds playback (pitched-up, harsh "bop"). Keep the speaker amp (NS_MODE bit7) ON during playback so tones aren't chopped.
-- Alert sounds are **streamed PCM clips** from the bridge (binary WS frames), not synth — see `bridge/sounds/` + `audio_play_pcm`.
+- Alert sounds are **built-in synth tones** by default (`audio_play_alert`); dropping a clip at `~/.claudeq/sounds/` on the bridge machine streams **PCM** instead (encrypted binary WS frames → `audio_play_pcm`).
 - ES8311 (speaker out) + ES7210 (mic in) share **one I2S** (BCLK15/WS46/MCLK7; out=DOUT45, in=DIN6) → mic capture needs full-duplex or play/record switching.
 - **Avoid `esp_lcd_panel_disp_on_off()` for standby on this board.** The AXS15231B driver's `panel_axs15231b_disp_off` sends DISPOFF/DISPON, but in practice the panel woke to a **black screen** (backlight on, no image) after a DISPOFF/DISPON cycle regardless of the bool passed — a plain DISPON didn't restore it. Blank with the **backlight** (BL_EN + PWM) instead; a panel that never gets DISPOFF always has a valid image the instant the backlight returns.

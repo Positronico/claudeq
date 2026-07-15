@@ -34,11 +34,14 @@ ECDH shared secret are discarded immediately after deriving the PSK.
 | `pair_ack` | either | `ok`, `label` | Sent after this side has locally persisted the new trust record |
 
 Management: bridge — `claudeq pair` (interactive), `claudeq devices [list]`, `claudeq devices disconnect
-<id>`, `claudeq devices forget <id>`. Device — Settings → Paired Bridges: each paired bridge is a row with
-a live-connected dot and **Disc.** (drops the live connection, trust untouched, re-authenticates on
-reconnect) / **Forget** (revokes trust — a fresh pairing ceremony is required afterward) buttons; any
-connected-but-unpaired bridge appears below them as a tappable **"New bridge — tap to pair →"** row that
-starts a ceremony.
+<id>`, `claudeq devices forget <id>`. Device — Settings → Paired Bridges: each paired bridge is a card
+(labelled with the bridge's machine name) with a live-connected dot and stacked **Disconnect** (drops the
+live connection, trust untouched, re-authenticates on reconnect; shows "offline" when there is no live
+connection) / **Forget** (revokes trust — asks for confirmation, since a fresh pairing ceremony is
+required afterward) buttons; any connected-but-unpaired bridge appears below them as a tappable
+**"New bridge — tap to pair →"** row that starts a ceremony. The card label is seeded from the bridge's
+`hello_ack` `host` at pairing time and refreshed after each successful authentication (never from an
+unauthenticated message), so renamed machines and entries stored by older firmware heal automatically.
 
 ## Authentication & encryption
 Every reconnect between an already-paired device and bridge runs a mutual handshake **before** any

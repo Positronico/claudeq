@@ -53,6 +53,9 @@ typedef struct {
     char *last_sessions;   // cached last 'sessions' JSON, replayed if this slot is promoted on a failover
     bool  ever_connected;  // the WS handshake has succeeded at least once — i.e. something IS a bridge there
     uint32_t first_seen;   // tick the slot was created; never-connected slots are given up on after a grace period
+    uint32_t down_since;   // tick the connection dropped (0 = connected / never yet connected); a slot down
+                           // too long has a wedged WS client (e.g. no auto-reconnect after a server-side
+                           // clean close) and gets recycled — see the stuck-slot reclaim in discovery_task
 } bridge_t;
 static bridge_t s_br[MAX_BRIDGES];
 static int s_focus_bridge = 0;       // where net_send_text/binary (macros/voice) go
@@ -119,7 +122,7 @@ static void ws_evt(void *args, esp_event_base_t base, int32_t id, void *data) {
     switch (id) {
     case WEBSOCKET_EVENT_CONNECTED: {
         ESP_LOGI(TAG, "bridge %d connected (%s:%d)", bi, b->ip, b->port);
-        b->connected = true; b->ever_connected = true; update_conn_icon();
+        b->connected = true; b->ever_connected = true; b->down_since = 0; update_conn_icon();
         pairing_on_connect(bi);                   // fresh connection -> fresh auth/pairing state for this slot
         char hello[220];
         int n = snprintf(hello, sizeof(hello),
@@ -131,6 +134,9 @@ static void ws_evt(void *args, esp_event_base_t base, int32_t id, void *data) {
     case WEBSOCKET_EVENT_DISCONNECTED:
     case WEBSOCKET_EVENT_CLOSED: {                // graceful/server-initiated close tears down too
         b->connected = false; update_conn_icon();
+        // Stamp when the outage STARTED (failed reconnect attempts re-fire this event — don't re-stamp,
+        // or the stuck-slot reclaim below could be pushed out forever by its own retry loop).
+        if (!b->down_since) b->down_since = xTaskGetTickCount();
         pairing_on_disconnect(bi);                // wipe this slot's session keys + abort any live ceremony with it
         free(b->rx); b->rx = NULL; b->rx_op = 0;  // discard any partial reassembly
         ui_bridge_gone(bi);                       // drop this bridge's sessions from the deck
@@ -267,19 +273,12 @@ static void peer_backoff_add(const char *ip) {
     s_peer_backoff[slot].until = xTaskGetTickCount() + pdMS_TO_TICKS(PEER_BACKOFF_MS);
 }
 
-static void ensure_bridge(const char *ip, int port, bool is_lan) {
-    for (int i = 0; i < MAX_BRIDGES; i++)
-        if (s_br[i].used && s_br[i].port == port && strcmp(s_br[i].ip, ip) == 0) { s_br[i].last_seen = xTaskGetTickCount(); return; }  // already known
-    if (!is_lan && peer_backed_off(ip)) return;   // recently proven not to be a bridge — don't churn a slot on it
-    int slot = -1;
-    for (int i = 0; i < MAX_BRIDGES; i++) if (!s_br[i].used) { slot = i; break; }
-    if (slot < 0) return;  // all slots in use
-    bridge_t *b = &s_br[slot];
-    b->used = true; b->connected = false; b->port = port; b->last_seen = xTaskGetTickCount();
-    b->is_lan = is_lan; b->primary = true; b->bridge_id[0] = 0; b->last_sessions = NULL;
-    b->ever_connected = false; b->first_seen = xTaskGetTickCount();
-    snprintf(b->ip, sizeof(b->ip), "%s", ip);
-    char uri[80]; snprintf(uri, sizeof(uri), "ws://%s:%d/", ip, port);
+// Create + start the WS client for a slot (shared by ensure_bridge and the stuck-slot rebuild in
+// discovery_task). Returns false when client init failed — the caller releases the slot; leaving
+// used=true with a NULL client would pin this ip:port to a slot that never dials NOR errors,
+// invisible and permanent (the ip:port dedupe refreshes last_seen every discovery pass).
+static bool slot_start_client(int slot, bridge_t *b) {
+    char uri[80]; snprintf(uri, sizeof(uri), "ws://%s:%d/", b->ip, b->port);
     esp_websocket_client_config_t cfg = {};
     cfg.uri = uri;
     cfg.reconnect_timeout_ms = 4000;
@@ -292,9 +291,29 @@ static void ensure_bridge(const char *ip, int port, bool is_lan) {
     // same headroom already used elsewhere in this firmware for similarly-loaded tasks (discovery_task).
     cfg.task_stack = 8192;
     b->client = esp_websocket_client_init(&cfg);
+    if (!b->client) {
+        ESP_LOGE(TAG, "bridge %d: websocket client init failed (%s)", slot, uri);
+        return false;
+    }
     esp_websocket_register_events(b->client, WEBSOCKET_EVENT_ANY, ws_evt, (void *)(intptr_t)slot);
     esp_websocket_client_start(b->client);
     ESP_LOGI(TAG, "bridge %d -> %s", slot, uri);
+    return true;
+}
+
+static void ensure_bridge(const char *ip, int port, bool is_lan) {
+    for (int i = 0; i < MAX_BRIDGES; i++)
+        if (s_br[i].used && s_br[i].port == port && strcmp(s_br[i].ip, ip) == 0) { s_br[i].last_seen = xTaskGetTickCount(); return; }  // already known
+    if (!is_lan && peer_backed_off(ip)) return;   // recently proven not to be a bridge — don't churn a slot on it
+    int slot = -1;
+    for (int i = 0; i < MAX_BRIDGES; i++) if (!s_br[i].used) { slot = i; break; }
+    if (slot < 0) return;  // all slots in use
+    bridge_t *b = &s_br[slot];
+    b->used = true; b->connected = false; b->port = port; b->last_seen = xTaskGetTickCount();
+    b->is_lan = is_lan; b->primary = true; b->bridge_id[0] = 0; b->last_sessions = NULL;
+    b->ever_connected = false; b->first_seen = xTaskGetTickCount(); b->down_since = 0;
+    snprintf(b->ip, sizeof(b->ip), "%s", ip);
+    if (!slot_start_client(slot, b)) b->used = false;   // release; the next discovery pass retries fresh
 }
 
 // Bring the deck onto the user's tailnet when an auth key is configured. microlink rides the existing
@@ -424,16 +443,50 @@ static void discovery_task(void *arg) {
         // reclaim slots whose bridge stopped advertising and isn't connected (vanished / changed IP),
         // and give up on TAILNET peers that never completed a WS handshake within the grace period —
         // those are almost certainly not bridges at all (phones, laptops...); back them off for 10 min.
-        // LAN slots are exempt from the never-connected reclaim: an mDNS _claudeq._tcp advertisement IS
-        // proof a bridge lives there, and a bridge that's merely restarting must not get blacklisted
-        // (that would blind the deck to it for 10 minutes over a few seconds of downtime).
+        // LAN slots are exempt from the never-connected BLACKLIST: an mDNS _claudeq._tcp advertisement IS
+        // proof a bridge lives there, and a bridge that's merely restarting must not get backed off for
+        // 10 minutes over a few seconds of downtime — but they are NOT exempt from being recycled.
+        //
+        // The `stuck` rules below recycle a slot whose WS client has died while the bridge is still
+        // advertised: the advertisement refreshes last_seen every pass, so the `vanished` rule never
+        // fires, and without recycling the slot is pinned to a dead client FOREVER (ensure_bridge
+        // dedupes by ip:port into it) — the deck showed the bridge "offline" until a reboot. Seen in
+        // the field two ways: esp_websocket_client does not auto-reconnect after a server-initiated
+        // clean close (bridge-side `claudeq devices disconnect`), and a client wedged across rapid
+        // bridge restarts during `brew upgrade`. A healthy outage never trips this: auto-reconnect
+        // retries every 4s, so 45s of continuous downedness means the client is not coming back.
+        // Recycling only frees the slot — re-discovery (mDNS/tailnet, ~8s) re-adds it with a fresh
+        // client, and a LAN bridge that is genuinely down simply stops being advertised (no re-add).
+        #define STUCK_RECYCLE_MS 45000
         uint32_t now = xTaskGetTickCount();
         for (int i = 0; i < MAX_BRIDGES; i++) {
             bridge_t *b = &s_br[i];
             bool vanished = b->used && !b->connected && (now - b->last_seen) > pdMS_TO_TICKS(30000);
             bool notabridge = b->used && !b->connected && !b->ever_connected && !b->is_lan && (now - b->first_seen) > pdMS_TO_TICKS(NEVER_CONNECTED_MS);
-            if (vanished || notabridge) {
-                ESP_LOGW(TAG, "reclaiming %s bridge slot %d (%s:%d)", notabridge ? "never-connected" : "stale", i, b->ip, b->port);
+            // stuck: was connected, has now been down way beyond the 4s auto-reconnect for 45s straight.
+            // The client is wedged — rebuild it IN PLACE rather than freeing the slot: the slot keeps
+            // ever_connected (this machine IS a bridge — freeing would let a still-down bridge be
+            // re-discovered as a fresh never-connected peer and funneled into the 10-min blacklist),
+            // and rebuilding here heals immediately instead of waiting for the next discovery pass.
+            bool stuck = b->used && !b->connected && b->ever_connected &&
+                         b->down_since && (now - b->down_since) > pdMS_TO_TICKS(STUCK_RECYCLE_MS);
+            // a LAN slot that never managed a single handshake (wrong resolved IP, client wedged at
+            // start) — FREE it (a fresh discovery pass may resolve a better IP) after the same grace
+            // tailnet peers get, just without the blacklist: the mDNS advertisement is proof of a bridge.
+            bool lan_never = b->used && !b->connected && !b->ever_connected && b->is_lan &&
+                             (now - b->first_seen) > pdMS_TO_TICKS(NEVER_CONNECTED_MS);
+            if (stuck) {
+                ESP_LOGW(TAG, "rebuilding stuck bridge slot %d (%s:%d)", i, b->ip, b->port);
+                if (b->client) { esp_websocket_client_stop(b->client); esp_websocket_client_destroy(b->client); b->client = NULL; }
+                free(b->rx); b->rx = NULL; b->rx_op = 0;
+                ls_lock(); free(b->last_sessions); b->last_sessions = NULL; ls_unlock();
+                b->bridge_id[0] = 0; b->primary = true; b->down_since = 0;   // fresh hello_ack re-stamps identity
+                if (!slot_start_client(i, b)) b->used = false;   // rebuild failed (OOM) — release for re-discovery
+                continue;
+            }
+            if (vanished || notabridge || lan_never) {
+                ESP_LOGW(TAG, "reclaiming %s bridge slot %d (%s:%d)",
+                         (notabridge || lan_never) ? "never-connected" : "stale", i, b->ip, b->port);
                 if (notabridge) peer_backoff_add(b->ip);
                 if (b->client) { esp_websocket_client_stop(b->client); esp_websocket_client_destroy(b->client); }
                 free(b->rx);

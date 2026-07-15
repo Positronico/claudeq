@@ -1207,22 +1207,63 @@ static int find_bridge_slot_by_id(const char *bridge_id) {
     }
     return -1;
 }
-static void pb_disconnect_cb(lv_event_t *e) {
-    int idx = (int)(intptr_t)lv_event_get_user_data(e);
-    if (idx >= 0) net_disconnect_bridge(idx);
-    ui_show_paired_bridges();   // rebuild to reflect the change
+// Disconnect/Forget hand the actual teardown to discovery_task (net_disconnect_bridge just notifies
+// it), so a rebuild right after the tap still reads the PRE-teardown state and the card would keep
+// showing a live "Disconnect" that appears to do nothing. Rebuild again once the teardown has had
+// time to land. (One-shot; NOT cancelled by pb_close — the tick no-ops when the screen is gone.)
+static lv_timer_t *s_pb_refresh = NULL;
+static void pb_refresh_tick(lv_timer_t *t) {
+    (void)t;
+    s_pb_refresh = NULL;                        // one-shot timers self-delete after this returns
+    if (s_pb_ov) ui_show_paired_bridges();
 }
-static void pb_forget_cb(lv_event_t *e) {
+static void pb_schedule_refresh(void) {
+    if (s_pb_refresh) lv_timer_del(s_pb_refresh);   // collapse rapid taps into the newest deadline
+    s_pb_refresh = lv_timer_create(pb_refresh_tick, 2500, NULL);
+    lv_timer_set_repeat_count(s_pb_refresh, 1);
+}
+static void pb_disconnect_cb(lv_event_t *e) {
+    // Resolve the slot at TAP time from the row's bridge_id — a slot index captured at render time
+    // can go stale (slots are recycled/re-added by discovery while this screen sits open).
     const char *bridge_id = (const char *)lv_event_get_user_data(e);
     int slot = find_bridge_slot_by_id(bridge_id);
     if (slot >= 0) net_disconnect_bridge(slot);
-    trust_forget(bridge_id);
-    ui_show_paired_bridges();   // rebuild
+    ui_show_paired_bridges();   // rebuild to reflect the change...
+    pb_schedule_refresh();      // ...and again after the async teardown actually lands
+}
+// Forget revokes the pairing — the deck can't talk to that bridge again without a fresh SAS ceremony.
+// That's too destructive for a single tap (it happened in the field, on a row that showed only an ID),
+// so it goes through the same confirm modal WiFi-off uses. The pending target is stashed in statics
+// because show_modal's yes-callback is a bare function pointer (no user data).
+static char s_pb_forget_id[40];
+static char s_pb_forget_label[24];
+static void pb_forget_confirmed(void) {
+    int slot = find_bridge_slot_by_id(s_pb_forget_id);
+    if (slot >= 0) net_disconnect_bridge(slot);
+    trust_forget(s_pb_forget_id);
+    ui_show_paired_bridges();   // rebuild (trust row is gone at once; the socket teardown is async)
+    pb_schedule_refresh();      // pick up the post-teardown state ("New bridge" row, dots)
+}
+static void pb_forget_cb(lv_event_t *e) {
+    const char *bridge_id = (const char *)lv_event_get_user_data(e);
+    int idx = trust_find(bridge_id);
+    trust_bridge_t entry;
+    snprintf(s_pb_forget_id, sizeof(s_pb_forget_id), "%s", bridge_id);
+    snprintf(s_pb_forget_label, sizeof(s_pb_forget_label), "%s",
+             (idx >= 0 && trust_get(idx, &entry)) ? entry.label : "bridge");
+    char body[120];
+    snprintf(body, sizeof(body), "Forget \"%s\"?\nYou'll need to pair\nagain to use it.", s_pb_forget_label);
+    show_modal("Forget bridge", body, "Forget", pb_forget_confirmed);
 }
 static void pb_pair_cb(lv_event_t *e) {
-    int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    // Resolve by bridge_id at TAP time, like Disconnect/Forget: a render-time slot index can be
+    // recycled and refilled with a DIFFERENT bridge while this screen sits open — pairing would then
+    // silently start a SAS ceremony with the wrong machine.
+    const char *bid = (const char *)lv_event_get_user_data(e);
+    int slot = find_bridge_slot_by_id(bid);
+    if (slot < 0 || trust_find(bid) >= 0) { ui_show_paired_bridges(); return; }   // gone or paired meanwhile
     pb_close();                // one overlay at a time -- the SAS confirm overlay takes over from here
-    pairing_start_as_device(idx);
+    pairing_start_as_device(slot);
 }
 static void ui_show_paired_bridges(void) {
     pb_close();
@@ -1252,7 +1293,7 @@ static void ui_show_paired_bridges(void) {
     lv_obj_set_scroll_dir(list, LV_DIR_VER);
     lv_obj_set_scrollbar_mode(list, LV_SCROLLBAR_MODE_AUTO);
 
-    // bridge_id strings must outlive this function for the Forget button callbacks -- a small bounded
+    // bridge_id strings must outlive this function for the button callbacks -- a small bounded
     // static table (MAX_TRUSTED_BRIDGES is tiny) reused across rebuilds, not a per-call heap allocation.
     static char forget_ids[MAX_TRUSTED_BRIDGES][40];
     for (int i = 0; i < MAX_TRUSTED_BRIDGES; i++) {
@@ -1260,48 +1301,63 @@ static void ui_show_paired_bridges(void) {
         if (!trust_get(i, &entry)) continue;
         int slot = find_bridge_slot_by_id(entry.bridge_id);
         bool live = slot >= 0 && pairing_is_authenticated(slot);
+        bool connected = false, used = false;   // any live socket at all (even mid-auth) — Disconnect's target
+        if (slot >= 0) net_bridge_info(slot, &used, &connected, NULL, 0, NULL, 0);
+        snprintf(forget_ids[i], sizeof(forget_ids[i]), "%s", entry.bridge_id);
 
+        // Big card: name on top, then Disconnect and Forget as full-width stacked buttons — large
+        // enough to read unabbreviated and to tap without hitting the neighbour.
         lv_obj_t *row = lv_obj_create(list);
-        lv_obj_set_size(row, 150, 74); style_card(row);
+        lv_obj_set_size(row, 150, 132); style_card(row);
         lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_set_style_pad_all(row, 6, 0);
+        lv_obj_set_style_pad_all(row, 8, 0);
 
-        lv_obj_t *dot = mkdot(row, 8, live ? COL_OK : COL_DIM);
-        lv_obj_align(dot, LV_ALIGN_TOP_LEFT, 0, 3);
-        lv_obj_t *lbl = mklabel(row, entry.label, &lv_font_montserrat_12, COL_INK);
-        lv_obj_align(lbl, LV_ALIGN_TOP_LEFT, 14, 0);
+        lv_obj_t *dot = mkdot(row, 10, live ? COL_OK : COL_DIM);
+        lv_obj_align(dot, LV_ALIGN_TOP_LEFT, 0, 5);
+        lv_obj_t *lbl = mklabel(row, entry.label, &lv_font_montserrat_16, COL_INK);
+        lv_obj_align(lbl, LV_ALIGN_TOP_LEFT, 16, 0);
         lv_label_set_long_mode(lbl, LV_LABEL_LONG_DOT);
-        lv_obj_set_width(lbl, 120);
+        lv_obj_set_width(lbl, 116);
 
         lv_obj_t *disc = lv_obj_create(row);
-        lv_obj_set_size(disc, 70, 28); style_card(disc);
-        lv_obj_align(disc, LV_ALIGN_BOTTOM_LEFT, 0, 0);
-        lv_obj_add_flag(disc, LV_OBJ_FLAG_CLICKABLE);
-        lv_obj_add_event_cb(disc, pb_disconnect_cb, LV_EVENT_CLICKED, (void *)(intptr_t)slot);
-        lv_obj_center(mklabel(disc, "Disc.", &lv_font_montserrat_12, COL_INK));
+        lv_obj_set_size(disc, 134, 40); style_card(disc);
+        lv_obj_align(disc, LV_ALIGN_TOP_MID, 0, 28);
+        if (connected) {
+            lv_obj_add_flag(disc, LV_OBJ_FLAG_CLICKABLE);
+            lv_obj_add_event_cb(disc, pb_disconnect_cb, LV_EVENT_CLICKED, forget_ids[i]);
+            lv_obj_center(mklabel(disc, "Disconnect", &lv_font_montserrat_16, COL_INK));
+        } else {
+            // nothing to disconnect — show the state instead of a button that silently does nothing.
+            // Clear CLICKABLE (plain lv_objs default to it) or style_card's pressed-accent flash would
+            // make this indicator look like a broken button.
+            lv_obj_clear_flag(disc, LV_OBJ_FLAG_CLICKABLE);
+            lv_obj_center(mklabel(disc, "offline", &lv_font_montserrat_16, COL_DIM));
+        }
 
         lv_obj_t *forget = lv_obj_create(row);
-        lv_obj_set_size(forget, 70, 28); style_card(forget);
-        lv_obj_align(forget, LV_ALIGN_BOTTOM_RIGHT, 0, 0);
+        lv_obj_set_size(forget, 134, 40); style_card(forget);
+        lv_obj_align(forget, LV_ALIGN_TOP_MID, 0, 76);
         lv_obj_add_flag(forget, LV_OBJ_FLAG_CLICKABLE);
-        snprintf(forget_ids[i], sizeof(forget_ids[i]), "%s", entry.bridge_id);
         lv_obj_add_event_cb(forget, pb_forget_cb, LV_EVENT_CLICKED, forget_ids[i]);
-        lv_obj_center(mklabel(forget, "Forget", &lv_font_montserrat_12, COL_ERR));
+        lv_obj_center(mklabel(forget, "Forget", &lv_font_montserrat_16, COL_ERR));
     }
 
-    // discovered-but-unpaired bridges -- tap to start the pairing ceremony
+    // discovered-but-unpaired bridges -- tap to start the pairing ceremony. bridge_id strings live in
+    // a static table for the same callback-lifetime reason as forget_ids above.
+    static char pair_bids[MAX_BRIDGES][40];
     int n = net_bridge_count();
     for (int i = 0; i < n; i++) {
         bool used = false, connected = false; char bid[40] = {0}, host[40] = {0};
         if (!net_bridge_info(i, &used, &connected, bid, sizeof(bid), host, sizeof(host))) continue;
         if (!used || !connected || !bid[0] || trust_find(bid) >= 0) continue;   // already paired, or not ready yet
+        snprintf(pair_bids[i], sizeof(pair_bids[i]), "%s", bid);
         lv_obj_t *row = lv_obj_create(list);
-        lv_obj_set_size(row, 150, 54); style_card(row);
+        lv_obj_set_size(row, 150, 62); style_card(row);
         lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_set_style_pad_all(row, 6, 0);
+        lv_obj_set_style_pad_all(row, 8, 0);
         lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
-        lv_obj_add_event_cb(row, pb_pair_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
-        lv_obj_t *lbl = mklabel(row, "New bridge", &lv_font_montserrat_12, COL_INK);
+        lv_obj_add_event_cb(row, pb_pair_cb, LV_EVENT_CLICKED, pair_bids[i]);
+        lv_obj_t *lbl = mklabel(row, "New bridge", &lv_font_montserrat_16, COL_INK);
         lv_obj_align(lbl, LV_ALIGN_TOP_LEFT, 0, 0);
         lv_obj_t *tap = mklabel(row, "tap to pair \xE2\x86\x92", &lv_font_montserrat_12, COL_ACCENT);
         lv_obj_align(tap, LV_ALIGN_BOTTOM_LEFT, 0, 0);

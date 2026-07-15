@@ -138,6 +138,9 @@ bool trust_add(const char *bridge_id, const char *label, const uint8_t psk[32]) 
         ESP_LOGW(TAG, "trust table full; evicting oldest entry (%s)", s_trust->entries[idx].bridge_id);
     }
     trust_bridge_t *e = &s_trust->entries[idx];
+    // Zero the whole entry before filling: on slot reuse (eviction), snprintf leaves the previous
+    // occupant's bytes past each string's NUL, and save_trust() persists the full struct to NVS.
+    memset(e, 0, sizeof(*e));
     e->used = true;
     snprintf(e->bridge_id, sizeof(e->bridge_id), "%s", bridge_id);
     snprintf(e->label, sizeof(e->label), "%s", (label && label[0]) ? label : bridge_id);
@@ -159,7 +162,13 @@ void trust_set_label(const char *bridge_id, const char *label) {
     if (!s_trust || !label || !label[0]) return;
     int idx = trust_find(bridge_id);
     if (idx < 0) return;
-    snprintf(s_trust->entries[idx].label, sizeof(s_trust->entries[idx].label), "%s", label);
+    // Called on every successful auth (see pairing.cpp) — skip the NVS write when nothing changed,
+    // or every reconnect would burn a flash erase cycle for a no-op. Zero-initialized: the full-width
+    // memcpy below is persisted to NVS, and uninitialized tail bytes would leak stack contents there.
+    char clipped[sizeof(s_trust->entries[idx].label)] = {0};
+    snprintf(clipped, sizeof(clipped), "%s", label);
+    if (strcmp(s_trust->entries[idx].label, clipped) == 0) return;
+    memcpy(s_trust->entries[idx].label, clipped, sizeof(clipped));
     save_trust();
 }
 

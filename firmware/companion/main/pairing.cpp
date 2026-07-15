@@ -105,6 +105,12 @@ typedef struct {
     uint8_t send_key[32], recv_key[32];   // active directional AES-256 keys (post-auth)
     uint64_t send_ctr, recv_ctr;
     char bridge_id_snapshot[40];          // learned from hello_ack; identifies which trust entry to use
+    char host_snapshot[24];               // machine name from hello_ack (sized like trust_bridge_t.label);
+                                          // applied to the trust label only once the peer authenticates
+    char auth_bridge_id[40];              // identity PINNED at auth start: the label write on auth success
+    char auth_host[24];                   // must target the entry whose PSK is being proven — a second
+                                          // hello_ack mid-handshake mutates the snapshots above and must
+                                          // not be able to redirect the write to a different trust entry
 
     bool auth_in_flight;
     uint8_t auth_priv[32], auth_pub[32], nonce_device[16];
@@ -141,6 +147,10 @@ void pairing_init(void) {
 static void start_auth_handshake(int bi) {
     pairing_conn_t *c = &s_conn[bi];
     if (trust_find(c->bridge_id_snapshot) < 0) return;
+    // Pin the identity this handshake authenticates — every later step (PSK lookup, post-auth label
+    // refresh) uses these copies, immune to snapshot rewrites by further hello_acks on this socket.
+    snprintf(c->auth_bridge_id, sizeof(c->auth_bridge_id), "%s", c->bridge_id_snapshot);
+    snprintf(c->auth_host, sizeof(c->auth_host), "%s", c->host_snapshot);
     esp_fill_random(c->auth_priv, 32);
     x25519_base(c->auth_pub, c->auth_priv, 1);
     esp_fill_random(c->nonce_device, 16);
@@ -163,7 +173,7 @@ static void handle_auth_challenge(cJSON *root, int bi) {
     if (b64_decode(nonce_item->valuestring, nonce_bridge, sizeof(nonce_bridge)) != 16) return;
     if (b64_decode(pub_item->valuestring, pub_bridge, sizeof(pub_bridge)) != 32) return;
 
-    int idx = trust_find(c->bridge_id_snapshot);
+    int idx = trust_find(c->auth_bridge_id);   // the identity pinned at auth start, not the live snapshot
     trust_bridge_t entry;
     if (idx < 0 || !trust_get(idx, &entry)) return;
 
@@ -207,6 +217,12 @@ static void handle_auth_verify(cJSON *root, int bi) {
     memset(c->pending_session_key, 0, 32);
     memset(c->auth_priv, 0, 32);
     ESP_LOGI(TAG, "bridge %d authenticated", bi);
+    // The peer just proved possession of THIS entry's PSK, so the host name it sent alongside is
+    // trustworthy — refresh the trust label with it. Heals entries stored before labels worked (they
+    // show the raw bridge_id) and follows bridge hostname changes; trust_set_label no-ops (no NVS
+    // write) when unchanged. Uses the auth-pinned copies: the live snapshots can have been rewritten
+    // by a later hello_ack, and must not redirect this write to a different entry.
+    if (c->auth_host[0]) trust_set_label(c->auth_bridge_id, c->auth_host);
     audio_play_alert("soft");   // connection greeting: the deck itself, so it works with zero bridge-side sound files
 }
 
@@ -312,7 +328,10 @@ static void try_finalize_pairing(void) {
     if (!c->bridge_id_snapshot[0]) { abort_pairing(PAIR_FAILED); return; }
     uint8_t psk[32];
     derive_psk(s_pair.shared, psk);
-    trust_add(c->bridge_id_snapshot, NULL, psk);
+    // Label with the bridge's machine name from hello_ack — the human just SAS-verified this very
+    // socket, so its claimed host is as trustworthy as the pairing itself. (Previously NULL, which
+    // fell back to the raw bridge_id UUID and left Paired Bridges rows unidentifiable.)
+    trust_add(c->bridge_id_snapshot, c->host_snapshot[0] ? c->host_snapshot : NULL, psk);
     memset(psk, 0, sizeof(psk));
     net_send_raw(s_pair.bridge, "{\"type\":\"pair_ack\",\"ok\":true}");
     int bridge = s_pair.bridge;
@@ -336,9 +355,13 @@ static void handle_pair_reject(cJSON *root, int bi) {
 }
 
 static void handle_pair_ack(cJSON *root, int bi) {
+    // Only meaningful right after OUR ceremony with THIS bridge finalized. Without the guard, pair_ack
+    // was the one pair_* handler with no state check — and since an unauthenticated hello_ack freely
+    // claims any bridge_id, any connected socket could have relabelled an arbitrary trust entry.
+    if (s_pair.bridge != bi || s_pair.state != PAIR_DONE) return;
     cJSON *ok = cJSON_GetObjectItem(root, "ok");
     // The bridge's pair_ack carries its human-readable label (hostname) -- the trust entry was already
-    // written by try_finalize_pairing with the raw bridge_id as a placeholder; upgrade it now.
+    // written by try_finalize_pairing with the hello_ack host (or the raw bridge_id); upgrade it now.
     cJSON *label = cJSON_GetObjectItem(root, "label");
     if (cJSON_IsString(label) && label->valuestring[0] && s_conn[bi].bridge_id_snapshot[0])
         trust_set_label(s_conn[bi].bridge_id_snapshot, label->valuestring);
@@ -393,8 +416,13 @@ void pairing_on_message(cJSON *root, int bi) {
     const char *t = type_item->valuestring;
     if (!strcmp(t, "hello_ack")) {
         cJSON *bid = cJSON_GetObjectItem(root, "bridge_id");
+        cJSON *host = cJSON_GetObjectItem(root, "host");
         cJSON *paired = cJSON_GetObjectItem(root, "paired");
         if (cJSON_IsString(bid)) snprintf(s_conn[bi].bridge_id_snapshot, sizeof(s_conn[bi].bridge_id_snapshot), "%s", bid->valuestring);
+        // Remember the bridge's machine name, but DON'T write it to the trust label yet: hello_ack is
+        // plaintext, so an unauthenticated peer could claim any name. It's applied after auth succeeds
+        // (peer proved PSK possession) and at pairing finalize (the human just SAS-verified this socket).
+        if (cJSON_IsString(host)) snprintf(s_conn[bi].host_snapshot, sizeof(s_conn[bi].host_snapshot), "%s", host->valuestring);
         if (cJSON_IsTrue(paired) && !s_conn[bi].authenticated && !s_conn[bi].auth_in_flight) start_auth_handshake(bi);
     }
     // pair_* handlers mutate the shared ceremony state (s_pair), which the LVGL task also touches

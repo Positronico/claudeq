@@ -398,8 +398,11 @@ function finishVoice(ws) {
     return;
   }
   // Return the transcript to the deck for on-device Send/Cancel; hold it (bound to the focus AT THIS MOMENT,
-  // so a later focus change can't misroute the injection) until voice_commit/voice_cancel, or 120s.
-  try { ws.send(JSON.stringify({ type: 'transcript', id, text, sid: focusedSid })); } catch {}
+  // so a later focus change can't misroute the injection) until voice_commit/voice_cancel.
+  // MUST go through the sec envelope: the device drops any non-handshake plaintext, so a raw ws.send
+  // here never arrives and the deck times out with "Transcription failed" — voice was broken this way
+  // on every encrypted connection from v2.1.0 until this line was fixed.
+  sendSecure(ws, { type: 'transcript', id, text, sid: focusedSid });
   // Hold the transcript (bound to the focus captured NOW) until the deck confirms/cancels, the next
   // capture on this socket overwrites it, or the socket closes — no wall-clock expiry, so a slow
   // confirm can never desync (a late Send still injects into the originally-focused session).
@@ -938,7 +941,12 @@ wss.on('connection', (ws, req) => {
         break;
       }
       case 'perm': console.log('[perm]', m.id, m.decision); break;
-      case 'ping': try { ws.send('{"type":"pong"}'); } catch {} break;
+      case 'ping':
+        // An authenticated peer sent its ping inside the envelope and drops plaintext replies —
+        // answer in kind. Unauthenticated peers (handshake keepalive) still get plaintext.
+        if (ws._authenticated) sendSecure(ws, { type: 'pong' });
+        else try { ws.send('{"type":"pong"}'); } catch {}
+        break;
       default: break;
     }
   });

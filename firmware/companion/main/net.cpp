@@ -10,6 +10,8 @@
 #include "esp_netif.h"
 #include "esp_netif_sntp.h"
 #include "esp_heap_caps.h"
+#include "esp_system.h"
+#include "esp_timer.h"
 #include "nvs_flash.h"
 #include "esp_websocket_client.h"
 #include "mdns.h"
@@ -114,6 +116,24 @@ static int elect_primary(const char *id) {
     return winner;
 }
 
+// Boot report: reset cause + uptime + internal-heap watermark ride along on every hello, so a deck
+// that reboots on its own leaves the diagnosis in the bridge log without needing a serial cable.
+static const char *reset_reason_str(void) {
+    switch (esp_reset_reason()) {
+        case ESP_RST_POWERON:   return "poweron";
+        case ESP_RST_EXT:       return "ext";
+        case ESP_RST_SW:        return "sw";
+        case ESP_RST_PANIC:     return "panic";
+        case ESP_RST_INT_WDT:   return "int_wdt";
+        case ESP_RST_TASK_WDT:  return "task_wdt";
+        case ESP_RST_WDT:       return "wdt";
+        case ESP_RST_DEEPSLEEP: return "deepsleep";
+        case ESP_RST_BROWNOUT:  return "brownout";
+        case ESP_RST_SDIO:      return "sdio";
+        default:                return "other";
+    }
+}
+
 static void ws_evt(void *args, esp_event_base_t base, int32_t id, void *data) {
     int bi = (int)(intptr_t)args;
     if (bi < 0 || bi >= MAX_BRIDGES) return;
@@ -124,10 +144,16 @@ static void ws_evt(void *args, esp_event_base_t base, int32_t id, void *data) {
         ESP_LOGI(TAG, "bridge %d connected (%s:%d)", bi, b->ip, b->port);
         b->connected = true; b->ever_connected = true; b->down_since = 0; update_conn_icon();
         pairing_on_connect(bi);                   // fresh connection -> fresh auth/pairing state for this slot
-        char hello[220];
+        char hello[320];
         int n = snprintf(hello, sizeof(hello),
-                         "{\"type\":\"hello\",\"name\":\"%s\",\"fw\":\"%s\",\"device_id\":\"%s\",\"caps\":[\"session\",\"macros\",\"voice\",\"settings\",\"sessions\"]}",
-                         DEVICE_NAME, DEVICE_FW, device_get_id());
+                         "{\"type\":\"hello\",\"name\":\"%s\",\"fw\":\"%s\",\"device_id\":\"%s\","
+                         "\"rst\":\"%s\",\"up\":%u,\"heap\":%u,\"heap_min\":%u,"
+                         "\"caps\":[\"session\",\"macros\",\"voice\",\"settings\",\"sessions\"]}",
+                         DEVICE_NAME, DEVICE_FW, device_get_id(),
+                         reset_reason_str(),
+                         (unsigned)(esp_timer_get_time() / 1000000ULL),
+                         (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                         (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL));
         esp_websocket_client_send_text(b->client, hello, n, portMAX_DELAY);
         break;
     }

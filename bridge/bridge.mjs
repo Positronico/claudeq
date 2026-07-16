@@ -19,6 +19,13 @@ import { WebSocketServer } from 'ws';
 import * as trust from './trust.mjs';
 import * as pcrypto from './crypto.mjs';
 
+// Timestamp every log line — bridge.log is the only record of deck reconnects/reboots, and without
+// wall-clock times there was no way to correlate them with anything (see the reboot debugging saga).
+for (const level of ['log', 'error']) {
+  const orig = console[level].bind(console);
+  console[level] = (...a) => orig(new Date().toISOString().replace('T', ' ').slice(0, 19), ...a);
+}
+
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = parseInt(process.env.CCDECK_PORT || '8787', 10);
 const SHORT_HOST = (process.env.CCDECK_HOST || os.hostname() || 'host').replace(/\.local$/, '').split('.')[0].slice(0, 16);  // for the deck to label chips on title clashes; override with CCDECK_HOST
@@ -904,10 +911,17 @@ wss.on('connection', (ws, req) => {
     }
 
     switch (m.type) {
-      case 'hello':
+      case 'hello': {
         ws._deviceId = typeof m.device_id === 'string' ? m.device_id : null;
         ws._deviceName = typeof m.name === 'string' ? m.name : null;
-        console.log(`[ws] hello from ${m.name} (${m.fw}) device_id=${ws._deviceId || '?'}`);
+        // Boot report (fw >= 2.3.2): reset cause + uptime + internal-heap watermark. An `up` of a few
+        // seconds means the deck just booted — and rst says why (panic/task_wdt/brownout = trouble).
+        const boot = typeof m.rst === 'string'
+          ? ` rst=${m.rst} up=${m.up}s heap=${Math.round((m.heap || 0) / 1024)}k min=${Math.round((m.heap_min || 0) / 1024)}k`
+          : '';
+        console.log(`[ws] hello from ${m.name} (${m.fw}) device_id=${ws._deviceId || '?'}${boot}`);
+        if (['panic', 'task_wdt', 'int_wdt', 'wdt', 'brownout'].includes(m.rst))
+          console.error(`[boot] deck restarted by ${m.rst.toUpperCase()} — unexpected reset, investigate`);
         try {
           ws.send(JSON.stringify({
             type: 'hello_ack', bridge_id: BRIDGE_ID, host: SHORT_HOST, fw: BRIDGE_FW,
@@ -915,6 +929,7 @@ wss.on('connection', (ws, req) => {
           }));
         } catch {}
         break;
+      }
       case 'pair_request': handlePairRequest(ws, m); break;
       case 'pair_response': handlePairResponse(ws, m); break;
       case 'pair_confirm': handlePairConfirm(ws, m); break;
@@ -997,7 +1012,20 @@ wss.on('connection', (ws, req) => {
     }
   });
   ws.on('error', () => {});
+  ws._alive = true;
+  ws.on('pong', () => { ws._alive = true; });
 });
+// Reap dead sockets. A deck that reboots (or drops off WiFi) never sends a close frame, so its
+// socket lingered in `clients` forever — the log showed counts climbing past 25 while one physical
+// deck was connected. Ping every 30s; a peer that misses two rounds is terminated (terminate()
+// fires the normal 'close' handler, so cleanup/ask-unblocking runs the same path as a real close).
+setInterval(() => {
+  for (const ws of clients) {
+    if (ws._alive === false) { try { ws.terminate(); } catch {} continue; }
+    ws._alive = false;
+    try { ws.ping(); } catch {}
+  }
+}, 30000).unref();
 
 // ---------- mDNS advertising: the deck auto-discovers every bridge on the LAN (_claudeq._tcp) ----------
 // Chain: dns-sd (macOS, native) -> avahi-publish-service (Linux w/ avahi-utils) -> bonjour-service

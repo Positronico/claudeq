@@ -121,7 +121,7 @@ its bridge. A question auto-focuses the session that asked, on any bridge.
 ## Device → Bridge
 | type | fields | meaning |
 |---|---|---|
-| `hello` | `name`, `fw`, `device_id`, `caps[]` | Device announces itself on connect — always allowed, no trust required. `device_id` is a persistent identifier generated once on first boot (NVS), replacing the old fixed `"claudeq"` literal every unit used to send. |
+| `hello` | `name`, `fw`, `device_id`, `caps[]`, `rst`, `up`, `heap`, `heap_min` | Device announces itself on connect — always allowed, no trust required. `device_id` is a persistent identifier generated once on first boot (NVS), replacing the old fixed `"claudeq"` literal every unit used to send. The boot report (fw ≥ 2.3.2): `rst` = last reset cause (`poweron`/`sw`/`panic`/`task_wdt`/`int_wdt`/`wdt`/`brownout`/…), `up` = seconds since boot, `heap`/`heap_min` = current and lowest-ever free **internal** DRAM in bytes — so a deck that reboots on its own leaves the diagnosis in the bridge log (`rst=… up=3s`), and a shrinking `heap_min` across hours exposes a leak. |
 | `focus` | `sid` | Switch the focused session (user tapped a chip) |
 | `answer` | `id`, `answers` = `{ "<question text>": "<label>" }` (multi = comma-joined) | User's selection(s) for an `ask`. Resolved by the global `id`, so it is robust even if focus changed |
 | `macro` | `id` | Fire a macro by id → injected into the focused session |

@@ -136,9 +136,27 @@ static void example_lcd_backlight_set(bool enable)
     ESP_ERROR_CHECK(esp_io_expander_set_level(io_expander, EXAMPLE_EXIO_PIN_BL_EN, enable ? 1 : 0));
 }
 
+// Heap telemetry (leak hunting): the deck aborted after ~56 min idle with ESP_ERR_NO_MEM in
+// esp_timer_create (WiFi PHY power-save wake) — internal DRAM exhausted. Log the internal heap
+// every 30 s so the serial log shows the leak's rate and step pattern against the idle events.
+static void heap_report_cb(void *arg) {
+    (void)arg;
+    ESP_LOGI("heap", "int free=%u min=%u big=%u | psram free=%u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+}
+
 extern "C" void app_main(void)
 {
     example_lcd_pwm_off_early();
+    esp_timer_create_args_t heap_timer_args = {};
+    heap_timer_args.callback = heap_report_cb;
+    heap_timer_args.name = "heap_report";
+    esp_timer_handle_t heap_timer = NULL;
+    if (esp_timer_create(&heap_timer_args, &heap_timer) == ESP_OK)
+        esp_timer_start_periodic(heap_timer, 30 * 1000 * 1000);
     // landscape reader rotates into this buffer; allocate always (same pixel count as portrait: 172*640 = 640*172)
     rotat_ptr = (uint16_t*)heap_caps_malloc(EXAMPLE_LCD_H_RES * EXAMPLE_LCD_V_RES * sizeof(uint16_t), MALLOC_CAP_SPIRAM);
     assert(rotat_ptr);

@@ -109,6 +109,10 @@ static void style_switch(lv_obj_t *sw) {
     lv_obj_set_style_bg_color(sw, lv_color_hex(0x2a2f3a), LV_PART_MAIN | LV_STATE_DISABLED);
     lv_obj_set_style_bg_color(sw, lv_color_hex(COL_OK), LV_PART_INDICATOR | LV_STATE_CHECKED);
     lv_obj_set_style_bg_color(sw, lv_color_hex(COL_INK), LV_PART_KNOB);
+    // Tiny screen: a bare switch is a ~49x28 target. Draw it a bit bigger AND accept taps well
+    // around it, so a thumb aimed at the row's right half still lands.
+    lv_obj_set_size(sw, 64, 32);
+    lv_obj_set_ext_click_area(sw, 14);
 }
 // Forward decls: icon/container primitives, defined further down (near make_page) but also needed by
 // the Paired Bridges screen and the session picker, defined earlier in the file.
@@ -233,6 +237,7 @@ static void feed_add_row(const char *kind, const char *label, const char *detail
     if (kind && !strcmp(kind, "reply") && full && full[0]) {
         free(s_last_reply); s_last_reply = strdup(full);
         lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_set_ext_click_area(row, 8);   // a one-line reply row is a thin strip — widen its tap zone
         lv_obj_add_event_cb(row, reply_row_clicked, LV_EVENT_CLICKED, NULL);
     }
     s_feed_n++;
@@ -306,9 +311,11 @@ static void render_question(void) {
         cJSON *des = cJSON_GetObjectItem(o, "description");
         lv_obj_t *btn = lv_obj_create(s_opts);
         lv_obj_set_size(btn, LV_PCT(100), LV_SIZE_CONTENT);
+        lv_obj_set_style_min_height(btn, 46, 0);   // a label-only option still gets a full-size tap target
         style_card(btn);
         lv_obj_set_style_pad_all(btn, 8, 0);
         lv_obj_set_flex_flow(btn, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_flex_align(btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
         lv_obj_add_flag(btn, LV_OBJ_FLAG_CLICKABLE);
         lv_obj_add_event_cb(btn, opt_clicked, LV_EVENT_CLICKED, (void *)(intptr_t)i);
         lv_obj_t *ll = mklabel(btn, cJSON_IsString(lab) ? lab->valuestring : "?", &lv_font_montserrat_16, COL_INK);
@@ -616,7 +623,7 @@ static void sesscfg_header(lv_obj_t *list, const char *txt) {
 }
 static void sesscfg_option(lv_obj_t *list, const char *lab, int kind, int idx) {
     lv_obj_t *btn = lv_obj_create(list);
-    lv_obj_set_size(btn, LV_PCT(100), 42);
+    lv_obj_set_size(btn, LV_PCT(100), 46);
     style_card(btn);
     lv_obj_add_flag(btn, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(btn, sesscfg_opt_cb, LV_EVENT_CLICKED, (void *)(intptr_t)((kind << 8) | idx));
@@ -691,39 +698,39 @@ static void sesspick_rebuild(void) {
         bool clash = false;
         for (int j = 0; j < sess_n; j++)
             if (j != i && sess_bridge[j] != sess_bridge[i] && !strcmp(sess_title[j], sess_title[i])) { clash = true; break; }
+        // Big card, Paired-Bridges style: the name gets the full card width for up to two lines
+        // (dotted past that), with a full-width Configure button below it. Fixed height — every card
+        // identical regardless of how far the name wraps, so the list is a uniform grid of tap targets.
         lv_obj_t *row = lv_obj_create(s_sesspick_list);
-        // Fixed height — every row the same size regardless of how far the title wraps, so the list
-        // reads as a uniform grid of big tap targets (long titles clip inside their cell).
-        lv_obj_set_size(row, LV_PCT(100), 64);
+        lv_obj_set_size(row, LV_PCT(100), 114);
         style_card(row);
         lv_obj_set_style_bg_color(row, lv_color_hex(focused ? 0x2a1c12 : COL_PANEL), 0);
         lv_obj_set_style_border_color(row, lv_color_hex(focused ? COL_ACCENT : (sess_needs[i] ? COL_WARN : COL_LINE)), 0);
         lv_obj_set_style_border_width(row, focused ? 2 : 1, 0);
         lv_obj_set_style_pad_all(row, 8, 0);
-        lv_obj_set_style_pad_column(row, 4, 0);
         lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
         lv_obj_add_event_cb(row, sesspick_row_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
-        lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
-        lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
         // status glyph: bell = needs you, chevron = the focused session, blank spacer otherwise
         lv_obj_t *ic = mklabel(row, sess_needs[i] ? LV_SYMBOL_BELL : (focused ? LV_SYMBOL_RIGHT : " "),
                                &lv_font_montserrat_16, sess_needs[i] ? COL_WARN : COL_ACCENT);
-        lv_obj_set_width(ic, 18);
-        lv_obj_t *tc = mkcell(row, 78, 48);   // text column: title + optional @machine
-        lv_obj_set_flex_flow(tc, LV_FLEX_FLOW_COLUMN);
-        lv_obj_set_flex_align(tc, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
-        lv_obj_t *tl = mklabel(tc, sess_title[i], &lv_font_montserrat_16, sess_needs[i] && !focused ? COL_WARN : COL_INK);
-        lv_label_set_long_mode(tl, LV_LABEL_LONG_WRAP);
-        lv_obj_set_width(tl, LV_PCT(100));
+        lv_obj_align(ic, LV_ALIGN_TOP_LEFT, 0, 1);
+        lv_obj_t *tl = mklabel(row, sess_title[i], &lv_font_montserrat_16, sess_needs[i] && !focused ? COL_WARN : COL_INK);
+        lv_label_set_long_mode(tl, LV_LABEL_LONG_DOT);   // wraps to the 2 lines that fit, then dots
+        lv_obj_set_size(tl, 116, 38);
+        lv_obj_align(tl, LV_ALIGN_TOP_LEFT, 18, 0);
         if (clash && bridge_host[sess_bridge[i]][0]) {
             char hb[26]; snprintf(hb, sizeof(hb), "@%s", bridge_host[sess_bridge[i]]);
-            mklabel(tc, hb, &lv_font_montserrat_12, COL_DIM);
+            lv_obj_t *hl = mklabel(row, hb, &lv_font_montserrat_12, COL_DIM);
+            lv_obj_align(hl, LV_ALIGN_TOP_LEFT, 18, 40);
         }
-        // gear -> per-session config sheet; its own clickable cell, so a tap here never switches focus
-        lv_obj_t *gear = mkcell(row, 30, 48);
-        lv_obj_add_flag(gear, LV_OBJ_FLAG_CLICKABLE);
-        lv_obj_add_event_cb(gear, sesscfg_gear_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
-        lv_obj_center(mklabel(gear, LV_SYMBOL_SETTINGS, &lv_font_montserrat_16, COL_DIM));
+        // Configure -> per-session config sheet; its own clickable full-width button (Paired-Bridges
+        // sized: the screen is tiny, so every tappable thing is a big fat row, never a small icon).
+        lv_obj_t *cfg = lv_obj_create(row);
+        lv_obj_set_size(cfg, 134, 40); style_card(cfg);
+        lv_obj_align(cfg, LV_ALIGN_BOTTOM_MID, 0, 0);
+        lv_obj_add_flag(cfg, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(cfg, sesscfg_gear_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+        lv_obj_center(mklabel(cfg, LV_SYMBOL_SETTINGS "  Configure", &lv_font_montserrat_16, COL_INK));
     }
     if (sess_n == 0) {
         lv_obj_t *ph = mklabel(s_sesspick_list, "No sessions.\nRun 'claudeq' in a\nterminal to start one.", &lv_font_montserrat_12, COL_DIM);
@@ -1708,8 +1715,8 @@ void ui_init(void) {
 
     // --- session selector bar: the focused session + count + attention badge; tap -> picker ---
     s_sessbar = lv_obj_create(scr);
-    lv_obj_set_size(s_sessbar, SCR_W - 10, 34);
-    lv_obj_align(s_sessbar, LV_ALIGN_TOP_MID, 0, 35);   // centered in the 30..74 band the chip strip used
+    lv_obj_set_size(s_sessbar, SCR_W - 10, 40);         // the most-tapped control on the deck: keep it fat
+    lv_obj_align(s_sessbar, LV_ALIGN_TOP_MID, 0, 32);   // centered in the 30..74 band the chip strip used
     style_card(s_sessbar);
     lv_obj_set_style_radius(s_sessbar, 16, 0);
     lv_obj_set_style_pad_hor(s_sessbar, 12, 0);

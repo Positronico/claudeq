@@ -1,6 +1,6 @@
 {
   "name": "claude-deck-bridge",
-  "version": "2.3.0",
+  "version": "2.3.1",
   "type": "module",
   "description": "Bridge between Claude Code (hooks) and the ESP32 Claude Deck device",
   "main": "bridge.mjs",

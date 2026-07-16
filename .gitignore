@@ -66,6 +66,8 @@ firmware/*/managed_components/
 # the optional voice-setup step into ~/.claudeq/whisper (outside the repo).
 tools/whisper-models/
 *.wav
+# ...except the bundled default deck sounds (small, ship with the bridge — see bridge.mjs SOUNDS_DIRS)
+!bridge/sounds/*.wav
 
 # =====================================================================
 # Waveshare reference SDKs — local reference only, not needed to build or

@@ -164,8 +164,9 @@ automatically. After editing any of these, run **`claudeq restart-bridge`** to a
 - **Macros** — edit `~/.claudeq/macros.json` (`id` / `icon` / `label` / `prompt`), then `claudeq restart-bridge`.
 - **Paired devices** — `~/.claudeq/trust.json` holds each paired device's persistent id and key; managed via
   `claudeq pair`/`claudeq devices`, not by hand. Delete it (then `claudeq restart-bridge`) to forget every pairing at once.
-- **Sounds** — drop any audio file at `~/.claudeq/sounds/alert.*` or `~/.claudeq/sounds/done.*` (auto-converted
-  via ffmpeg). With no custom clip, the deck plays a built-in tone instead.
+- **Sounds** — the bridge ships with pleasant default chimes (needs-you and done). To use your own, drop any
+  audio file at `~/.claudeq/sounds/alert.*` or `~/.claudeq/sounds/done.*` (auto-converted via ffmpeg) — it
+  overrides the bundled clip. If no clip can be played at all, the deck falls back to a built-in tone.
 - **Voice** — `CCDECK_VOICE_AUTOSUBMIT=0` types the transcript without pressing Enter;
   `CCDECK_WHISPER_MODEL=/path` overrides the model location (default: `~/.claudeq/whisper/ggml-base.en.bin`);
   `CCDECK_WHISPER_BIN=/path` if `whisper-cli` isn't on `PATH`.

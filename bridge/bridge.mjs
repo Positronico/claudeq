@@ -165,14 +165,31 @@ function loadMacros() {
   }
   try { return JSON.parse(fs.readFileSync(MACROS_FILE, 'utf8')); }
   catch { return [
-    { id: 'review',   icon: '🔍', label: 'Code review', prompt: '/code-review' },
-    { id: 'tests',    icon: '✅', label: 'Run tests',   prompt: 'run the tests and fix any failures' },
-    { id: 'commit',   icon: '💾', label: 'Commit',      prompt: '/commit' },
-    { id: 'continue', icon: '▶',  label: 'Continue',    prompt: 'continue' },
-    { id: 'explain',  icon: '💡', label: 'Explain',     prompt: 'explain what you just did and why' },
-    { id: 'effort',   icon: '⚙',  label: 'Effort',      prompt: '/effort' },
+    { id: 'review',   label: 'Code review', prompt: '/code-review' },
+    { id: 'tests',    label: 'Run tests',   prompt: 'run the tests and fix any failures' },
+    { id: 'commit',   label: 'Commit',      prompt: '/commit' },
+    { id: 'continue', label: 'Continue',    prompt: 'continue' },
+    { id: 'explain',  label: 'Explain',     prompt: 'explain what you just did and why' },
   ]; }
 }
+
+// ---------- session config presets (deck gear sheet: model / effort) ----------
+// Injected as `/model X` / `/effort Y` — both commands take inline args and apply immediately,
+// no interactive picker (unlike the old bare `/effort` macro, which opened one and stalled).
+const CFG_MODELS = [
+  { id: 'fable',  label: 'Fable'  },
+  { id: 'opus',   label: 'Opus'   },
+  { id: 'sonnet', label: 'Sonnet' },
+  { id: 'haiku',  label: 'Haiku'  },
+];
+const CFG_EFFORTS = [
+  { id: 'low',       label: 'Low'       },
+  { id: 'medium',    label: 'Medium'    },
+  { id: 'high',      label: 'High'      },
+  { id: 'xhigh',     label: 'X-High'    },
+  { id: 'max',       label: 'Max'       },
+  { id: 'ultracode', label: 'Ultracode' },   // xhigh + standing multi-agent workflow orchestration
+];
 
 // ---------- ws helpers ----------
 function broadcast(obj) {
@@ -840,6 +857,7 @@ function handleAuthVerify(ws, m) {
 // ---------- websocket ----------
 function sendSnapshot(ws) {
   sendSecure(ws, { type: 'macros', items: macros });
+  sendSecure(ws, { type: 'cfgopts', models: CFG_MODELS, efforts: CFG_EFFORTS });
   sendSecure(ws, { type: 'sessions', list: sessionsList(), focus: focusedSid, host: SHORT_HOST, bridge_id: BRIDGE_ID });
   const s = sessions.get(focusedSid);
   if (s) {
@@ -938,6 +956,19 @@ wss.on('connection', (ws, req) => {
       case 'macro': {
         const mc = macros.find((x) => x.id === m.id);
         if (mc) { const s = sessions.get(focusedSid); console.log(`[macro] ${mc.label} -> ${s ? s.title : DEFAULT_TMUX}`); injectToCC(mc.prompt); }
+        break;
+      }
+      case 'setcfg': {
+        // Targets the session the gear was tapped on (by sid), NOT the focused one. One setting per
+        // message — the deck sends a tap at a time, and chaining two injections could interleave keys.
+        const s = sessions.get(m.sid);
+        if (!s) break;
+        const model = CFG_MODELS.find((x) => x.id === m.model);
+        const effort = !model && CFG_EFFORTS.find((x) => x.id === m.effort);
+        if (!model && !effort) break;   // only preset values reach the terminal
+        const cmd = model ? `/model ${model.id}` : `/effort ${effort.id}`;
+        console.log(`[setcfg] ${cmd} -> ${s.title}`);
+        injectToCC(cmd, true, s.tmux);
         break;
       }
       case 'perm': console.log('[perm]', m.id, m.decision); break;

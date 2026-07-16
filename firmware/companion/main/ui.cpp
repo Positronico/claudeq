@@ -558,6 +558,127 @@ static void sesspick_row_cb(lv_event_t *e) {
     render_session_bar();
 }
 
+// ---------- per-session config sheet (gear on a picker row -> preset model / effort) ----------
+// Choices come from the bridge ('cfgopts' in the snapshot) so new models never need a firmware
+// update. A tap sends {type:'setcfg', sid, model|effort} to the session's OWN bridge, which types
+// `/model X` / `/effort Y` into that session's terminal — inline args apply immediately, unlike
+// the old bare `/effort` macro that just opened Claude Code's interactive picker.
+#define CFG_MAX_OPTS 8
+static char cfg_model_id[CFG_MAX_OPTS][24], cfg_model_lab[CFG_MAX_OPTS][20];
+static char cfg_effort_id[CFG_MAX_OPTS][24], cfg_effort_lab[CFG_MAX_OPTS][20];
+static int  cfg_models_n = 0, cfg_efforts_n = 0;
+static lv_obj_t *s_cfg_ov = NULL;
+static char cfg_sid[48]; static int cfg_bridge = -1; static char cfg_title[40];
+
+static int cfg_parse_list(cJSON *arr, char ids[][24], char labs[][20]) {
+    if (!cJSON_IsArray(arr)) return 0;
+    int n = cJSON_GetArraySize(arr), out = 0;
+    if (n > CFG_MAX_OPTS) n = CFG_MAX_OPTS;
+    for (int i = 0; i < n; i++) {
+        cJSON *it = cJSON_GetArrayItem(arr, i);
+        cJSON *id = cJSON_GetObjectItem(it, "id"), *lab = cJSON_GetObjectItem(it, "label");
+        if (!cJSON_IsString(id) || !id->valuestring[0]) continue;
+        snprintf(ids[out], 24, "%s", id->valuestring);
+        snprintf(labs[out], 20, "%s", cJSON_IsString(lab) && lab->valuestring[0] ? lab->valuestring : id->valuestring);
+        out++;
+    }
+    return out;
+}
+static void show_cfgopts(cJSON *root) {
+    cfg_models_n  = cfg_parse_list(cJSON_GetObjectItem(root, "models"),  cfg_model_id,  cfg_model_lab);
+    cfg_efforts_n = cfg_parse_list(cJSON_GetObjectItem(root, "efforts"), cfg_effort_id, cfg_effort_lab);
+}
+
+static void sesscfg_close(void) {
+    if (s_cfg_ov) { lv_obj_del(s_cfg_ov); s_cfg_ov = NULL; cfg_bridge = -1; cfg_sid[0] = 0; }
+}
+static void sesscfg_close_cb(lv_event_t *e) { (void)e; sesscfg_close(); }
+static void sesscfg_opt_cb(lv_event_t *e) {
+    int v = (int)(intptr_t)lv_event_get_user_data(e);
+    int kind = v >> 8, idx = v & 0xff;
+    const char *key = kind ? "effort" : "model";
+    const char *val = kind ? (idx < cfg_efforts_n ? cfg_effort_id[idx] : NULL)
+                           : (idx < cfg_models_n  ? cfg_model_id[idx]  : NULL);
+    if (val && cfg_bridge >= 0 && cfg_sid[0]) {
+        cJSON *m = cJSON_CreateObject();
+        cJSON_AddStringToObject(m, "type", "setcfg");
+        cJSON_AddStringToObject(m, "sid", cfg_sid);
+        cJSON_AddStringToObject(m, key, val);
+        char *s = cJSON_PrintUnformatted(m);
+        if (s) { net_send_to(cfg_bridge, s); ESP_LOGI(TAG, "setcfg %s=%s -> b%d", key, val, cfg_bridge); cJSON_free(s); }
+        cJSON_Delete(m);
+    }
+    sesscfg_close();
+}
+static void sesscfg_header(lv_obj_t *list, const char *txt) {
+    lv_obj_t *h = mklabel(list, txt, &lv_font_montserrat_12, COL_DIM);
+    lv_obj_set_style_pad_top(h, 6, 0);
+}
+static void sesscfg_option(lv_obj_t *list, const char *lab, int kind, int idx) {
+    lv_obj_t *btn = lv_obj_create(list);
+    lv_obj_set_size(btn, LV_PCT(100), 42);
+    style_card(btn);
+    lv_obj_add_flag(btn, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(btn, sesscfg_opt_cb, LV_EVENT_CLICKED, (void *)(intptr_t)((kind << 8) | idx));
+    lv_obj_center(mklabel(btn, lab, &lv_font_montserrat_16, COL_INK));
+}
+static void sesscfg_open(int idx) {
+    if (idx < 0 || idx >= sess_n || !sess_sid[idx][0]) return;
+    sesscfg_close();
+    snprintf(cfg_sid, sizeof(cfg_sid), "%s", sess_sid[idx]);
+    snprintf(cfg_title, sizeof(cfg_title), "%s", sess_title[idx]);
+    cfg_bridge = sess_bridge[idx];
+
+    lv_obj_t *ov = lv_obj_create(lv_layer_top());
+    s_cfg_ov = ov;
+    lv_obj_set_size(ov, SCR_W, 640);
+    lv_obj_align(ov, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_bg_color(ov, lv_color_hex(COL_BG), 0);
+    lv_obj_set_style_border_width(ov, 0, 0);
+    lv_obj_set_style_radius(ov, 0, 0);
+    lv_obj_set_style_pad_all(ov, 10, 0);
+    lv_obj_clear_flag(ov, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(ov, LV_OBJ_FLAG_CLICKABLE);   // eat taps so they don't fall through to the picker below
+
+    lv_obj_t *tl = mklabel(ov, "Session config", &lv_font_montserrat_16, COL_ACCENT);
+    lv_obj_align(tl, LV_ALIGN_TOP_MID, 0, 4);
+    lv_obj_t *st = mklabel(ov, cfg_title, &lv_font_montserrat_12, COL_DIM);
+    lv_label_set_long_mode(st, LV_LABEL_LONG_DOT);
+    lv_obj_set_width(st, 148);
+    lv_obj_set_style_text_align(st, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(st, LV_ALIGN_TOP_MID, 0, 26);
+
+    lv_obj_t *list = lv_obj_create(ov);
+    lv_obj_set_size(list, 152, 506);
+    lv_obj_align(list, LV_ALIGN_TOP_MID, 0, 46);
+    lv_obj_set_style_bg_opa(list, LV_OPA_0, 0);
+    lv_obj_set_style_border_width(list, 0, 0);
+    lv_obj_set_style_pad_all(list, 0, 0);
+    lv_obj_set_style_pad_gap(list, 6, 0);
+    lv_obj_set_flex_flow(list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(list, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    lv_obj_set_scroll_dir(list, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(list, LV_SCROLLBAR_MODE_AUTO);
+
+    if (cfg_models_n == 0 && cfg_efforts_n == 0) {
+        lv_obj_t *ph = mklabel(list, "No presets from this\nbridge - update it:\nbrew upgrade claudeq", &lv_font_montserrat_12, COL_DIM);
+        lv_label_set_long_mode(ph, LV_LABEL_LONG_WRAP);
+        lv_obj_set_width(ph, 148);
+    }
+    if (cfg_models_n)  sesscfg_header(list, "Model");
+    for (int i = 0; i < cfg_models_n; i++)  sesscfg_option(list, cfg_model_lab[i], 0, i);
+    if (cfg_efforts_n) sesscfg_header(list, "Effort");
+    for (int i = 0; i < cfg_efforts_n; i++) sesscfg_option(list, cfg_effort_lab[i], 1, i);
+
+    lv_obj_t *close = lv_obj_create(ov);
+    lv_obj_set_size(close, 148, 46); style_card(close);
+    lv_obj_add_flag(close, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(close, sesscfg_close_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_align(close, LV_ALIGN_BOTTOM_MID, 0, -6);
+    lv_obj_center(mklabel(close, "Close", &lv_font_montserrat_16, COL_INK));
+}
+static void sesscfg_gear_cb(lv_event_t *e) { sesscfg_open((int)(intptr_t)lv_event_get_user_data(e)); }
+
 // Rebuild the picker rows from the sess_* arrays, keeping the user's scroll position — the list
 // refreshes live while open (sessions broadcasts arrive on every prompt/stop/notification).
 static void sesspick_rebuild(void) {
@@ -571,13 +692,15 @@ static void sesspick_rebuild(void) {
         for (int j = 0; j < sess_n; j++)
             if (j != i && sess_bridge[j] != sess_bridge[i] && !strcmp(sess_title[j], sess_title[i])) { clash = true; break; }
         lv_obj_t *row = lv_obj_create(s_sesspick_list);
-        lv_obj_set_size(row, LV_PCT(100), LV_SIZE_CONTENT);
+        // Fixed height — every row the same size regardless of how far the title wraps, so the list
+        // reads as a uniform grid of big tap targets (long titles clip inside their cell).
+        lv_obj_set_size(row, LV_PCT(100), 64);
         style_card(row);
         lv_obj_set_style_bg_color(row, lv_color_hex(focused ? 0x2a1c12 : COL_PANEL), 0);
         lv_obj_set_style_border_color(row, lv_color_hex(focused ? COL_ACCENT : (sess_needs[i] ? COL_WARN : COL_LINE)), 0);
         lv_obj_set_style_border_width(row, focused ? 2 : 1, 0);
         lv_obj_set_style_pad_all(row, 8, 0);
-        lv_obj_set_style_pad_column(row, 6, 0);
+        lv_obj_set_style_pad_column(row, 4, 0);
         lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
         lv_obj_add_event_cb(row, sesspick_row_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
         lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
@@ -586,8 +709,9 @@ static void sesspick_rebuild(void) {
         lv_obj_t *ic = mklabel(row, sess_needs[i] ? LV_SYMBOL_BELL : (focused ? LV_SYMBOL_RIGHT : " "),
                                &lv_font_montserrat_16, sess_needs[i] ? COL_WARN : COL_ACCENT);
         lv_obj_set_width(ic, 18);
-        lv_obj_t *tc = mkcell(row, 106, LV_SIZE_CONTENT);   // text column: title + optional @machine
+        lv_obj_t *tc = mkcell(row, 78, 48);   // text column: title + optional @machine
         lv_obj_set_flex_flow(tc, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_flex_align(tc, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
         lv_obj_t *tl = mklabel(tc, sess_title[i], &lv_font_montserrat_16, sess_needs[i] && !focused ? COL_WARN : COL_INK);
         lv_label_set_long_mode(tl, LV_LABEL_LONG_WRAP);
         lv_obj_set_width(tl, LV_PCT(100));
@@ -595,6 +719,11 @@ static void sesspick_rebuild(void) {
             char hb[26]; snprintf(hb, sizeof(hb), "@%s", bridge_host[sess_bridge[i]]);
             mklabel(tc, hb, &lv_font_montserrat_12, COL_DIM);
         }
+        // gear -> per-session config sheet; its own clickable cell, so a tap here never switches focus
+        lv_obj_t *gear = mkcell(row, 30, 48);
+        lv_obj_add_flag(gear, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(gear, sesscfg_gear_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+        lv_obj_center(mklabel(gear, LV_SYMBOL_SETTINGS, &lv_font_montserrat_16, COL_DIM));
     }
     if (sess_n == 0) {
         lv_obj_t *ph = mklabel(s_sesspick_list, "No sessions.\nRun 'claudeq' in a\nterminal to start one.", &lv_font_montserrat_12, COL_DIM);
@@ -743,6 +872,7 @@ static void show_sessions(cJSON *root, int bridge) {
 void ui_bridge_gone(int bridge) {
     if (!ui_lock(1000)) return;
     if (s_vstate != VOICE_IDLE && bridge == s_voice_bridge) voice_reset();   // capture's bridge vanished
+    if (s_cfg_ov && cfg_bridge == bridge) sesscfg_close();   // config sheet's bridge vanished
     drop_bridge_sessions(bridge);
     if (focus_bridge == bridge) { set_local_focus(NULL, -1); clear_ask(); }
     render_session_bar();
@@ -844,6 +974,8 @@ void ui_handle_message(cJSON *root, int bridge) {
         }
     } else if (!strcmp(t, "macros")) {
         show_macros(root);
+    } else if (!strcmp(t, "cfgopts")) {
+        show_cfgopts(root);
     } else if (!strcmp(t, "alert")) {
         cJSON *lvl = cJSON_GetObjectItem(root, "level");
         const char *lv = cJSON_IsString(lvl) ? lvl->valuestring : "info";

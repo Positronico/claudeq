@@ -18,6 +18,7 @@ voice — with an on-screen **Send/Cancel** so nothing reaches Claude until you 
 - **Every session on one screen** — sessions show under the same names Claude Code uses locally (`/rename` included); a bell badge marks the one that needs you, and a question auto-focuses whoever asked.
 - **Across computers** — decks auto-discover every bridge on the LAN (mDNS) and over your **Tailscale** tailnet, merging all their sessions.
 - **Macro deck** — one tap fires a saved prompt or slash-command into the focused session.
+- **Session config** — a gear on each session-picker row opens preset **model** and **effort** choices; a tap applies `/model` / `/effort` to that session, no keyboard needed.
 - **Tap-to-talk voice** — speak, review the local transcription (no API key), then **Send** — nothing reaches Claude until you approve.
 - **Speaker alerts** — it chirps when Claude needs you (mutable).
 - **Physical controls + low power** — BOOT-button brightness, **lock** (pocket mode), auto-sleep, wake-on-event, and a battery gauge.
@@ -105,6 +106,7 @@ folder name on Claude versions that don't expose it. Plain `claude` is unaffecte
 |---|---|
 | Claude asks a question | The options appear — **tap one to answer**. Multi-question prompts step through each. |
 | **Tap the session bar** (top) | Opens the full-screen **session picker** — every session is a big tappable row; tap one to switch. The bar shows the focused session's name, the session count, and a bell badge when *another* session needs you (the picker opens scrolled to it). |
+| **Gear on a picker row** | Opens that session's **config sheet**: preset **Model** (Fable / Opus / Sonnet / Haiku) and **Effort** (Low → Max, plus **Ultracode**) choices. A tap types `/model X` or `/effort Y` into that session — it works even for sessions that aren't focused. |
 | **Macros** tab | Tap a saved prompt/slash-command → sent to the focused session. |
 | **Voice** (mic) | **Tap** the mic and speak, then **Stop** → review the transcript and tap **Send** (or Cancel). |
 | **BOOT button** (side) | **Short press** cycles screen brightness; **hold** (~1.5s) **locks** the deck (screen dark, touch ignored — safe to pocket). Another **hold** unlocks and restores the brightness. |
@@ -161,7 +163,7 @@ drive; a question auto-focuses the session that asked, wherever it's running.
 Your editable state lives in **`~/.claudeq/`** (override the dir with `$CLAUDEQ_STATE_DIR`) — kept out of
 the install dir so a `brew upgrade` can't wipe it; an existing setup's files are migrated there once,
 automatically. After editing any of these, run **`claudeq restart-bridge`** to apply them.
-- **Macros** — edit `~/.claudeq/macros.json` (`id` / `icon` / `label` / `prompt`), then `claudeq restart-bridge`.
+- **Macros** — edit `~/.claudeq/macros.json` (`id` / `label` / `prompt`), then `claudeq restart-bridge`.
 - **Paired devices** — `~/.claudeq/trust.json` holds each paired device's persistent id and key; managed via
   `claudeq pair`/`claudeq devices`, not by hand. Delete it (then `claudeq restart-bridge`) to forget every pairing at once.
 - **Sounds** — the bridge ships with pleasant default chimes (needs-you and done). To use your own, drop any

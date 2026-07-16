@@ -22,4 +22,4 @@
 #define BRIDGE_WS_URI  "ws://" BRIDGE_HOST ":8787/"
 
 #define DEVICE_NAME    "claudeq"
-#define DEVICE_FW      "2.2.4"
+#define DEVICE_FW      "2.3.0"

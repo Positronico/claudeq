@@ -39,14 +39,23 @@
              border:1px solid var(--line); border-radius:10px; padding:6px; max-height:320px; overflow-y:auto;
              box-shadow:0 8px 24px rgba(0,0,0,.5); }
   .pickrow{ display:flex; align-items:center; gap:6px; padding:8px; border:1px solid var(--line); border-radius:9px;
-            background:var(--panel); cursor:pointer; margin-bottom:6px; font-size:13px; color:var(--ink); }
+            background:var(--panel); cursor:pointer; margin-bottom:6px; font-size:13px; color:var(--ink);
+            height:48px; box-sizing:border-box; overflow:hidden; }   /* uniform rows (mirrors firmware) */
   .pickrow:last-child{ margin-bottom:0; }
   .pickrow:hover{ border-color:var(--accent2); }
   .pickrow.focus{ border:2px solid var(--accent); background:rgba(214,116,58,.16); padding:7px; }
   .pickrow.needs{ border-color:var(--warn); }
   .pickrow.needs:not(.focus) .t{ color:var(--warn); }
   .pickrow .ic{ flex:0 0 16px; text-align:center; }
-  .pickrow .t{ flex:1 1 auto; min-width:0; overflow-wrap:anywhere; }
+  .pickrow .t{ flex:1 1 auto; min-width:0; overflow-wrap:anywhere; max-height:100%; overflow:hidden; }
+  .pickrow .gear{ flex:0 0 auto; color:var(--dim); font-size:15px; padding:4px; border-radius:6px; }
+  .pickrow .gear:hover{ color:var(--ink); background:rgba(122,162,255,.12); }
+  /* per-session config sheet (gear -> preset model / effort; mirrors the firmware overlay) */
+  .cfgov{ position:absolute; inset:0; z-index:30; background:var(--bg); padding:10px;
+          overflow-y:auto; display:flex; flex-direction:column; gap:7px; }
+  .cfgov .cfgtitle{ text-align:center; color:var(--dim); font-size:11px; white-space:nowrap;
+                    overflow:hidden; text-overflow:ellipsis; }
+  .cfgov .cfghdr{ color:var(--dim); font-size:10.5px; text-transform:uppercase; letter-spacing:.06em; margin-top:4px; }
   .pickrow .host{ font-size:10px; color:var(--dim); margin-left:5px; }
   .body{ flex:1 1 auto; overflow-y:auto; padding:8px; }
   .hdr{ font-size:10px; letter-spacing:.08em; text-transform:uppercase; color:var(--accent);
@@ -78,7 +87,7 @@
   .macro{ background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:13px 10px;
           text-align:center; cursor:pointer; }
   .macro:hover{ border-color:var(--accent2); }
-  .macro .i{ font-size:18px; } .macro .t{ font-size:12px; margin-top:3px; color:var(--dim); }
+  .macro .t{ font-size:13px; font-weight:600; }
   .voicebtn{ margin:60px auto 0; width:120px; height:120px; border-radius:50%; background:var(--panel);
              border:2px solid var(--accent); color:var(--accent); font-weight:700; display:flex;
              align-items:center; justify-content:center; cursor:pointer; user-select:none; }
@@ -146,6 +155,7 @@ const HOST = (location.protocol==='file:'? 'localhost' : location.hostname);
 const PORTS = (new URLSearchParams(location.search).get('b') || '8787').split(',').map(s=>s.trim()).filter(Boolean);
 document.getElementById('wsurl').textContent = PORTS.map(p=>`ws://${HOST}:${p}`).join('  ,  ');
 let mode='decide', ask=null, sel={}, hud={}, macros=[], state={state:'idle',text:'idle'};
+let cfgopts={models:[],efforts:[]};   // session-config presets from the bridge snapshot
 let sessions=[], focus=null, qIdx=0, answersAcc={}, hosts={};   // focus = {sid, bridge} | null; hosts[bridge]=machine
 let feed=[];                                                     // activity lines for the focused session
 let voiceState='idle', voiceId=0, voiceText='';                  // mic action + on-device confirm (mirrors firmware)
@@ -454,6 +464,7 @@ async function handle(m, bridge){
         if(mode==='decide' && !ask) render();
       } break;
     case 'macros': macros=m.items||[]; if(mode==='macros') render(); break;
+    case 'cfgopts': cfgopts={models:m.models||[], efforts:m.efforts||[]}; break;
     case 'alert': flash(); log('ALERT: '+m.text,'log-sys'); break;
   }
 }
@@ -478,6 +489,7 @@ function bridgeGone(bridge){
   delete bidByBridge[bridge]; delete lastListByBridge[bridge]; delete primaryByBridge[bridge];
   const c=conns[bridge]; if(c){ c.authenticated=false; c.sessionKeys=null; c.counters={send:0,recv:0}; c.pairing=null; c.authPending=null; }
   electPrimary(); rebuildSessions();   // a surviving shadow on another path is promoted -> its sessions show
+  closeCfg();                          // the sheet's target may have lived on the vanished bridge
   if(focus && focus.bridge===bridge){ focus=null; ask=null; feed=[]; }
   renderSessions(); renderStatus(); render(); renderPairing(); renderTrustList();
 }
@@ -511,7 +523,9 @@ function renderSessions(){ const sb=document.getElementById('sessbar');
     const ic=document.createElement('span'); ic.className='ic'; ic.textContent=s.needs?'🔔':(isFoc?'›':'');
     const tt=document.createElement('span'); tt.className='t'; tt.textContent=s.title;
     if(clash && hosts[s.bridge]){ const h=document.createElement('span'); h.className='host'; h.textContent='@'+hosts[s.bridge]; tt.appendChild(h); }
-    r.append(ic,tt);
+    const g=document.createElement('span'); g.className='gear'; g.textContent='⚙';
+    g.onclick=(ev)=>{ ev.stopPropagation(); pickOpen=false; renderSessions(); openCfg(s); };
+    r.append(ic,tt,g);
     r.title=`${s.sid} @ bridge ${s.bridge}`;
     r.onclick=(ev)=>{ ev.stopPropagation(); pickOpen=false;
       focus={sid:s.sid, bridge:s.bridge}; feed=[]; sendSecureTo(s.bridge,{type:'focus', sid:s.sid});
@@ -524,6 +538,28 @@ function renderSessions(){ const sb=document.getElementById('sessbar');
     const tgt=pick.querySelector('.pickrow.needs:not(.focus)')||pick.querySelector('.pickrow.focus');
     if(tgt) pick.scrollTop=Math.max(0, tgt.offsetTop-8);
   }
+}
+// Per-session config sheet: gear on a picker row -> preset model / effort choices (from the bridge's
+// cfgopts). A tap sends {type:'setcfg', sid, model|effort} to the session's OWN bridge, which types
+// `/model X` / `/effort Y` into that session — inline args, so no picker opens in the terminal.
+function closeCfg(){ const ov=document.getElementById('cfgov'); if(ov) ov.remove(); }
+function openCfg(s){
+  closeCfg();
+  const ov=document.createElement('div'); ov.className='cfgov'; ov.id='cfgov';
+  ov.innerHTML=`<span class="hdr" style="text-align:center">Session config</span><div class="cfgtitle">${s.title}</div>`;
+  const addSec=(name,items,key)=>{ if(!items.length) return;
+    const h=document.createElement('div'); h.className='cfghdr'; h.textContent=name; ov.appendChild(h);
+    items.forEach(o=>{ const d=document.createElement('div'); d.className='opt'; d.style.textAlign='center';
+      d.innerHTML=`<div class="l">${o.label||o.id}</div>`;
+      d.onclick=()=>{ sendSecureTo(s.bridge,{type:'setcfg', sid:s.sid, [key]:o.id}); closeCfg(); };
+      ov.appendChild(d); });
+  };
+  if(!cfgopts.models.length && !cfgopts.efforts.length)
+    ov.innerHTML+='<div class="placeholder">No presets from this bridge — update it.</div>';
+  addSec('Model', cfgopts.models, 'model');
+  addSec('Effort', cfgopts.efforts, 'effort');
+  const c=document.createElement('button'); c.className='confirm'; c.textContent='Close'; c.onclick=closeCfg; ov.appendChild(c);
+  document.querySelector('.device').appendChild(ov);
 }
 function renderStatus(){ document.getElementById('dot').className='dot '+(state.state||'idle');
   document.getElementById('titletxt').textContent=focusedTitle();
@@ -552,7 +588,7 @@ function render(){
     if(!macros.length){ b.innerHTML='<div class="placeholder">No macros configured.</div>'; return; }
     const g=document.createElement('div'); g.className='macros';
     macros.forEach(mc=>{ const d=document.createElement('div'); d.className='macro';
-      d.innerHTML=`<div class="i">${mc.icon||'▷'}</div><div class="t">${mc.label}</div>`;
+      d.innerHTML=`<div class="t">${mc.label}</div>`;
       d.onclick=()=>sendFocus({type:'macro', id:mc.id}); g.appendChild(d); });
     b.appendChild(g);
   } else if(mode==='settings'){
